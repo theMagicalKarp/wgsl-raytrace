@@ -1,0 +1,44 @@
+[camera]
+aspect_ratio = "standard"
+image_width = 800
+samples = 10000
+max_bounces = 64
+fov = 45
+look_from = [1.55, 0.0, 1.9]
+look_at = [0.0, -0.5, 0.0]
+vup = [0.0, 1.0, 0.0]
+
+# Teapot
+[[objects]]
+shape = "wavefront"
+file = "teapot.obj"
+group = "Teapot"
+material = "metal"
+albedo = [0.42, 0.20, 0.70]
+roughness = 0.2
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.5, 0.5, 0.5]
+
+[[objects.transform]]
+type = "rotate"
+axis = "y"
+degrees = 31.5
+
+# Floor
+[[objects]]
+shape = "wavefront"
+file = "teapot.obj"
+group = "Plane"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.5, 0.5, 0.5]
+
+[[objects.transform]]
+type = "rotate"
+axis = "y"
+degrees = 31.5
