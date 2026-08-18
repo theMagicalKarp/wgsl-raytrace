@@ -1,5 +1,6 @@
 mod config;
 mod math;
+mod render;
 mod scene;
 
 use clap::Parser;
@@ -12,6 +13,7 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Instant;
 
 fn main() -> ExitCode {
     match run() {
@@ -51,11 +53,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         scene.materials.len(),
     );
 
+    let started = Instant::now();
+    let (image, renderer) = render::render(&config, &scene)?;
+    image.save(&args.output)?;
+
     println!(
-        "{}{} rendering is not implemented yet, nothing was written to {}",
+        "{}{} {}x{} written to {} in {:.1}s on {}",
+        "render".bold().green(),
+        ":".bold(),
+        image.width,
+        image.height,
+        args.output.display(),
+        started.elapsed().as_secs_f32(),
+        renderer,
+    );
+    println!(
+        "{}{} the tracer is a stand-in: every ray reaches the background, so \
+         samples and bounces are not honored yet",
         "note".bold().yellow(),
         ":".bold(),
-        args.output.display(),
     );
 
     Ok(())

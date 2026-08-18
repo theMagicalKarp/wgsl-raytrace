@@ -52,7 +52,17 @@ $ wgsl-raytrace --config examples/teapot/render.toml --output render.png
 │             1: examples/teapot/teapot.obj [Plane] · lambertian[0.72, 0.72, 0.7…│
 └────────────────────────────────────────────────────────────────────────────────┘
 scene: 1576 triangles across 2 materials
+render: 800x600 written to render.png in 0.1s on Apple M4 Pro (Metal)
+note: the tracer is a stand-in: every ray reaches the background, so samples and bounces are not honored yet
 ```
+
+The tracing kernel is not written yet. The pass around it is: the scene's
+triangles and materials are uploaded, the camera becomes a primary ray per
+pixel, and the frame comes back as a PNG — but nothing intersects anything, so
+every ray reaches the background. What lands is a sky gradient in the direction
+the camera is pointed, with a strip along the bottom showing the materials the
+config asked for and a bar that grows with the triangle count. It is there to
+show the scene reached the GPU intact, and it goes away with the tracer.
 
 A malformed scene is reported against the line that caused it:
 
@@ -240,9 +250,11 @@ emit = [7.0, 7.0, 7.0]
 
 ```
 src/
-  main.rs            CLI entry point: read scene, validate, load, report
+  main.rs            CLI entry point: read scene, validate, load, render, save
   config/mod.rs      the TOML scene format and its CLI arguments
   scene/mod.rs       meshes and materials, flattened into GPU buffers
+  render/mod.rs      the wgpu pass: buffers in, pixels out, PNG on disk
+  render/shader.wgsl the WGSL kernel — a stand-in until the tracer lands
   math/mod.rs        just enough linear algebra to bake a model transform
 examples/
   teapot/            a two-object scene, mesh included
@@ -259,3 +271,12 @@ config and returns two flat arrays — `GpuTriangle` and `GpuMaterial`, both
 fanning, missing normals, block selection and model transforms already resolved.
 A triangle names its material by index into that second array, which is one
 entry per object in config order.
+
+`render` owns the GPU and nothing else. It uploads those two arrays plus a
+`GpuCamera` uniform, dispatches the compute pass, and averages the accumulated
+radiance into 8-bit sRGB. The bind group layouts are reflected out of the shader
+rather than declared twice, so a binding that changes in WGSL fails at pipeline
+creation instead of quietly reading the wrong bytes — and because the three
+structs are the contract between the two languages, a test parses the shader
+with naga and checks their sizes against the Rust ones. That runs without a GPU,
+so CI catches a layout drift that only a render would otherwise reveal.
