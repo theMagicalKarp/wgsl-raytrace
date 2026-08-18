@@ -1,15 +1,13 @@
-//! Headless WebGPU (wgpu + WGSL) path tracer over Wavefront meshes.
-//!
-//! Today this is the front half only: it reads a scene, checks it, and reports
-//! what it would render. The tracer itself lands behind this same CLI.
-
 mod config;
+mod math;
+mod scene;
 
 use clap::Parser;
 use colored::Colorize;
 use config::Args;
 use config::Config;
 use config::format_error;
+use scene::Scene;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -43,6 +41,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     config.validate(config_dir)?;
 
     println!("{}", config);
+
+    let scene = Scene::load(&config)?;
+    println!(
+        "{}{} {} triangles across {} materials",
+        "scene".bold().green(),
+        ":".bold(),
+        scene.triangles.len(),
+        scene.materials.len(),
+    );
+
     println!(
         "{}{} rendering is not implemented yet, nothing was written to {}",
         "note".bold().yellow(),

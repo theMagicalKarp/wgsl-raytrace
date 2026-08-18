@@ -51,6 +51,7 @@ $ wgsl-raytrace --config examples/teapot/render.toml --output render.png
 │             0: examples/teapot/teapot.obj [Teapot] · metal[0.42, 0.2, 0.7] rou…│
 │             1: examples/teapot/teapot.obj [Plane] · lambertian[0.72, 0.72, 0.7…│
 └────────────────────────────────────────────────────────────────────────────────┘
+scene: 1576 triangles across 2 materials
 ```
 
 A malformed scene is reported against the line that caused it:
@@ -133,13 +134,20 @@ group = "Teapot"
 - `file`: Path to the `.obj` file _(relative to the config location)_
 - `group`: Optional name of a single `o`/`g` block to load from the file. When
   omitted the whole file is used. This is how one `.obj` gets several materials
-  — list it once per block, as `examples/teapot` does.
+  — list it once per block, as `examples/teapot` does. A name that does not
+  match lists the ones the file does have. _(A block whose name contains a
+  space cannot be selected — the `.obj` grammar allows one word after a `g`.)_
+
+Faces with more than three corners are fanned into triangles, and a corner with
+no normal of its own gets the face's geometric one, so every triangle reaching
+the shader is smooth-shaded the same way.
 
 ### Transforms
 
 Each object may carry an ordered list of transforms, applied first to last and
 baked into the mesh before it reaches the GPU, so the tracer works entirely in
-world space.
+world space. Normals are carried by the inverse transpose of that transform, so
+a non-uniform `scale` tilts the surface the way it actually should.
 
 ```toml
 [[objects.transform]]
@@ -232,8 +240,10 @@ emit = [7.0, 7.0, 7.0]
 
 ```
 src/
-  main.rs            CLI entry point: read scene, validate, report
+  main.rs            CLI entry point: read scene, validate, load, report
   config/mod.rs      the TOML scene format and its CLI arguments
+  scene/mod.rs       meshes and materials, flattened into GPU buffers
+  math/mod.rs        just enough linear algebra to bake a model transform
 examples/
   teapot/            a two-object scene, mesh included
 ```
@@ -242,3 +252,10 @@ examples/
 the config file, and `Config::validate` is the separate pass that resolves
 object paths against the config's directory. Keeping those apart is what lets
 the whole scene format be tested without a GPU, or a mesh, in sight.
+
+`scene` is the one place that knows what a `.obj` file is. `Scene::load` takes a
+config and returns two flat arrays — `GpuTriangle` and `GpuMaterial`, both
+`#[repr(C)]` and laid out to match their WGSL counterparts — with the polygon
+fanning, missing normals, block selection and model transforms already resolved.
+A triangle names its material by index into that second array, which is one
+entry per object in config order.

@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.5.32", features = ["derive"] }
 colored = "3.0.0"
+obj-rs = "0.7.4"
 serde = { version = "1.0.219", features = ["derive"] }
 serde-inline-default = "0.2.3"
 toml = "0.8.20"
