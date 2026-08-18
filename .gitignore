@@ -21,4 +21,6 @@ target
 #.idea/
 
 /render.png
+# `mise run examples` renders next to each scene it renders.
+examples/**/render.png
 .DS_Store

@@ -43,6 +43,16 @@ pub fn rotation(axis: usize, radians: f32) -> Mat4 {
     m
 }
 
+pub fn camera_basis(
+    eye: [f32; 3],
+    target: [f32; 3],
+    up: [f32; 3],
+) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let forward = normalize(sub(target, eye));
+    let right = normalize(cross(forward, up));
+    (right, cross(right, forward), forward)
+}
+
 pub fn transform_point(m: Mat4, point: [f32; 3]) -> [f32; 3] {
     let mut out = [0.0; 3];
     for (row, slot) in out.iter_mut().enumerate() {
@@ -142,6 +152,28 @@ mod tests {
         let m = translation([10.0, 20.0, 30.0]);
 
         close(transform_direction(m, [1.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_camera_basis_is_orthonormal() {
+        let (u, v, w) = camera_basis([2.0, 3.0, 4.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+
+        for axis in [u, v, w] {
+            assert!((dot(axis, axis) - 1.0).abs() < 1e-5, "{axis:?} is not unit");
+        }
+        for (a, b) in [(u, v), (v, w), (w, u)] {
+            assert!(dot(a, b).abs() < 1e-5, "{a:?} and {b:?} are not square");
+        }
+        close(w, normalize([-2.0, -3.0, -4.0]));
+    }
+
+    #[test]
+    fn a_tilted_up_hint_still_squares_up() {
+        // Rolled 45° about the view axis: the up axis has to lean with it, not
+        // stay glued to world up.
+        let (_, v, _) = camera_basis([0.0, 0.0, 1.0], [0.0; 3], [1.0, 1.0, 0.0]);
+
+        close(v, normalize([1.0, 1.0, 0.0]));
     }
 
     #[test]
