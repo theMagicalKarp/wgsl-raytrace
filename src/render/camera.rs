@@ -20,7 +20,9 @@ pub struct GpuCamera {
 
     /// Right.
     pub u: [f32; 3],
-    pub defocus_angle: f32,
+    /// Radius of the lens disk primary rays start from, already resolved out of
+    /// the scene's `defocus_angle` and `focus_dist`. Zero is a pinhole.
+    pub defocus_radius: f32,
 
     /// Up.
     pub v: [f32; 3],
@@ -31,7 +33,7 @@ pub struct GpuCamera {
     pub max_bounces: u32,
 
     pub background: [f32; 3],
-    /// 1-based index of the sample being traced, which will also reseed the RNG.
+    /// 1-based index of the sample being traced, which also reseeds the RNG.
     pub sample: u32,
 
     pub width: u32,
@@ -50,7 +52,7 @@ impl From<&CameraOptions> for GpuCamera {
             origin: camera.look_from,
             fov: camera.fov.to_radians(),
             u,
-            defocus_angle: camera.defocus_angle,
+            defocus_radius: camera.focus_dist * (camera.defocus_angle.to_radians() / 2.0).tan(),
             v,
             focus_distance: camera.focus_dist,
             w,
@@ -94,5 +96,28 @@ look_at = [0.0, 0.0, 0.0]
         assert_eq!(gpu.w, [0.0, 0.0, -1.0], "the camera should look inward");
         assert_eq!(gpu.v, [0.0, 1.0, 0.0]);
         assert_eq!(gpu.sample, 1, "samples are counted from one");
+        assert_eq!(gpu.defocus_radius, 0.0, "a scene without one is a pinhole");
+    }
+
+    #[test]
+    fn a_defocus_angle_becomes_a_lens_radius() {
+        // The angle spans the whole cone, so a 90 degree one over a focus
+        // distance of two opens a lens of exactly that radius.
+        let gpu = camera(
+            r#"
+[camera]
+aspect_ratio = "square"
+image_width = 64
+samples = 8
+max_bounces = 4
+fov = 90
+look_from = [0.0, 0.0, 5.0]
+look_at = [0.0, 0.0, 0.0]
+defocus_angle = 90.0
+focus_dist = 2.0
+"#,
+        );
+
+        assert!((gpu.defocus_radius - 2.0).abs() < 1e-5, "{gpu:?}");
     }
 }

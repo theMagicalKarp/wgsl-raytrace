@@ -1,4 +1,4 @@
-# wgsl-raytrace (wip)
+# wgsl-raytrace
 
 A GPU path tracer in Rust, running headless on [wgpu](https://wgpu.rs/) with the
 tracing kernel written in [WGSL](https://www.w3.org/TR/WGSL/). It is the GPU
@@ -41,36 +41,19 @@ $ wgsl-raytrace --config examples/teapot/render.toml --output render.png
 │       Samples: 10000                                                           │
 │   Max Bounces: 64                                                              │
 │ Field of View: 45                                                              │
-│     Look From: [1.55, 0  , 1.9]                                                │
-│       Look At: [0  , -0.5, 0  ]                                                │
+│     Look From: [2.5, 1.2, 3.1]                                                 │
+│       Look At: [0  , 0.2, 0  ]                                                 │
 │           Vup: [0  , 1  , 0  ]                                                 │
 │ Defocus Angle: 0                                                               │
 │Focus Distance: 1                                                               │
-│    Background: [0  , 0  , 0  ]                                                 │
+│    Background: [0.7, 0.8, 0.99]                                                │
 │       Objects: 2                                                               │
 │             0: examples/teapot/teapot.obj [Teapot] · metal[0.42, 0.2, 0.7] rou…│
 │             1: examples/teapot/teapot.obj [Plane] · lambertian[0.72, 0.72, 0.7…│
 └────────────────────────────────────────────────────────────────────────────────┘
-scene: 1576 triangles across 2 materials
-render: 800x600 written to render.png in 0.1s on Apple M4 Pro (Metal)
-note: the tracer is a stand-in: every ray reaches the background, so samples and bounces are not honored yet
-```
-
-The tracing kernel is not written yet. The pass around it is: the scene's
-triangles and materials are uploaded, the camera becomes a primary ray per
-pixel, and the frame comes back as a PNG — but nothing intersects anything, so
-every ray reaches the background. What lands is a sky gradient in the direction
-the camera is pointed, with a strip along the bottom showing the materials the
-config asked for and a bar that grows with the triangle count. It is there to
-show the scene reached the GPU intact, and it goes away with the tracer.
-
-A malformed scene is reported against the line that caused it:
-
-```Bash
-$ wgsl-raytrace --config examples/teapot/render.toml
-error: unknown variant `ultrawide`, expected one of `widescreen`, `square`, ...
-  --> examples/teapot/render.toml:24:35
-   2 | aspect_ratio = "ultrawide"
+scene: 1576 triangles across 2 materials, indexed by 1511 bvh nodes 14 deep
+[########################] 10000/10000 samples  41s elapsed  ~0s left
+render: 800x600 written to render.png in 41.1s on Apple M4 Pro (Metal)
 ```
 
 ## Scene Configuration Specification
@@ -115,7 +98,9 @@ focus_dist = 10.0
 - `vup`: Defines the camera's orientation. _(Defaults to `[0.0, 1.0, 0.0]`,
   where y positive is "up")_
 - `background`: Set the rgb values for the default color when a ray misses every
-  object. _(Defaults to black `[0.0, 0.0, 0.0]`)_
+  object. This doubles as the scene's ambient light — a path that escapes brings
+  this color home with it — so a scene holding no `light` material and left at
+  the default black renders black. _(Defaults to black `[0.0, 0.0, 0.0]`)_
 - `defocus_angle`: Variation angle of rays through each pixel _(Defaults to
   being disabled)_
 - `focus_dist`: Distance from the camera `look_from` point to the plane of
@@ -145,8 +130,8 @@ group = "Teapot"
 - `group`: Optional name of a single `o`/`g` block to load from the file. When
   omitted the whole file is used. This is how one `.obj` gets several materials
   — list it once per block, as `examples/teapot` does. A name that does not
-  match lists the ones the file does have. _(A block whose name contains a
-  space cannot be selected — the `.obj` grammar allows one word after a `g`.)_
+  match lists the ones the file does have. _(A block whose name contains a space
+  cannot be selected — the `.obj` grammar allows one word after a `g`.)_
 
 Faces with more than three corners are fanned into triangles, and a corner with
 no normal of its own gets the face's geometric one, so every triangle reaching
@@ -253,8 +238,9 @@ src/
   main.rs            CLI entry point: read scene, validate, load, render, save
   config/mod.rs      the TOML scene format and its CLI arguments
   scene/mod.rs       meshes and materials, flattened into GPU buffers
+  scene/bvh.rs       the bounding volume hierarchy built over those triangles
   render/mod.rs      the wgpu pass: buffers in, pixels out, PNG on disk
-  render/shader.wgsl the WGSL kernel — a stand-in until the tracer lands
+  render/shader.wgsl the WGSL kernel — the path tracer itself
   math/mod.rs        just enough linear algebra to bake a model transform
 examples/
   teapot/            a two-object scene, mesh included
@@ -266,17 +252,33 @@ object paths against the config's directory. Keeping those apart is what lets
 the whole scene format be tested without a GPU, or a mesh, in sight.
 
 `scene` is the one place that knows what a `.obj` file is. `Scene::load` takes a
-config and returns two flat arrays — `GpuTriangle` and `GpuMaterial`, both
-`#[repr(C)]` and laid out to match their WGSL counterparts — with the polygon
-fanning, missing normals, block selection and model transforms already resolved.
-A triangle names its material by index into that second array, which is one
-entry per object in config order.
+config and returns flat arrays — `GpuTriangle`, `GpuMaterial` and `GpuBvhNode`,
+all `#[repr(C)]` and laid out to match their WGSL counterparts — with the
+polygon fanning, missing normals, block selection and model transforms already
+resolved. A triangle names its material by index into the material array, which
+is one entry per object in config order.
 
-`render` owns the GPU and nothing else. It uploads those two arrays plus a
-`GpuCamera` uniform, dispatches the compute pass, and averages the accumulated
+The hierarchy is what makes a scene of any size tractable: a linear scan pays
+for every triangle in the scene on every bounce, while a tree of nested boxes
+lets a ray reject whole subtrees with one slab test. It is built with a binned
+surface area heuristic — the alternatives do badly on exactly this shape of
+scene, where two enormous floor triangles sit alongside a thousand small ones —
+and the triangles are permuted into leaf order on the way out, so a leaf can
+name its own with an offset and a count. The builder caps the tree's depth below
+the shader's fixed traversal stack, which is what makes that stack a bound
+rather than a hope.
+
+`render` owns the GPU and nothing else. It uploads those arrays plus a
+`GpuCamera` uniform, runs the dispatch loop, and averages the accumulated
 radiance into 8-bit sRGB. The bind group layouts are reflected out of the shader
 rather than declared twice, so a binding that changes in WGSL fails at pipeline
-creation instead of quietly reading the wrong bytes — and because the three
+creation instead of quietly reading the wrong bytes — and because the four
 structs are the contract between the two languages, a test parses the shader
 with naga and checks their sizes against the Rust ones. That runs without a GPU,
 so CI catches a layout drift that only a render would otherwise reveal.
+
+The same trick covers the traversal: `scene/bvh.rs` carries a Rust
+reimplementation of the shader's walk, structurally line-for-line with the WGSL,
+and tests it against a brute-force scan over thousands of rays — including the
+axis-aligned ones that make an inverse direction infinite. A tree the shader
+would traverse wrongly fails on CPU first.
