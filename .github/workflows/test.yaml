@@ -32,27 +32,30 @@ jobs:
           path: target/release/wgsl-raytrace
           retention-days: 3
 
-  # Runs the release binary over every example scene. Once the tracer lands this
-  # becomes the render job, uploading each result as an artifact.
-  # scenes:
-  #   name: scene ${{ matrix.config }}
-  #   needs: [check]
-  #   strategy:
-  #     matrix:
-  #       config:
-  #         - teapot
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v7.0.1
-  #     - uses: actions/download-artifact@v8.0.1
-  #       with:
-  #         name: build
-  #         path: target/release
-  #     - run: chmod +x ./target/release/wgsl-raytrace
-  #     - env:
-  #         CONFIG: ${{ matrix.config }}
-  #       run: >
-  #         ./target/release/wgsl-raytrace
-  #         --config "examples/$CONFIG/render.toml"
-  #         --output render.png
-  #         --samples 100
+  scenes:
+    name: scene ${{ matrix.config }}
+    needs: [check]
+    strategy:
+      matrix:
+        config:
+          - teapot
+          - melee
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install a software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: build
+          path: target/release
+      - run: chmod +x ./target/release/wgsl-raytrace
+      - env:
+          CONFIG: ${{ matrix.config }}
+        run: >
+          ./target/release/wgsl-raytrace
+          --config "examples/$CONFIG/render.toml"
+          --output render.png
+          --samples 100

@@ -46,11 +46,13 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let scene = Scene::load(&config)?;
     println!(
-        "{}{} {} triangles across {} materials",
+        "{}{} {} triangles across {} materials, indexed by {} bvh nodes {} deep",
         "scene".bold().green(),
         ":".bold(),
         scene.triangles.len(),
         scene.materials.len(),
+        scene.nodes.len(),
+        scene.depth,
     );
 
     let started = Instant::now();
@@ -66,12 +68,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         args.output.display(),
         started.elapsed().as_secs_f32(),
         renderer,
-    );
-    println!(
-        "{}{} the tracer is a stand-in: every ray reaches the background, so \
-         samples and bounces are not honored yet",
-        "note".bold().yellow(),
-        ":".bold(),
     );
 
     Ok(())

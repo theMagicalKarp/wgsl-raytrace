@@ -1,22 +1,31 @@
 //! The GPU pass: scene buffers in, pixels out.
 //!
-//! The tracing itself is not written yet — `shader.wgsl` fills the frame with a
-//! background gradient and a readout of what it was handed. Everything on this
-//! side is the real thing, so landing the tracer is a change to the shader and
-//! to the sample loop, not to the plumbing underneath it.
+//! The scene is uploaded once and then traced one sample at a time, each sample
+//! a separate dispatch that reseeds the shader's RNG and adds its radiance to a
+//! shared accumulator. Splitting the work that way is what lets the samples in a
+//! config mean anything, and it keeps any single GPU command short enough not to
+//! trip a driver's watchdog.
 
 mod camera;
+mod progress;
 
 pub use camera::GpuCamera;
 
 use crate::config::Config;
 use crate::scene::Scene;
 use bytemuck::cast_slice;
+use progress::Progress;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::path::Path;
 use std::sync::mpsc;
 use wgpu::util::BufferInitDescriptor;
 use wgpu::util::DeviceExt;
+
+/// Samples allowed in flight before the loop waits on the oldest one. Enough to
+/// keep the GPU fed while it works through the queue, few enough that the
+/// progress readout reflects samples the GPU has actually finished.
+const IN_FLIGHT_SAMPLES: usize = 4;
 
 /// A finished frame, 8-bit RGBA and ready to write.
 pub struct Image {
@@ -88,6 +97,11 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
         contents: cast_slice(&scene.triangles),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let bvh_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("bvh"),
+        contents: cast_slice(&scene.nodes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
 
     // One `vec4<f32>` of summed radiance per pixel, started at zero.
     let accumulator_size = (width as u64) * (height as u64) * size_of::<[f32; 4]>() as u64;
@@ -145,29 +159,55 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
                 binding: 1,
                 resource: triangle_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: bvh_buffer.as_entire_binding(),
+            },
         ],
     });
 
-    // One pass, whatever the config asked for: with no RNG in the shader yet,
-    // every sample of a pixel would take the identical path and average to
-    // exactly what one pass already produced. Once that stops being true this
-    // becomes a loop that rewrites `sample` and dispatches again — the buffers
-    // and bind groups above are already shaped for it.
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("sample"),
-    });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("trace"),
-            timestamp_writes: None,
+    // One dispatch per sample, each reseeding the shader's RNG from the sample
+    // index it is handed.
+    let sample_offset = std::mem::offset_of!(GpuCamera, sample) as wgpu::BufferAddress;
+    let mut in_flight: VecDeque<wgpu::SubmissionIndex> = VecDeque::new();
+    let mut progress = Progress::new(config.camera.samples);
+
+    for sample in 1..=config.camera.samples {
+        // A queued write lands before the submission that follows it.
+        queue.write_buffer(&camera_buffer, sample_offset, bytemuck::bytes_of(&sample));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sample"),
         });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &frame, &[]);
-        pass.set_bind_group(1, &geometry, &[]);
-        // Rounded up to whole workgroups; the shader drops the threads that
-        // land outside the image.
-        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("trace"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &frame, &[]);
+            pass.set_bind_group(1, &geometry, &[]);
+            // Rounded up to whole workgroups; the shader drops the threads that
+            // land outside the image.
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        in_flight.push_back(queue.submit([encoder.finish()]));
+
+        // Let a few samples queue up, then block on the oldest. Waiting keeps
+        // the count honest — without it every sample would "finish" instantly
+        // and the GPU would still be tracing long after the loop ended.
+        if in_flight.len() > IN_FLIGHT_SAMPLES {
+            wait_for(&device, &mut in_flight, &mut progress)?;
+        }
     }
+    while !in_flight.is_empty() {
+        wait_for(&device, &mut in_flight, &mut progress)?;
+    }
+    progress.finish();
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("readback"),
+    });
     encoder.copy_buffer_to_buffer(&accumulator, 0, &readback, 0, accumulator_size);
     queue.submit([encoder.finish()]);
 
@@ -196,6 +236,25 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
     ))
 }
 
+/// Blocks until the oldest queued sample has run, then counts it.
+fn wait_for(
+    device: &wgpu::Device,
+    in_flight: &mut VecDeque<wgpu::SubmissionIndex>,
+    progress: &mut Progress,
+) -> Result<(), wgpu::PollError> {
+    let Some(submission) = in_flight.pop_front() else {
+        return Ok(());
+    };
+
+    device.poll(wgpu::PollType::Wait {
+        submission_index: Some(submission),
+        timeout: None,
+    })?;
+    progress.advance();
+
+    Ok(())
+}
+
 /// Averages each pixel's accumulated radiance and gamma-encodes it to 8-bit
 /// sRGB.
 fn resolve(sums: &[[f32; 4]]) -> Vec<u8> {
@@ -218,6 +277,7 @@ fn resolve(sums: &[[f32; 4]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::GpuBvhNode;
     use crate::scene::GpuMaterial;
     use crate::scene::GpuTriangle;
     use naga::proc::Layouter;
@@ -259,6 +319,7 @@ mod tests {
         assert_eq!(wgsl("Camera"), size_of::<GpuCamera>());
         assert_eq!(wgsl("Material"), size_of::<GpuMaterial>());
         assert_eq!(wgsl("Triangle"), size_of::<GpuTriangle>());
+        assert_eq!(wgsl("BvhNode"), size_of::<GpuBvhNode>());
     }
 
     #[test]
