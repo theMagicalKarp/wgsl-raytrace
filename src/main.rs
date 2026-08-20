@@ -56,19 +56,27 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
 
     let started = Instant::now();
-    let (image, renderer) = render::render(&config, &scene)?;
-    image.save(&args.output)?;
+    let render = render::render(&config, &scene)?;
+    render.image.save(&args.output)?;
 
     println!(
         "{}{} {}x{} written to {} in {:.1}s on {}",
         "render".bold().green(),
         ":".bold(),
-        image.width,
-        image.height,
+        render.image.width,
+        render.image.height,
         args.output.display(),
         started.elapsed().as_secs_f32(),
-        renderer,
+        render.renderer,
     );
+
+    // Wall time above covers the scene load, the uploads and every host stall
+    // in the sample loop. This is the dispatches alone, and is the number a
+    // change to the shader should be judged by. Absent on an adapter without
+    // timestamp queries.
+    if let Some(timings) = render.timings {
+        println!("{}{}    {}", "gpu".bold().green(), ":".bold(), timings);
+    }
 
     Ok(())
 }

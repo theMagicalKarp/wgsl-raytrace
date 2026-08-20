@@ -1,0 +1,70 @@
+# The scene behind the golden-image test in `src/render/golden.rs`.
+#
+# Small enough to render anywhere in a moment, and wide enough to be worth
+# checking: primary rays through a jittered lens, BVH traversal, both of the
+# scatter models a mesh can carry, and the background a path that escapes
+# brings home. The mesh is the example teapot rather than one of its own —
+# object paths resolve against the config's directory, so this can reach back
+# into `examples/` instead of checking in a second copy.
+#
+# Nothing here may change without regenerating the reference beside it:
+#
+#   UPDATE_GOLDEN=1 cargo test golden
+
+[camera]
+aspect_ratio = "square"
+image_width = 32
+
+# Both frames walk the same RNG sequence, so Monte Carlo noise cancels in the
+# comparison rather than adding to it — the sample count is not about hiding
+# noise. It is here because a backend that flips a branch on one sample of
+# sixty-four moves the pixel a quarter as far as it would on one of sixteen,
+# and those flips are the whole reason the comparison needs a tolerance.
+samples = 64
+
+# Well under the examples' 64. A short path is a shorter chain of floating
+# point to accumulate a difference along, which is what keeps this comparable
+# across the backends that have to agree on it.
+max_bounces = 8
+
+fov = 45
+look_from = [2.5, 1.2, 3.1]
+look_at = [0.0, 0.2, 0.0]
+vup = [0.0, 1.0, 0.0]
+
+background = [0.70, 0.80, 0.99]
+
+# Teapot
+[[objects]]
+shape = "wavefront"
+file = "../../examples/teapot/teapot.obj"
+group = "Teapot"
+material = "metal"
+albedo = [0.42, 0.20, 0.70]
+roughness = 0.2
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.5, 0.5, 0.5]
+
+[[objects.transform]]
+type = "rotate"
+axis = "y"
+degrees = 31.5
+
+# Floor
+[[objects]]
+shape = "wavefront"
+file = "../../examples/teapot/teapot.obj"
+group = "Plane"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.5, 0.5, 0.5]
+
+[[objects.transform]]
+type = "rotate"
+axis = "y"
+degrees = 31.5

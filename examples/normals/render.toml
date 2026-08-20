@@ -1,0 +1,48 @@
+[camera]
+aspect_ratio = "widescreen"
+image_width = 800
+samples = 5000
+max_bounces = 64
+fov = 30
+look_from = [-4.57, 9.01, -5.7]
+look_at = [0.0, 2.0, 0.0]
+vup = [0.0, 1.0, 0.0]
+
+# Nothing in this scene emits, so the background is the only light in it.
+background = [0.0, 0.0, 0.0]
+
+# Smooth Orb
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Smooth"
+material = "metal"
+albedo = [0.9, 0.9, 0.9]
+roughness = 0.4
+
+# Sharp Orb
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Sharp"
+material = "metal"
+albedo = [0.9, 0.9, 0.9]
+roughness = 0.4
+
+
+# Light
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Light"
+material = "light"
+emit = [9.0, 9.0, 9.0]
+
+
+# Floor
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Plane"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
