@@ -54,7 +54,50 @@ $ wgsl-raytrace --config examples/teapot/render.toml --output render.png
 scene: 1576 triangles across 2 materials, indexed by 1511 bvh nodes 14 deep
 [########################] 10000/10000 samples  41s elapsed  ~0s left
 render: 800x600 written to render.png in 41.1s on Apple M4 Pro (Metal)
+gpu:    3.94ms/dispatch  ·  39.4s traced  ·  min 3.71  p50 3.92  p95 4.18  max 5.30
 ```
+
+The `render:` line is wall time, which includes reading the mesh, building the
+hierarchy, uploading it and every stall the host takes waiting on the GPU. The
+`gpu:` line is the dispatches alone, measured with timestamp queries written
+either side of each compute pass, and is the number a change to the shader
+should be judged by. It is absent on an adapter whose backend cannot write
+timestamps, which is allowed on every one of them.
+
+## Examples
+
+`mise run examples` renders every scene under `examples/`, writing the image
+back beside the config it came from. Those images are checked in, so what
+follows is what this tracer currently produces.
+
+### Teapot
+
+One `.obj`, two blocks, two materials: a metal teapot standing on a lambertian
+plane, with the sky background the only thing lighting it. 800x600, 1000
+samples.
+
+```Bash
+wgsl-raytrace --config examples/teapot/render.toml --output examples/teapot/render.png
+```
+
+![The teapot scene](examples/teapot/render.png)
+
+### Normals
+
+The same sphere twice — once authored with smoothed vertex normals, once with
+per-face ones — under a single emissive panel, so the only difference in the
+frame is the normals the shader interpolates. 800x450, 5000 samples.
+
+![The normals scene](examples/normals/render.png)
+
+### Melee
+
+The CPU tracer's stress scene, ported: nine blocks selected out of a single
+mesh, glass and metal and lambertian side by side, lit by an emissive sphere
+above the frame that is the only light in a black background. 1200x675, 10000
+samples.
+
+![The melee scene](examples/melee/render.png)
 
 ## Scene Configuration Specification
 
@@ -240,10 +283,16 @@ src/
   scene/mod.rs       meshes and materials, flattened into GPU buffers
   scene/bvh.rs       the bounding volume hierarchy built over those triangles
   render/mod.rs      the wgpu pass: buffers in, pixels out, PNG on disk
+  render/timing.rs   timestamp queries, and what they average to
+  render/golden.rs   the rendered frame, diffed against a checked-in one
   render/shader.wgsl the WGSL kernel — the path tracer itself
   math/mod.rs        just enough linear algebra to bake a model transform
 examples/
   teapot/            a two-object scene, mesh included
+  normals/           smoothed against per-face normals, side by side
+  melee/             the many-material stress scene, and its light
+tests/
+  golden/            the scene behind the golden-image test, and its reference
 ```
 
 `config` is deliberately pure data — deserializing a scene touches nothing but
@@ -282,3 +331,15 @@ reimplementation of the shader's walk, structurally line-for-line with the WGSL,
 and tests it against a brute-force scan over thousands of rays — including the
 axis-aligned ones that make an inverse direction infinite. A tree the shader
 would traverse wrongly fails on CPU first.
+
+Both of those check the seams rather than the picture, and a shader that
+compiles, traverses correctly and shades wrongly passes them. `render/golden.rs`
+closes that: it renders `tests/golden/render.toml` — the teapot at 32x32 — and
+diffs it against `tests/golden/reference.png`. The comparison carries a
+tolerance because the reference is generated on one backend and checked on
+another, and the constants behind it are documented where they are declared,
+with the measurements they came from. Regenerate the reference with
+`UPDATE_GOLDEN=1 cargo test golden` whenever the render is meant to change; a
+machine with no working adapter can opt out with
+`WGSL_RAYTRACE_SKIP_GPU_TESTS=1`, which is deliberately opt-in rather than a
+silent skip.

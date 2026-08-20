@@ -1,15 +1,12 @@
-//! The GPU pass: scene buffers in, pixels out.
-//!
-//! The scene is uploaded once and then traced one sample at a time, each sample
-//! a separate dispatch that reseeds the shader's RNG and adds its radiance to a
-//! shared accumulator. Splitting the work that way is what lets the samples in a
-//! config mean anything, and it keeps any single GPU command short enough not to
-//! trip a driver's watchdog.
-
 mod camera;
 mod progress;
+mod timing;
+
+#[cfg(test)]
+mod golden;
 
 pub use camera::GpuCamera;
+pub use timing::Timings;
 
 use crate::config::Config;
 use crate::scene::Scene;
@@ -19,6 +16,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::path::Path;
 use std::sync::mpsc;
+use timing::Timer;
 use wgpu::util::BufferInitDescriptor;
 use wgpu::util::DeviceExt;
 
@@ -26,6 +24,16 @@ use wgpu::util::DeviceExt;
 /// keep the GPU fed while it works through the queue, few enough that the
 /// progress readout reflects samples the GPU has actually finished.
 const IN_FLIGHT_SAMPLES: usize = 4;
+
+/// A finished render: the frame, the GPU that drew it, and what that cost.
+pub struct Render {
+    pub image: Image,
+    /// The adapter's name and backend — "which GPU did this" is the first thing
+    /// worth knowing when a render is slow or wrong.
+    pub renderer: String,
+    /// `None` on an adapter that cannot write timestamps.
+    pub timings: Option<Timings>,
+}
 
 /// A finished frame, 8-bit RGBA and ready to write.
 pub struct Image {
@@ -50,14 +58,12 @@ impl Image {
 /// Renders `scene` through `config`'s camera, blocking until the GPU is done.
 ///
 /// The adapter is whatever the platform offers — there is no surface to be
-/// compatible with, so any device that can run a compute pass will do. Its name
-/// is returned along with the image because "which GPU did this" is the first
-/// thing worth knowing when a render is slow or wrong.
-pub fn render(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn Error>> {
+/// compatible with, so any device that can run a compute pass will do.
+pub fn render(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
     pollster::block_on(run(config, scene))
 }
 
-async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn Error>> {
+async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
     // An empty buffer cannot be bound, and a scene with nothing in it is a
     // mistake worth naming rather than a black frame worth writing.
     if scene.triangles.is_empty() {
@@ -68,9 +74,14 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await?;
+    // Timestamps are optional on every backend — Metal wants stage-boundary
+    // counter sampling, Vulkan a queue with enough valid timestamp bits — and
+    // asking for a feature the adapter lacks fails the request outright, so the
+    // ask is whatever it turns out to have.
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("device"),
+            required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
             ..Default::default()
         })
         .await?;
@@ -171,6 +182,7 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
     let sample_offset = std::mem::offset_of!(GpuCamera, sample) as wgpu::BufferAddress;
     let mut in_flight: VecDeque<wgpu::SubmissionIndex> = VecDeque::new();
     let mut progress = Progress::new(config.camera.samples);
+    let timer = Timer::new(&device, &queue, config.camera.samples);
 
     for sample in 1..=config.camera.samples {
         // A queued write lands before the submission that follows it.
@@ -182,7 +194,7 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("trace"),
-                timestamp_writes: None,
+                timestamp_writes: timer.as_ref().and_then(|timer| timer.writes(sample)),
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &frame, &[]);
@@ -209,6 +221,9 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
         label: Some("readback"),
     });
     encoder.copy_buffer_to_buffer(&accumulator, 0, &readback, 0, accumulator_size);
+    if let Some(timer) = &timer {
+        timer.resolve(&mut encoder);
+    }
     queue.submit([encoder.finish()]);
 
     let slice = readback.slice(..);
@@ -226,14 +241,20 @@ async fn run(config: &Config, scene: &Scene) -> Result<(Image, String), Box<dyn 
     drop(mapped);
     readback.unmap();
 
-    Ok((
-        Image {
+    let timings = match &timer {
+        Some(timer) => timer.timings(&device)?,
+        None => None,
+    };
+
+    Ok(Render {
+        image: Image {
             width,
             height,
             pixels,
         },
         renderer,
-    ))
+        timings,
+    })
 }
 
 /// Blocks until the oldest queued sample has run, then counts it.
