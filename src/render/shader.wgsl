@@ -13,6 +13,12 @@ const TWO_PI: f32 = 6.2831853;
 // matters: this is per-thread storage, and 64 threads share a workgroup.
 const MAX_BVH_STACK: u32 = 32u;
 
+// Bounces a path is allowed before Russian roulette starts deciding whether it
+// lives. The first few carry most of the image and killing them there would only
+// trade traversal for noise; past that a path is usually deep in an interreflection
+// and worth very little, and the survivors it is folded into cost nothing extra.
+const MIN_ROULETTE_BOUNCE: u32 = 4u;
+
 // `Material.kind`, matching the constants in `scene/material.rs`.
 const LAMBERTIAN: u32 = 0u;
 const METAL: u32 = 1u;
@@ -440,8 +446,29 @@ fn trace_path(primary: Ray) -> vec3f {
         throughput *= scattered.attenuation;
         ray = scattered.ray;
 
-        // A path that can no longer contribute is not worth bouncing further.
-        if max(throughput.r, max(throughput.g, throughput.b)) <= 0.0 {
+        // Russian roulette. Past the first few bounces a path is killed with
+        // probability `1 - survival` and the survivors are divided by
+        // `survival`, so what the path carries is unchanged in expectation —
+        // the estimator stays unbiased, it just spends its bounces on the paths
+        // that still matter.
+        //
+        // The brightest channel is the survival probability: a throughput of
+        // 0.73 across the board survives 73% of the time, which turns melee's
+        // 64-bounce paths into about eight. Anything at or above one always
+        // survives and is never scaled, which is what keeps a dielectric — the
+        // one material that attenuates by nothing — walking the full path it
+        // needs to.
+        let survival = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
+        if bounce >= MIN_ROULETTE_BOUNCE {
+            // A survival of zero terminates here: `rand_f32` returns [0, 1), so
+            // nothing is ever below it, and the division is never reached.
+            if rand_f32() >= survival {
+                break;
+            }
+            throughput /= survival;
+        } else if survival <= 0.0 {
+            // Before roulette takes over, a path that can no longer contribute
+            // still is not worth bouncing further.
             break;
         }
     }
