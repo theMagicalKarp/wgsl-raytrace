@@ -44,8 +44,10 @@ jobs:
     strategy:
       matrix:
         config:
-          - teapot
           - melee
+          - normals
+          - stairs
+          - teapot
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1

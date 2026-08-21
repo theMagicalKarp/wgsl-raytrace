@@ -1,0 +1,78 @@
+[camera]
+aspect_ratio = "smartphone"
+image_width = 800
+samples = 100000
+max_bounces = 64
+fov = 20.4
+look_from = [-45.59, 19.02, -26.83]
+look_at = [1.57, 7.45, -1.32]
+vup = [0.0, 1.0, 0.0]
+background = [0.0, 0.0, 0.0]
+
+# Room
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Cylinder"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+# Stairs
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Stairs"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+# Light
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Light1"
+material = "light"
+emit = [1000.0, 1000.0, 1000.0]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Light2"
+material = "light"
+emit = [1000.0, 1000.0, 1000.0]
+
+# Glass Orbs
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Orb1"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Orb2"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Orb3"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Orb4"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Orb5"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Orb6"
+material = "glass"
