@@ -5,6 +5,7 @@ const FLT_MAX: f32 = 3.40282346638528859812e+38;
 // `t` is in world units at every bounce and one epsilon covers self-intersection
 // everywhere.
 const EPSILON: f32 = 1e-3;
+const PI: f32 = 3.1415927;
 const TWO_PI: f32 = 6.2831853;
 
 // WGSL has no dynamic allocation, so BVH traversal carries a fixed-size stack.
@@ -43,6 +44,12 @@ struct Camera {
     sample: u32,
     width: u32,
     height: u32,
+    // Entries in `lights`. Zero means the scene has no emitters, and the whole
+    // of next event estimation is skipped.
+    light_count: u32,
+    // What those entries add up to, and what turns one entry's share of the
+    // table back into a probability.
+    light_power: f32,
 }
 
 // One surface, packed by `GpuMaterial`. `kind` selects what the other two mean:
@@ -92,6 +99,20 @@ struct BvhNode {
 @group(1) @binding(0) var<storage> materials: array<Material>;
 @group(1) @binding(1) var<storage> triangles: array<Triangle>;
 @group(1) @binding(2) var<storage> bvh: array<BvhNode>;
+// One emissive triangle, as an entry in the distribution the host built over
+// them in `scene/light.rs`.
+struct Light {
+    // Index into `triangles`.
+    triangle: u32,
+    // The chance of drawing this entry or any before it. Entries ascend and the
+    // last is exactly one.
+    cdf: f32,
+}
+
+// The emitters, in proportion to the light they put out. Sampling searches this
+// rather than the scene: an emitter that is large or bright is worth more shadow
+// rays than one that is small or dim, and the table is what says by how much.
+@group(1) @binding(3) var<storage> lights: array<Light>;
 
 // Every thread draws from its own stream, seeded from where and when it is, so
 // two pixels never walk the same path and a pixel never repeats one across
@@ -169,10 +190,14 @@ struct Intersection {
     t: f32,
     material: u32,
     front_face: bool,
+    // Index into `triangles`. Only [`traverse`] can fill this in — a triangle
+    // does not know where it is stored — and light sampling needs it to recover
+    // the emitter's area from a hit.
+    triangle: u32,
 }
 
 fn no_intersection() -> Intersection {
-    return Intersection(vec3f(0.0), -1.0, 0u, true);
+    return Intersection(vec3f(0.0), -1.0, 0u, true, 0u);
 }
 
 // Möller-Trumbore. Deliberately two-sided: a mesh here is a surface rather than
@@ -216,7 +241,7 @@ fn intersect_triangle(ray: Ray, tri: Triangle) -> Intersection {
     let front_face = dot(ray.direction, normal) < 0.0;
     normal = select(-normal, normal, front_face);
 
-    return Intersection(normal, t, tri.material, front_face);
+    return Intersection(normal, t, tri.material, front_face, 0u);
 }
 
 // Slab test, returning the distance at which the ray enters the node, or FLT_MAX
@@ -242,9 +267,14 @@ fn hit_aabb(origin: vec3f, inv_direction: vec3f, node: BvhNode, closest: f32) ->
 // Walks the hierarchy instead of the triangle list. A scan costs one triangle
 // test per triangle in the scene; this costs a couple of dozen box tests and a
 // handful of triangle tests, whatever the scene size.
-fn intersect_scene(ray: Ray) -> Intersection {
+//
+// Nothing beyond `limit` is considered, which is what lets a shadow ray stop at
+// the light it is aimed at. `any_hit` returns the first thing found rather than
+// the nearest: a shadow ray only asks whether the path is blocked, so it can
+// abandon the tree the moment anything says yes.
+fn traverse(ray: Ray, limit: f32, any_hit: bool) -> Intersection {
     var closest = no_intersection();
-    closest.t = FLT_MAX;
+    closest.t = limit;
 
     let inv_direction = 1.0 / ray.direction;
     var stack: array<u32, MAX_BVH_STACK>;
@@ -257,9 +287,14 @@ fn intersect_scene(ray: Ray) -> Intersection {
             // A leaf. Its triangles were permuted into a contiguous run on the
             // host, so the count and the offset are all it takes to find them.
             for (var i = 0u; i < node.primitive_count; i += 1u) {
-                let hit = intersect_triangle(ray, triangles[node.left_or_first + i]);
+                let primitive = node.left_or_first + i;
+                let hit = intersect_triangle(ray, triangles[primitive]);
                 if hit.t > 0.0 && hit.t < closest.t {
                     closest = hit;
+                    closest.triangle = primitive;
+                    if any_hit {
+                        return closest;
+                    }
                 }
             }
         } else {
@@ -305,10 +340,22 @@ fn intersect_scene(ray: Ray) -> Intersection {
         index = stack[stack_depth];
     }
 
-    if closest.t < FLT_MAX {
+    if closest.t < limit {
         return closest;
     }
     return no_intersection();
+}
+
+// The nearest thing the ray meets anywhere in the scene.
+fn intersect_scene(ray: Ray) -> Intersection {
+    return traverse(ray, FLT_MAX, false);
+}
+
+// Whether anything at all stands between `origin` and a point `distance` away
+// along `direction`. The limit stops an epsilon short so that the emitter being
+// aimed at does not shadow itself.
+fn occluded(origin: vec3f, direction: vec3f, distance: f32) -> bool {
+    return traverse(Ray(origin, direction), distance - EPSILON, true).t > 0.0;
 }
 
 struct Scatter {
@@ -417,12 +464,189 @@ fn primary_ray(pixel: vec2u) -> Ray {
     return Ray(origin, normalize(focus_point - origin));
 }
 
+// Veach's power heuristic with an exponent of two, weighing a sample drawn at
+// density `chosen` against the density `other` some rival strategy would have
+// drawn it at. The two weights sum to one for any pair, so combining the
+// strategies neither loses light nor counts it twice; squaring is what makes the
+// strategy that was confident about a sample keep most of it.
+fn power_heuristic(chosen: f32, other: f32) -> f32 {
+    let a = chosen * chosen;
+    let b = other * other;
+    return a / max(a + b, 1e-8);
+}
+
+// Rec. 709 luma, matching what `scene/light.rs` weighed the table by. The two
+// have to be the same function: one decides how often a triangle is drawn and
+// the other divides by how often it was.
+fn luminance(color: vec3f) -> f32 {
+    return dot(color, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// The density with which [`sample_light`] draws a direction, per unit solid
+// angle, given the emitter it lands on and how that emitter is turned.
+//
+// The triangle's own area is missing, and not by omission. An entry is drawn in
+// proportion to its area times its brightness, and a point is then drawn per
+// unit of that same area, so the two cancel and what is left is one emitter's
+// brightness against everything the scene emits. That cancellation is why
+// nothing here has to find which entry of the table a triangle belongs to: a
+// direction can be priced from the triangle alone, which is what makes weighing
+// a scattered ray that happened to land on an emitter cost a lookup rather than
+// a search.
+fn light_density(emit: vec3f, distance: f32, cosine: f32) -> f32 {
+    if cosine <= 0.0 || camera.light_power <= 0.0 {
+        return 0.0;
+    }
+
+    return (distance * distance) * luminance(emit) / (cosine * camera.light_power);
+}
+
+// The density with which [`sample_light`] would have produced a direction, given
+// that following it landed on `hit`.
+//
+// Only the emitter a ray reaches first matters: anything behind it is occluded,
+// so a shadow ray aimed there returns nothing and that draw contributes zero.
+fn light_pdf(hit: Intersection, direction: vec3f) -> f32 {
+    let tri = triangles[hit.triangle];
+    let normal = cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
+    // Emitters are two-sided, so a face turned away still emits toward whatever
+    // is looking at its back.
+    let cosine = abs(dot(normalize(normal), direction));
+
+    // Directions are unit, so `hit.t` is the distance to the emitter.
+    return light_density(materials[hit.material].color, hit.t, cosine);
+}
+
+// The entry whose slice of the table a uniform draw lands in: the first whose
+// cumulative chance has overtaken it.
+//
+// A dozen divergent iterations for melee's sphere, against the couple of hundred
+// a traversal costs — the search is not what this pays for. Every entry is worth
+// drawing, which is the point of leaving the ones that emit nothing out of the
+// table rather than giving them a slice of zero to be searched past.
+fn select_light(draw: f32) -> Light {
+    var low = 0u;
+    var high = camera.light_count - 1u;
+
+    loop {
+        if low >= high {
+            break;
+        }
+
+        let middle = (low + high) / 2u;
+        if lights[middle].cdf > draw {
+            high = middle;
+        } else {
+            low = middle + 1u;
+        }
+    }
+
+    return lights[low];
+}
+
+// One point on one emitter, and what the estimator needs to weigh it.
+struct LightSample {
+    // From the shading point toward the light, unit length.
+    direction: vec3f,
+    // How far the light is, so the shadow ray knows where to stop.
+    distance: f32,
+    // What the emitter sends back along `direction`.
+    radiance: vec3f,
+    // Solid angle density of having drawn this direction. Zero is unusable.
+    pdf: f32,
+}
+
+// Draws a point on an emitter: a triangle out of the table, then a point
+// uniformly on that triangle.
+fn sample_light(origin: vec3f) -> LightSample {
+    let tri = triangles[select_light(rand_f32()).triangle];
+
+    let e1 = tri.v1 - tri.v0;
+    let e2 = tri.v2 - tri.v0;
+
+    // Uniform over the triangle. The square folds along its diagonal rather than
+    // rejecting the far half, for the same reason `sample_disk` does not reject:
+    // a retry would stall every other thread in the workgroup.
+    var u = rand_f32();
+    var v = rand_f32();
+    if u + v > 1.0 {
+        u = 1.0 - u;
+        v = 1.0 - v;
+    }
+    let point = tri.v0 + e1 * u + e2 * v;
+
+    let offset = point - origin;
+    let distance = length(offset);
+    let direction = offset / max(distance, 1e-8);
+
+    // The geometric normal, not the interpolated one: the density is written
+    // against the surface that was actually sampled, and a shading normal is not
+    // that surface. Emitters are two-sided like everything else, so only how
+    // foreshortened the face is matters.
+    let normal = cross(e1, e2);
+    let cosine = abs(dot(normalize(normal), direction));
+
+    let emit = materials[tri.material].color;
+    var pdf = 0.0;
+    if distance > 0.0 {
+        pdf = light_density(emit, distance, cosine);
+    }
+
+    return LightSample(direction, distance, emit, pdf);
+}
+
+// Next event estimation: the light this surface receives directly, found by
+// aiming at an emitter instead of waiting for a scattered ray to wander into
+// one.
+//
+// This is what removes fireflies. A scattered ray finds a small bright light by
+// luck, so one sample in a few hundred comes back carrying all of it and the
+// pixel keeps that dot until the average catches up. A shadow ray finds it every
+// time, and what it brings back varies only with visibility.
+//
+// Lambertian only. The other two models are sampled from lobes narrow enough
+// that a random direction already lands near the light — and neither has a
+// density this could weigh a light sample against, since both are sampled by
+// construction rather than from a distribution anyone wrote down.
+//
+// The caller has to have checked that there is a light to sample: with none,
+// `sample_light` has nothing to pick from.
+fn direct_light(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
+    let light = sample_light(point);
+
+    // Behind the surface, or a degenerate emitter.
+    let cosine = dot(normal, light.direction);
+    if light.pdf <= 0.0 || cosine <= 0.0 {
+        return vec3f(0.0);
+    }
+
+    if occluded(point, light.direction, light.distance) {
+        return vec3f(0.0);
+    }
+
+    // Scattering would have found this same direction with this density, and
+    // the heuristic splits the contribution between the two strategies. Near a
+    // large emitter scattering is the better one and keeps most of it; for the
+    // small bright light that made the fireflies, this sample keeps nearly all.
+    let weight = power_heuristic(light.pdf, cosine / PI);
+
+    // The lambertian brdf is `albedo / PI`, and the estimator is `f * cos / pdf`.
+    return light.radiance * albedo * cosine * weight / (PI * light.pdf);
+}
+
 // Follows one path from the camera until it reaches a light, escapes the scene,
 // is absorbed, or runs out of bounces, and returns the radiance it carried back.
 fn trace_path(primary: Ray) -> vec3f {
     var ray = primary;
     var radiance = vec3f(0.0);
     var throughput = vec3f(1.0);
+
+    // How the current direction was chosen, which is what decides how much of an
+    // emitter this ray is allowed to keep. A camera ray counts as specular:
+    // nothing sampled it, so no other strategy could have found it and there is
+    // nothing to share the light with.
+    var scatter_pdf = 0.0;
+    var specular = true;
 
     for (var bounce = 0u; bounce <= camera.max_bounces; bounce += 1u) {
         let hit = intersect_scene(ray);
@@ -435,13 +659,35 @@ fn trace_path(primary: Ray) -> vec3f {
         if material.kind == LIGHT {
             // An emitter is where a path ends: it is the only thing in the scene
             // that adds rather than attenuates.
-            return radiance + throughput * material.color;
+            //
+            // The previous vertex already sampled this emitter directly, so
+            // taking all of what the scattered ray found would count it twice.
+            // The heuristic hands over only the share this strategy earned, and
+            // `direct_light` took the rest. A specular bounce, or the camera,
+            // had no direct sample to double, and keeps everything.
+            var weight = 1.0;
+            if !specular {
+                weight = power_heuristic(scatter_pdf, light_pdf(hit, ray.direction));
+            }
+            return radiance + throughput * material.color * weight;
+        }
+
+        // Light arriving straight from an emitter, gathered before the path
+        // wanders off to find whatever else this surface can see.
+        if material.kind == LAMBERTIAN && camera.light_count > 0u {
+            let point = point_on_ray(ray, hit.t);
+            radiance += throughput * direct_light(point, hit.normal, material.color);
         }
 
         let scattered = scatter(ray, hit, material);
         if !scattered.bounced {
             break;
         }
+
+        // A cosine-weighted direction was drawn at `cos / PI`; the other two
+        // models did not draw from anything an emitter can be weighed against.
+        specular = material.kind != LAMBERTIAN;
+        scatter_pdf = dot(scattered.ray.direction, hit.normal) / PI;
 
         throughput *= scattered.attenuation;
         ray = scattered.ray;

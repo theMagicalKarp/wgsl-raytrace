@@ -9,7 +9,9 @@ pub use camera::GpuCamera;
 pub use timing::Timings;
 
 use crate::config::Config;
+use crate::scene::GpuLight;
 use crate::scene::Scene;
+use bytemuck::Zeroable;
 use bytemuck::cast_slice;
 use progress::Progress;
 use std::collections::VecDeque;
@@ -89,7 +91,9 @@ async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
     let info = adapter.get_info();
     let renderer = format!("{} ({:?})", info.name, info.backend);
 
-    let camera = GpuCamera::from(&config.camera);
+    let mut camera = GpuCamera::from(&config.camera);
+    camera.light_count = scene.lights.len() as u32;
+    camera.light_power = scene.light_power;
     let (width, height) = (camera.width, camera.height);
 
     let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
@@ -111,6 +115,19 @@ async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
     let bvh_buffer = device.create_buffer_init(&BufferInitDescriptor {
         label: Some("bvh"),
         contents: cast_slice(&scene.nodes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // A scene may legitimately have no emitters — every example but melee is lit
+    // by its background alone — but an empty buffer cannot be bound, so the
+    // binding falls back to this one entry. Nothing reads it: `light_count` is
+    // zero alongside it, and that is what the shader checks.
+    let unused = [GpuLight::zeroed()];
+    let light_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("lights"),
+        contents: match scene.lights.is_empty() {
+            true => cast_slice(&unused),
+            false => cast_slice(&scene.lights),
+        },
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -173,6 +190,10 @@ async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: bvh_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: light_buffer.as_entire_binding(),
             },
         ],
     });
@@ -338,6 +359,7 @@ mod tests {
         };
 
         assert_eq!(wgsl("Camera"), size_of::<GpuCamera>());
+        assert_eq!(wgsl("Light"), size_of::<GpuLight>());
         assert_eq!(wgsl("Material"), size_of::<GpuMaterial>());
         assert_eq!(wgsl("Triangle"), size_of::<GpuTriangle>());
         assert_eq!(wgsl("BvhNode"), size_of::<GpuBvhNode>());

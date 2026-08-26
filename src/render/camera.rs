@@ -38,7 +38,14 @@ pub struct GpuCamera {
 
     pub width: u32,
     pub height: u32,
-    _pad: [u32; 2],
+    /// How many entries the shader's light table has, and the total power they
+    /// share out. Neither is a camera setting — they belong to the scene — but
+    /// they ride here because the shader needs them as scalars and this is the
+    /// block it already reads scalars from.
+    /// [`render`](crate::render::render) fills them in once the scene has been
+    /// loaded, which is why [`From`] leaves them zero.
+    pub light_count: u32,
+    pub light_power: f32,
 }
 
 const _: () = assert!(size_of::<GpuCamera>() == 96);
@@ -61,7 +68,8 @@ impl From<&CameraOptions> for GpuCamera {
             sample: 1,
             width,
             height,
-            _pad: [0; 2],
+            light_count: 0,
+            light_power: 0.0,
         }
     }
 }
@@ -96,6 +104,8 @@ look_at = [0.0, 0.0, 0.0]
         assert_eq!(gpu.w, [0.0, 0.0, -1.0], "the camera should look inward");
         assert_eq!(gpu.v, [0.0, 1.0, 0.0]);
         assert_eq!(gpu.sample, 1, "samples are counted from one");
+        assert_eq!(gpu.light_count, 0, "the scene is what knows about lights");
+        assert_eq!(gpu.light_power, 0.0);
         assert_eq!(gpu.defocus_radius, 0.0, "a scene without one is a pinhole");
     }
 

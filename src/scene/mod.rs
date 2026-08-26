@@ -1,5 +1,6 @@
 mod bvh;
 mod geometry;
+mod light;
 mod material;
 mod transform;
 mod wavefront;
@@ -9,6 +10,7 @@ mod testing;
 
 pub use bvh::GpuBvhNode;
 pub use geometry::GpuTriangle;
+pub use light::GpuLight;
 pub use material::GpuMaterial;
 
 use crate::config::Config;
@@ -23,6 +25,14 @@ pub struct Scene {
     /// and it keeps the triangles one leaf tests next to each other in memory.
     pub triangles: Vec<GpuTriangle>,
     pub materials: Vec<GpuMaterial>,
+    /// The distribution the shader draws emitters from, built over `triangles`
+    /// after the permutation above so its indices address the list the shader is
+    /// handed. Empty when nothing in the scene emits.
+    pub lights: Vec<GpuLight>,
+    /// Total power the entries in `lights` distribute between them, which is
+    /// what turns one of their shares back into a probability. Zero alongside an
+    /// empty `lights`.
+    pub light_power: f32,
     /// The hierarchy over `triangles`, flattened. Node 0 is the root.
     pub nodes: Vec<GpuBvhNode>,
     /// Depth of the hierarchy's deepest leaf, with the root at zero.
@@ -52,15 +62,19 @@ impl Scene {
             .map(|triangle| bvh::Aabb::of_points([triangle.v0, triangle.v1, triangle.v2]))
             .collect();
         let hierarchy = bvh::build(&bounds);
-        let triangles = hierarchy
+        let triangles: Vec<GpuTriangle> = hierarchy
             .order
             .iter()
             .map(|&index| triangles[index as usize])
             .collect();
 
+        let (lights, light_power) = light::build(&triangles, &materials);
+
         Ok(Scene {
             triangles,
             materials,
+            lights,
+            light_power,
             nodes: hierarchy.nodes,
             depth: hierarchy.max_depth,
         })
@@ -71,6 +85,7 @@ impl Scene {
 mod tests {
     use super::*;
     use crate::scene::material::LAMBERTIAN;
+    use crate::scene::material::LIGHT;
     use crate::scene::material::METAL;
     use crate::scene::testing::triangles;
     use crate::scene::testing::wavefront;
@@ -125,6 +140,47 @@ mod tests {
             "every triangle should sit in exactly one leaf",
         );
         assert!(scene.depth > 0, "1576 triangles should not be one leaf");
+    }
+
+    #[test]
+    fn the_light_table_covers_every_emissive_triangle() {
+        // Melee is the example with a light in it: a mesh, so the table should
+        // hold all of its triangles and nothing else.
+        let source = fs::read_to_string("examples/melee/render.toml").unwrap();
+        let mut config: Config = toml::from_str(&source).unwrap();
+        config.validate(Path::new("examples/melee")).unwrap();
+
+        let scene = Scene::load(&config).unwrap();
+
+        let emissive = scene
+            .triangles
+            .iter()
+            .filter(|t| scene.materials[t.material as usize].kind == LIGHT)
+            .count();
+        assert!(emissive > 0, "melee's light should have survived the load");
+        assert_eq!(scene.lights.len(), emissive);
+        assert!(scene.light_power > 0.0);
+
+        // The entries address the permuted list the shader reads, not the order
+        // the config listed the objects in, and they ascend to exactly one.
+        for entry in &scene.lights {
+            let triangle = scene.triangles[entry.triangle as usize];
+            assert_eq!(scene.materials[triangle.material as usize].kind, LIGHT);
+        }
+        assert!(scene.lights.windows(2).all(|p| p[0].cdf <= p[1].cdf));
+        assert_eq!(scene.lights.last().unwrap().cdf, 1.0);
+    }
+
+    #[test]
+    fn a_scene_without_an_emitter_has_no_lights() {
+        let source = fs::read_to_string("examples/teapot/render.toml").unwrap();
+        let mut config: Config = toml::from_str(&source).unwrap();
+        config.validate(Path::new("examples/teapot")).unwrap();
+
+        let scene = Scene::load(&config).unwrap();
+
+        assert!(scene.lights.is_empty());
+        assert_eq!(scene.light_power, 0.0);
     }
 
     #[test]
