@@ -16,8 +16,9 @@
 # up as a floor that is flatly too bright or too dark rather than as noise.
 #
 # Everything is taken from the normals example, whose geometry already agrees
-# with itself: object paths resolve against the config's directory, so this can
-# reach back into `examples/` instead of checking in a second copy.
+# with itself, copied in beside this file: object paths resolve against the
+# config's directory, and the copy is what keeps an edit over in `examples/`
+# from moving the reference frame here.
 #
 # Nothing here may change without regenerating the reference beside it:
 #
@@ -46,7 +47,7 @@ background = [0.0, 0.0, 0.0]
 # Orb
 [[objects]]
 shape = "wavefront"
-file = "../../examples/normals/scene.obj"
+file = "normals.obj"
 group = "Smooth"
 material = "metal"
 albedo = [0.9, 0.9, 0.9]
@@ -55,7 +56,7 @@ roughness = 0.4
 # Floor
 [[objects]]
 shape = "wavefront"
-file = "../../examples/normals/scene.obj"
+file = "normals.obj"
 group = "Plane"
 material = "lambertian"
 albedo = [0.72, 0.72, 0.75]
@@ -64,7 +65,7 @@ albedo = [0.72, 0.72, 0.75]
 # the light in the scene.
 [[objects]]
 shape = "wavefront"
-file = "../../examples/normals/scene.obj"
+file = "normals.obj"
 group = "Plane"
 material = "light"
 emit = [3.0, 3.0, 3.0]
@@ -80,7 +81,7 @@ offset = [0.0, 9.0, 0.0]
 # Bulb: two and a half thousand triangles for a fraction of the panel's output.
 [[objects]]
 shape = "wavefront"
-file = "../../examples/normals/scene.obj"
+file = "normals.obj"
 group = "Light"
 material = "light"
 emit = [9.0, 9.0, 9.0]

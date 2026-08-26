@@ -86,7 +86,6 @@ mod tests {
     use super::*;
     use crate::scene::material::LAMBERTIAN;
     use crate::scene::material::LIGHT;
-    use crate::scene::material::METAL;
     use crate::scene::testing::triangles;
     use crate::scene::testing::wavefront;
     use std::fs;
@@ -100,22 +99,35 @@ mod tests {
 
         let scene = Scene::load(&config).unwrap();
 
+        // Both blocks are lambertian; they stay separate materials because
+        // they ask for different albedos, and they keep the order the file
+        // lists them in.
         assert_eq!(scene.materials.len(), 2);
-        assert_eq!(scene.materials[0].kind, METAL);
+        assert_eq!(scene.materials[0].kind, LAMBERTIAN);
         assert_eq!(scene.materials[1].kind, LAMBERTIAN);
+        assert_eq!(scene.materials[0].color, [0.72, 0.72, 0.75]);
+        assert_eq!(scene.materials[1].color, [0.3, 0.72, 0.3]);
 
-        // Every triangle belongs to the object that asked for it, and the two
-        // blocks together account for the whole file.
+        // Every triangle belongs to the object that asked for it, and each
+        // block holds exactly the group it named.
+        let obj = fs::read_to_string("examples/teapot/teapot.obj").unwrap();
         let teapot = scene.triangles.iter().filter(|t| t.material == 0).count();
         let plane = scene.triangles.iter().filter(|t| t.material == 1).count();
         assert!(teapot > 0 && plane > 0);
         assert_eq!(teapot + plane, scene.triangles.len());
-
-        let whole_file = triangles(
-            &fs::read_to_string("examples/teapot/teapot.obj").unwrap(),
-            &wavefront(None, vec![]),
+        assert_eq!(
+            teapot,
+            triangles(&obj, &wavefront(Some("Teapot"), vec![])).len()
         );
-        assert_eq!(teapot + plane, whole_file.len());
+        assert_eq!(
+            plane,
+            triangles(&obj, &wavefront(Some("Plane"), vec![])).len()
+        );
+
+        // The file also holds a group the scene never asks for, so selecting by
+        // group has to leave something out rather than take the whole file.
+        let whole_file = triangles(&obj, &wavefront(None, vec![]));
+        assert!(scene.triangles.len() < whole_file.len());
     }
 
     #[test]

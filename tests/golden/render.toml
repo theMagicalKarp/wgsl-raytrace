@@ -3,9 +3,9 @@
 # Small enough to render anywhere in a moment, and wide enough to be worth
 # checking: primary rays through a jittered lens, BVH traversal, both of the
 # scatter models a mesh can carry, and the background a path that escapes
-# brings home. The mesh is the example teapot rather than one of its own —
-# object paths resolve against the config's directory, so this can reach back
-# into `examples/` instead of checking in a second copy.
+# brings home. The mesh is a copy of the example teapot, checked in beside this
+# file: object paths resolve against the config's directory, and the copy is
+# what keeps an edit over in `examples/` from moving the reference frame here.
 #
 # Nothing here may change without regenerating the reference beside it:
 #
@@ -37,7 +37,7 @@ background = [0.70, 0.80, 0.99]
 # Teapot
 [[objects]]
 shape = "wavefront"
-file = "../../examples/teapot/teapot.obj"
+file = "teapot.obj"
 group = "Teapot"
 material = "metal"
 albedo = [0.42, 0.20, 0.70]
@@ -55,7 +55,7 @@ degrees = 31.5
 # Floor
 [[objects]]
 shape = "wavefront"
-file = "../../examples/teapot/teapot.obj"
+file = "teapot.obj"
 group = "Plane"
 material = "lambertian"
 albedo = [0.72, 0.72, 0.75]
