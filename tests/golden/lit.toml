@@ -1,0 +1,86 @@
+# The second golden scene: the one with emitters in it.
+#
+# `render.toml` beside this is lit by its background alone, which means it never
+# reaches the shader's light sampling at all — nothing in it is emissive, so the
+# table is empty and every path finds its light by escaping. This scene is the
+# other half, and it is deliberately awkward about it: two emitters whose share
+# of the light in the room has nothing to do with their share of the triangles.
+#
+# The panel overhead is one quad — two triangles — and puts out most of the
+# light. The sphere is a mesh of two and a half thousand and puts out the rest.
+# Draw an emitter uniformly and the panel is picked one time in twelve hundred,
+# which is a floor lit almost entirely by paths that stumbled into it; weight the
+# draw by the light each one actually emits and the panel gets its share. Both
+# are correct, and converge to the same image — this scene is here because they
+# converge at very different speeds, and because a mistake in the weighting shows
+# up as a floor that is flatly too bright or too dark rather than as noise.
+#
+# Everything is taken from the normals example, whose geometry already agrees
+# with itself: object paths resolve against the config's directory, so this can
+# reach back into `examples/` instead of checking in a second copy.
+#
+# Nothing here may change without regenerating the reference beside it:
+#
+#   UPDATE_GOLDEN=1 cargo test golden
+
+[camera]
+aspect_ratio = "square"
+image_width = 32
+
+# Both frames walk the same RNG sequence, so Monte Carlo noise cancels in the
+# comparison rather than adding to it.
+samples = 64
+
+# Well under the examples' 64, for the same reason `render.toml` is: a short
+# path is a shorter chain of floating point for the backends to disagree along.
+max_bounces = 8
+
+fov = 30
+look_from = [-4.57, 9.01, -5.7]
+look_at = [0.0, 2.0, 0.0]
+vup = [0.0, 1.0, 0.0]
+
+# The two emitters are the only things that give off light.
+background = [0.0, 0.0, 0.0]
+
+# Orb
+[[objects]]
+shape = "wavefront"
+file = "../../examples/normals/scene.obj"
+group = "Smooth"
+material = "metal"
+albedo = [0.9, 0.9, 0.9]
+roughness = 0.4
+
+# Floor
+[[objects]]
+shape = "wavefront"
+file = "../../examples/normals/scene.obj"
+group = "Plane"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+# Panel: the same quad, shrunk and lifted overhead. Two triangles, and most of
+# the light in the scene.
+[[objects]]
+shape = "wavefront"
+file = "../../examples/normals/scene.obj"
+group = "Plane"
+material = "light"
+emit = [3.0, 3.0, 3.0]
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.1, 1.0, 0.1]
+
+[[objects.transform]]
+type = "translate"
+offset = [0.0, 9.0, 0.0]
+
+# Bulb: two and a half thousand triangles for a fraction of the panel's output.
+[[objects]]
+shape = "wavefront"
+file = "../../examples/normals/scene.obj"
+group = "Light"
+material = "light"
+emit = [9.0, 9.0, 9.0]

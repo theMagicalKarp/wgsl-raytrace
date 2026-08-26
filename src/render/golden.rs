@@ -6,8 +6,26 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-const SCENE: &str = "tests/golden/render.toml";
-const REFERENCE: &str = "tests/golden/reference.png";
+/// A scene rendered by the tests below, and the frame it has to keep matching.
+struct Golden {
+    scene: &'static str,
+    reference: &'static str,
+}
+
+/// Lit by its background: no emitter, so the shader's light list is empty and
+/// every path finds its light by escaping the scene.
+const UNLIT: Golden = Golden {
+    scene: "tests/golden/render.toml",
+    reference: "tests/golden/reference.png",
+};
+
+/// Lit by one emissive mesh against a black background, which is the only thing
+/// that exercises direct light sampling and the weighting that combines it with
+/// scattering.
+const LIT: Golden = Golden {
+    scene: "tests/golden/lit.toml",
+    reference: "tests/golden/lit.png",
+};
 
 /// How far one channel may drift before its pixel is called an outlier rather
 /// than noise, out of 255.
@@ -54,13 +72,13 @@ fn compare(actual: &[u8], expected: &[u8]) -> Difference {
     }
 }
 
-/// Renders the golden scene, from the config on disk so the test exercises the
+/// Renders a golden scene, from the config on disk so the test exercises the
 /// same path the binary does.
-fn render() -> Image {
-    let source = fs::read_to_string(SCENE).expect("the golden scene should be readable");
+fn render(golden: &Golden) -> Image {
+    let source = fs::read_to_string(golden.scene).expect("the golden scene should be readable");
     let mut config: Config = toml::from_str(&source).expect("the golden scene should parse");
     config
-        .validate(Path::new(SCENE).parent().unwrap())
+        .validate(Path::new(golden.scene).parent().unwrap())
         .expect("the golden scene's mesh should exist");
 
     let scene = Scene::load(&config).expect("the golden scene should load");
@@ -102,22 +120,23 @@ fn amplified(actual: &Image, expected: &[u8]) -> Image {
     }
 }
 
-#[test]
-fn the_render_matches_the_reference() {
+/// Renders `golden` and holds it against the frame on disk, or rewrites that
+/// frame when the run asked for it.
+fn compare_to_reference(golden: &Golden, name: &str) {
     if env::var_os("WGSL_RAYTRACE_SKIP_GPU_TESTS").is_some() {
         return;
     }
 
-    let image = render();
+    let image = render(golden);
 
     if env::var_os("UPDATE_GOLDEN").is_some() {
         image
-            .save(Path::new(REFERENCE))
+            .save(Path::new(golden.reference))
             .expect("the reference should be writable");
         return;
     }
 
-    let reference = image::open(REFERENCE)
+    let reference = image::open(golden.reference)
         .expect("the reference should decode — regenerate it with UPDATE_GOLDEN=1")
         .to_rgba8();
     assert_eq!(
@@ -133,23 +152,34 @@ fn the_render_matches_the_reference() {
 
     // Everything a run needs to judge whether the tolerance is wrong or the
     // shader is: the two measured numbers, and somewhere to look at the frames.
-    let rendered = dump("wgsl-raytrace-golden-actual.png", &image);
+    let rendered = dump(&format!("wgsl-raytrace-{name}-actual.png"), &image);
     let diff = dump(
-        "wgsl-raytrace-golden-diff.png",
+        &format!("wgsl-raytrace-{name}-diff.png"),
         &amplified(&image, &reference),
     );
 
     panic!(
-        "the render drifted from {REFERENCE}\n  \
+        "the render drifted from {}\n  \
            mae      {:.3} / {MAX_MAE} per channel\n  \
            outliers {:.4} / {MAX_OUTLIERS} of pixels past {OUTLIER}\n  \
            rendered {}\n  \
            diff     {} (amplified 8x)",
+        golden.reference,
         difference.mae,
         difference.outliers,
         rendered.display(),
         diff.display(),
     );
+}
+
+#[test]
+fn the_render_matches_the_reference() {
+    compare_to_reference(&UNLIT, "golden");
+}
+
+#[test]
+fn the_lit_render_matches_the_reference() {
+    compare_to_reference(&LIT, "golden-lit");
 }
 
 #[test]

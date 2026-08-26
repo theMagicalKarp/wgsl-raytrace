@@ -94,7 +94,7 @@ frame is the normals the shader interpolates. 800x450, 5000 samples.
 
 The CPU tracer's stress scene, ported: nine blocks selected out of a single
 mesh, glass and metal and lambertian side by side, lit by an emissive sphere
-above the frame that is the only light in a black background. 1200x675, 10000
+above the frame that is the only light in a black background. 1200x675, 1000
 samples.
 
 ![The melee scene](examples/melee/render.png)
