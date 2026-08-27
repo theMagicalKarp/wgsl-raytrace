@@ -411,6 +411,39 @@ degrees = 31.5
         assert_eq!(config.camera.background, [0.0, 0.0, 0.0]);
     }
 
+    /// A light is its emitted color and nothing else: emission is always from
+    /// the one face the triangle's winding points at, so there is no flag to
+    /// misspell into the config.
+    #[test]
+    fn a_light_takes_no_field_beyond_what_it_emits() {
+        let source = MINIMAL.replace(
+            r#"material = "lambertian"
+albedo = [0.42, 0.2, 0.7]"#,
+            r#"material = "light"
+emit = [3.0, 3.0, 3.0]"#,
+        );
+
+        let config: Config = toml::from_str(&source).unwrap();
+        let Object::Wavefront(wavefront) = &config.objects[0];
+
+        assert_eq!(
+            wavefront.material,
+            Material::Light {
+                emit: [3.0, 3.0, 3.0]
+            }
+        );
+        assert_eq!(wavefront.material.to_string(), "light[3.0, 3.0, 3.0]");
+
+        assert!(
+            toml::from_str::<Config>(&source.replace(
+                "emit = [3.0, 3.0, 3.0]",
+                "emit = [3.0, 3.0, 3.0]\ntwo_sided = true"
+            ))
+            .is_err(),
+            "sidedness is not a thing a scene gets to ask about"
+        );
+    }
+
     #[test]
     fn rejects_unsupported_shapes() {
         let scene = MINIMAL.replace(

@@ -86,4 +86,25 @@ mod tests {
             }
         );
     }
+
+    /// A light is its emitted radiance and nothing more. Which face it emits
+    /// from is not a per-material question any more — the shader answers it the
+    /// one way, from the triangle's winding — so nothing about sidedness has to
+    /// survive the trip into the buffer.
+    #[test]
+    fn a_light_carries_its_emission_and_nothing_else() {
+        let light = GpuMaterial::from(&Material::Light {
+            emit: [1.0, 2.0, 3.0],
+        });
+
+        assert_eq!(
+            light,
+            GpuMaterial {
+                color: [1.0, 2.0, 3.0],
+                kind: LIGHT,
+                parameter: 0.0,
+                _pad: [0.0; 3],
+            }
+        );
+    }
 }

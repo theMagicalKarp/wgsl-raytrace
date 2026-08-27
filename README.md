@@ -274,6 +274,12 @@ emit = [7.0, 7.0, 7.0]
 
 - `emit`: The RGB color of the emitted light.
 
+Emission is one-sided: a surface gives off light through the face its winding
+points at and nothing through the other, so a ceiling panel wound to face down
+lights the room and not the cavity above it. A closed mesh is unaffected — its
+inside is never seen — but open geometry has to be wound to face where the light
+is wanted.
+
 ## Layout
 
 ```
