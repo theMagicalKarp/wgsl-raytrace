@@ -380,6 +380,18 @@ mod tests {
         assert_eq!(resolve(&[[0.0; 4]]), [0, 0, 0, 255]);
     }
 
+    /// The shader rejects a non-finite sample before it reaches the accumulator,
+    /// so this should never fire in practice. It is asserted anyway because it
+    /// is the other half of that guarantee: `f32::max` returns its non-NaN
+    /// operand, which is the only reason a poisoned sum resolves to black rather
+    /// than to whatever `as u8` makes of a NaN.
+    #[test]
+    fn a_poisoned_sum_still_resolves_to_a_pixel() {
+        let nan = f32::NAN;
+        assert_eq!(resolve(&[[nan, nan, nan, 1.0]]), [0, 0, 0, 255]);
+        assert_eq!(resolve(&[[f32::INFINITY, 0.0, 0.0, 1.0]]), [255, 0, 0, 255]);
+    }
+
     #[test]
     fn gamma_encodes_and_clamps() {
         let pixels = resolve(&[[0.0, 0.5, 1.0, 1.0], [-1.0, 2.0, 1.0, 1.0]]);

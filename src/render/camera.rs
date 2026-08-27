@@ -46,9 +46,25 @@ pub struct GpuCamera {
     /// loaded, which is why [`From`] leaves them zero.
     pub light_count: u32,
     pub light_power: f32,
+
+    /// The side of the square grid a pixel's samples are stratified over, so
+    /// that `strata * strata` samples cover the pixel one cell each instead of
+    /// clumping the way independent draws do. One reduces exactly to an
+    /// unstratified jitter, which is what keeps a single-sample render from
+    /// being a special case.
+    ///
+    /// Unlike `light_count` and `light_power` this is a camera setting — it
+    /// falls out of `samples` — so [`From`] fills it in rather than
+    /// [`render`](crate::render::render).
+    pub strata: u32,
+
+    /// Every row above is a `vec3<f32>` paired with a scalar and so is exactly
+    /// the 16 bytes WGSL aligns one to. `strata` has no vector to ride beside,
+    /// which is what costs this block a seventh row.
+    _pad: [u32; 3],
 }
 
-const _: () = assert!(size_of::<GpuCamera>() == 96);
+const _: () = assert!(size_of::<GpuCamera>() == 112);
 
 impl From<&CameraOptions> for GpuCamera {
     fn from(camera: &CameraOptions) -> Self {
@@ -70,6 +86,8 @@ impl From<&CameraOptions> for GpuCamera {
             height,
             light_count: 0,
             light_power: 0.0,
+            strata: (camera.samples as f32).sqrt() as u32,
+            _pad: [0; 3],
         }
     }
 }
@@ -107,6 +125,40 @@ look_at = [0.0, 0.0, 0.0]
         assert_eq!(gpu.light_count, 0, "the scene is what knows about lights");
         assert_eq!(gpu.light_power, 0.0);
         assert_eq!(gpu.defocus_radius, 0.0, "a scene without one is a pinhole");
+        assert_eq!(
+            gpu.strata, 2,
+            "eight samples stratify over a two by two grid"
+        );
+    }
+
+    #[test]
+    fn strata_is_the_largest_square_that_fits_the_sample_count() {
+        let with = |samples: u32| {
+            camera(&format!(
+                r#"
+[camera]
+aspect_ratio = "square"
+image_width = 64
+samples = {samples}
+max_bounces = 4
+fov = 90
+look_from = [0.0, 0.0, 5.0]
+look_at = [0.0, 0.0, 0.0]
+"#
+            ))
+            .strata
+        };
+
+        // A single sample has no grid to walk, and the shader's `max(strata, 1)`
+        // turns this back into the jitter it had before stratification.
+        assert_eq!(with(1), 1);
+        assert_eq!(with(64), 8, "an exact square covers every cell equally");
+
+        // Not a square, so the shader wraps: with 70 samples the first six cells
+        // of the 8x8 grid take two and the rest take one, which is a spread
+        // unstratified sampling only manages on average.
+        assert_eq!(with(70), 8);
+        assert_eq!(with(63), 7, "and it never claims a grid it cannot fill");
     }
 
     #[test]

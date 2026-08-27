@@ -50,6 +50,9 @@ struct Camera {
     // What those entries add up to, and what turns one entry's share of the
     // table back into a probability.
     light_power: f32,
+    // The side of the square grid a pixel's samples are stratified over. One is
+    // an unstratified jitter.
+    strata: u32,
 }
 
 // One surface, packed by `GpuMaterial`. `kind` selects what the other two mean:
@@ -439,9 +442,39 @@ fn scatter(ray: Ray, hit: Intersection, material: Material) -> Scatter {
 // The ray through `pixel` for this sample: jittered inside the pixel so that
 // samples across passes anti-alias the edges, and started from a point on the
 // lens so that everything off the focus plane blurs.
+//
+// The jitter is stratified rather than drawn twice from [0, 1). Independent
+// draws clump and gap exactly as often as chance allows; one draw per cell of a
+// square grid cannot, and it costs nothing. The book nests two loops per pixel
+// and reads the cell off the counters, but a dispatch here carries one sample,
+// so the cell has to come from `camera.sample` — which the host rewrites every
+// pass anyway.
+//
+// Only the pixel is stratified. The lens draw below, the scatter directions and
+// the light draws stay independent: padding those dimensions needs machinery
+// this does not have, and the edge noise is what the pixel grid buys.
 fn primary_ray(pixel: vec2u) -> Ray {
     let resolution = vec2f(f32(camera.width), f32(camera.height));
-    let uv = (vec2f(pixel) + vec2f(rand_f32(), rand_f32())) / resolution;
+
+    // Which cell of the s-by-s grid this sample owns. With `samples` an exact
+    // multiple of `s * s` every cell takes the same count; otherwise the wrap
+    // leaves them differing by one, which is what unstratified sampling manages
+    // only on average — so it is never worse than what this replaces.
+    let s = max(camera.strata, 1u);
+    let cell = (camera.sample - 1u) % (s * s);
+
+    // Every pixel would otherwise walk the grid in the same order, which leaves
+    // the residual error correlated across the image and reads as banding rather
+    // than as noise. Rotating the cell per pixel is a bijection on [0, s), so a
+    // pixel still visits every cell exactly once per `s * s` samples. Both
+    // offsets are reduced before the addition so the sum cannot wrap a u32,
+    // which would cost the map its bijectivity for the pixels it happened to.
+    let shuffle = jenkins_hash(pixel.x + pixel.y * camera.width);
+    let x = (cell % s + shuffle % s) % s;
+    let y = (cell / s + (shuffle >> 16u) % s) % s;
+
+    let jitter = (vec2f(f32(x), f32(y)) + vec2f(rand_f32(), rand_f32())) / f32(s);
+    let uv = (vec2f(pixel) + jitter) / resolution;
 
     // To [-1, 1], with +y up rather than down the image.
     let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -482,6 +515,33 @@ fn luminance(color: vec3f) -> f32 {
     return dot(color, vec3f(0.2126, 0.7152, 0.0722));
 }
 
+// The normal of the triangle as it was built, not as it is shaded. Emission
+// sidedness is a question about the surface a point was drawn on, and an
+// interpolated normal is not that surface — the two disagree on a smooth-shaded
+// mesh near a silhouette, which is the hardest possible place to notice that one
+// strategy is claiming a direction the other prices at zero.
+fn geometric_normal(tri: Triangle) -> vec3f {
+    return normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+}
+
+// How foreshortened an emitter is along `direction`, which points from the
+// shading point toward it — and zero when the emitter has its back turned, so
+// that [`light_density`] prices the draw at nothing. Emission is one-sided,
+// always: a light gives off nothing through the face its winding points away
+// from.
+//
+// Both [`sample_light`] and [`light_pdf`] go through here for the same reason
+// the cosine floor lives in one place: the two have to agree exactly on which
+// directions the light sampler can produce, or the heuristic loses light on one
+// side and doubles it on the other.
+fn emitted_cosine(tri: Triangle, direction: vec3f) -> f32 {
+    // Positive when the winding points back along the direction of travel, which
+    // is the face a shading point at the other end of it can see.
+    let facing = -dot(geometric_normal(tri), direction);
+
+    return max(facing, 0.0);
+}
+
 // The density with which [`sample_light`] draws a direction, per unit solid
 // angle, given the emitter it lands on and how that emitter is turned.
 //
@@ -493,8 +553,20 @@ fn luminance(color: vec3f) -> f32 {
 // direction can be priced from the triangle alone, which is what makes weighing
 // a scattered ray that happened to land on an emitter cost a lookup rather than
 // a search.
+//
+// The floor under `cosine` is not the same thing as rejecting a back face. A
+// direction can be arbitrarily close to tangent to an emitter without being
+// behind it, and dividing by that cosine sends the density to infinity — which
+// [`power_heuristic`] then squares into `inf / inf`, a NaN that reaches the
+// accumulator and stays there. Rejecting those directions outright is the fix,
+// and it belongs here rather than in either caller: this one function is what
+// both [`sample_light`] and [`light_pdf`] price a direction with, so a floor
+// raised in one place keeps the two strategies agreeing about which directions
+// the light sampler can produce at all.
+const MIN_LIGHT_COSINE: f32 = 1e-6;
+
 fn light_density(emit: vec3f, distance: f32, cosine: f32) -> f32 {
-    if cosine <= 0.0 || camera.light_power <= 0.0 {
+    if cosine <= MIN_LIGHT_COSINE || camera.light_power <= 0.0 {
         return 0.0;
     }
 
@@ -508,13 +580,13 @@ fn light_density(emit: vec3f, distance: f32, cosine: f32) -> f32 {
 // so a shadow ray aimed there returns nothing and that draw contributes zero.
 fn light_pdf(hit: Intersection, direction: vec3f) -> f32 {
     let tri = triangles[hit.triangle];
-    let normal = cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
-    // Emitters are two-sided, so a face turned away still emits toward whatever
-    // is looking at its back.
-    let cosine = abs(dot(normalize(normal), direction));
+    let material = materials[hit.material];
+    let cosine = emitted_cosine(tri, direction);
 
-    // Directions are unit, so `hit.t` is the distance to the emitter.
-    return light_density(materials[hit.material].color, hit.t, cosine);
+    // Directions are unit, so `hit.t` is the distance to the emitter. An emitter
+    // arrived at from behind prices at zero here, which is the half of sidedness
+    // that is easy to forget and the half that keeps the heuristic consistent.
+    return light_density(material.color, hit.t, cosine);
 }
 
 // The entry whose slice of the table a uniform draw lands in: the first whose
@@ -581,18 +653,19 @@ fn sample_light(origin: vec3f) -> LightSample {
 
     // The geometric normal, not the interpolated one: the density is written
     // against the surface that was actually sampled, and a shading normal is not
-    // that surface. Emitters are two-sided like everything else, so only how
-    // foreshortened the face is matters.
-    let normal = cross(e1, e2);
-    let cosine = abs(dot(normalize(normal), direction));
+    // that surface.
+    let material = materials[tri.material];
+    let cosine = emitted_cosine(tri, direction);
 
-    let emit = materials[tri.material].color;
     var pdf = 0.0;
     if distance > 0.0 {
-        pdf = light_density(emit, distance, cosine);
+        pdf = light_density(material.color, distance, cosine);
     }
 
-    return LightSample(direction, distance, emit, pdf);
+    // An emitter with its back turned leaves `pdf` at zero, and
+    // `direct_light` ends the draw on that before the shadow ray is cast — so
+    // this is a traversal saving as much as it is a knob.
+    return LightSample(direction, distance, material.color, pdf);
 }
 
 // Next event estimation: the light this surface receives directly, found by
@@ -665,6 +738,16 @@ fn trace_path(primary: Ray) -> vec3f {
             // The heuristic hands over only the share this strategy earned, and
             // `direct_light` took the rest. A specular bounce, or the camera,
             // had no direct sample to double, and keeps everything.
+            // An emitter struck on its back emits nothing. Decided by the
+            // geometric normal and never by `hit.front_face`, which is derived
+            // from the interpolated vertex normal: on a smooth-shaded mesh the
+            // two part company near a silhouette, and `sample_light` draws its
+            // points on the geometric surface.
+            let front = dot(geometric_normal(triangles[hit.triangle]), ray.direction) < 0.0;
+            if !front {
+                return radiance;
+            }
+
             var weight = 1.0;
             if !specular {
                 weight = power_heuristic(scatter_pdf, light_pdf(hit, ray.direction));
@@ -735,8 +818,20 @@ fn trace(@builtin(global_invocation_id) id: vec3u) {
     init_rng(pixel);
     let radiance = trace_path(primary_ray(pixel));
 
+    // A backstop for whatever still manages to produce one. The accumulator sums
+    // across every dispatch, so a single non-finite sample would otherwise turn
+    // that pixel's running total into a NaN no later sample could pull back —
+    // one bad path costing the pixel the entire render. Dropping the sample and
+    // still counting it in `w` costs one sample's worth of light instead.
+    //
+    // NaN fails every comparison it is given, so this rejects one as well as an
+    // infinity. A finite value large enough to trip it is already past anything
+    // the accumulator could average back down.
+    let finite = abs(radiance) < vec3f(FLT_MAX);
+    let clean = select(vec3f(0.0), radiance, finite);
+
     // Radiance sums in `rgb`, samples in `w`, so the host can average without
     // being told how many passes ran.
     let index = pixel.y * camera.width + pixel.x;
-    accum[index] = accum[index] + vec4f(radiance, 1.0);
+    accum[index] = accum[index] + vec4f(clean, 1.0);
 }

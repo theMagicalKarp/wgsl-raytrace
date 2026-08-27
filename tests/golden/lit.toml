@@ -61,8 +61,15 @@ group = "Plane"
 material = "lambertian"
 albedo = [0.72, 0.72, 0.75]
 
-# Panel: the same quad, shrunk and lifted overhead. Two triangles, and most of
-# the light in the scene.
+# Panel: the same quad, shrunk, turned over and lifted overhead. Two triangles,
+# and most of the light in the scene.
+#
+# The turning over is the point of the rotation. This is the floor quad, wound
+# to face +y, and a ceiling panel facing the ceiling emits into the cavity above
+# it and leaves the room dark — which is what happens now that emission is
+# one-sided by default. The square is centred on the origin and symmetric, so
+# rotating it before the lift moves no vertex anywhere it was not already and
+# changes only which way it faces.
 [[objects]]
 shape = "wavefront"
 file = "normals.obj"
@@ -73,6 +80,11 @@ emit = [3.0, 3.0, 3.0]
 [[objects.transform]]
 type = "scale"
 scalar = [0.1, 1.0, 0.1]
+
+[[objects.transform]]
+type = "rotate"
+axis = "x"
+degrees = 180.0
 
 [[objects.transform]]
 type = "translate"
