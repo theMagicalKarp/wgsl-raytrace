@@ -1,0 +1,53 @@
+[camera]
+aspect_ratio = "square"
+image_width = 800
+samples = 1000
+max_bounces = 64
+fov = 35
+look_from = [0.0, 1.0, 0.0]
+look_at = [1.0, 1.0, 0.0]
+vup = [0.0, 1.0, 0.0]
+background = [0.70, 0.80, 0.99]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "LeftWall"
+material = "lambertian"
+albedo = [0.99, 0.001, 0.001]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "RightWall"
+material = "lambertian"
+albedo = [0.001, 0.99, 0.001]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Room"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "RightCube"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "LeftCube"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "BackWall"
+material = "metal"
+albedo = [0.99, 0.99, 0.99]
+roughness = 0.1
