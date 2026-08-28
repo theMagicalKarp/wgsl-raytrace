@@ -36,6 +36,26 @@ run = "cargo fmt --check"
 description = "Check for linting issues"
 run = "cargo clippy --all-targets --all-features -- -D warnings"
 
+[tasks.example]
+description = "Run a single example scene through the binary, e.g. `mise run example teapot`"
+depends = ["release"]
+usage = 'arg "<name>" help="Name of the example directory under examples/"'
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+dir="examples/$usage_name"
+
+if [ ! -f "$dir/render.toml" ]; then
+  echo "No example named '$usage_name'. Available:" >&2
+  find examples -name render.toml | sort | xargs -n1 dirname | xargs -n1 basename >&2
+  exit 1
+fi
+
+echo "Rendering $dir"
+target/release/wgsl-raytrace --config "$dir/render.toml" --output "$dir/render.png"
+"""
+
 [tasks.examples]
 description = "Run every example scene through the binary"
 depends = ["release"]
