@@ -1,0 +1,51 @@
+[camera]
+aspect_ratio = "widescreen"
+image_width = 800
+samples = 20000
+max_bounces = 64
+fov = 30
+look_from = [5.60, 6.038, 8.077]
+look_at = [0.058, 1.91, 0.001]
+vup = [0.0, 1.0, 0.0]
+background = [0.0, 0.0, 0.0]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Suzanne1"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Suzanne2"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Suzanne3"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Floor"
+material = "lambertian"
+albedo = [0.73, 0.73, 0.73]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "LeftLight"
+material = "light"
+emit = [112.5, 96.6375, 82.4625]
+# 50.0*1.5, 42.95*1.5, 36.65*1.5
+# 1.0*50.0, 0.859*50.0, 0.733*50.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "RightLight"
+material = "light"
+emit = [100.0, 100.0, 100.0]
