@@ -1,0 +1,76 @@
+# The third golden scene: the one lit by an environment map with a sun in it.
+#
+# The other two cover the sky as scattering finds it — `render.toml` escapes to
+# a flat background, `lit.toml` samples emissive triangles against a black one.
+# Neither reaches `sample_sky`, because a flat background gets no sampling
+# distribution built for it at all. This scene is what holds the sky's half of
+# next event estimation to a frame: the 2D distribution in `scene/sky.rs`, the
+# binary searches and Jacobian in `sky_pdf`, and the weight that keeps an
+# escaped ray from counting light a shadow ray already brought home.
+#
+# `sky.exr` is a 64x32 equirectangular map, rows running from the +Y pole down:
+#
+#   sky    (v < 0.5)     [0.35, 0.45, 0.70] * (1.4 - v)
+#   ground (v >= 0.5)    [0.12, 0.10, 0.08]
+#   sun    x in 20..22, y in 8..10    [300.0, 280.0, 240.0]
+#
+# The sun is the point of it. Four texels of about 0.03 steradians carry a few
+# times the light of the whole rest of the sky, which is the ratio that makes a
+# cosine-weighted bounce find them once in a few hundred draws and come back
+# carrying all of it. At 64 samples this frame is unrenderable that way and
+# perfectly ordinary with a shadow ray aimed at it, so a sampler that breaks
+# does not drift — it speckles, and the outlier budget catches it.
+#
+# Nothing here may change without regenerating the reference beside it:
+#
+#   UPDATE_GOLDEN=1 cargo test golden
+
+[camera]
+aspect_ratio = "square"
+image_width = 32
+samples = 64
+max_bounces = 8
+
+fov = 45
+look_from = [2.5, 1.2, 3.1]
+look_at = [0.0, 0.2, 0.0]
+vup = [0.0, 1.0, 0.0]
+
+[environment]
+file = "sky.exr"
+
+# Teapot. Lambertian and not metal, unlike `render.toml`: direct lighting is
+# lambertian-only, so a metal one would leave the shadow ray untested.
+[[objects]]
+shape = "wavefront"
+file = "teapot.obj"
+group = "Teapot"
+material = "lambertian"
+albedo = [0.72, 0.62, 0.45]
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.5, 0.5, 0.5]
+
+[[objects.transform]]
+type = "rotate"
+axis = "y"
+degrees = 31.5
+
+# Floor, which is what the teapot's shadow lands on and the only reason the
+# occlusion half of the estimator is visible at all.
+[[objects]]
+shape = "wavefront"
+file = "teapot.obj"
+group = "Plane"
+material = "lambertian"
+albedo = [0.72, 0.72, 0.75]
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.5, 0.5, 0.5]
+
+[[objects.transform]]
+type = "rotate"
+axis = "y"
+degrees = 31.5

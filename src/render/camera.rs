@@ -32,7 +32,19 @@ pub struct GpuCamera {
     pub w: [f32; 3],
     pub max_bounces: u32,
 
-    pub background: [f32; 3],
+    /// Yaw applied to an escaped ray before it is looked up in the environment
+    /// map, in radians. Like `light_count` below these are scene settings rather
+    /// than camera ones, and ride here because the shader wants them as scalars.
+    pub environment_rotation: f32,
+    /// Scales what the map returns. [`From`] leaves this at one rather than at
+    /// zero the way it does the other scene fields: zero is not a neutral
+    /// default here but a black sky, so a camera that never reached
+    /// [`render`](crate::render::render) should still light its scene.
+    pub environment_intensity: f32,
+    /// `sample` is a `u32` and the two above are `f32`, so this row is four
+    /// scalars where every other one is a `vec3<f32>` and a scalar. It measures
+    /// the same sixteen bytes either way.
+    _pad0: f32,
     /// 1-based index of the sample being traced, which also reseeds the RNG.
     pub sample: u32,
 
@@ -43,7 +55,8 @@ pub struct GpuCamera {
     /// they ride here because the shader needs them as scalars and this is the
     /// block it already reads scalars from.
     /// [`render`](crate::render::render) fills them in once the scene has been
-    /// loaded, which is why [`From`] leaves them zero.
+    /// loaded, which is why [`From`] leaves them zero. The two `environment_`
+    /// fields above are filled in the same place for the same reason.
     pub light_count: u32,
     pub light_power: f32,
 
@@ -58,10 +71,20 @@ pub struct GpuCamera {
     /// [`render`](crate::render::render).
     pub strata: u32,
 
+    /// The size of the distribution the shader aims sky samples with, in cells.
+    /// Zero in `sky_width` means the scene has no map worth aiming at — a flat
+    /// background, or a black one — and turns sky sampling off entirely, the
+    /// way `light_count` of zero turns off the triangle half.
+    ///
+    /// Filled in by [`render`](crate::render::render) alongside the other two
+    /// `environment_` fields, since like them it belongs to the scene.
+    pub sky_width: u32,
+    pub sky_height: u32,
+
     /// Every row above is a `vec3<f32>` paired with a scalar and so is exactly
-    /// the 16 bytes WGSL aligns one to. `strata` has no vector to ride beside,
-    /// which is what costs this block a seventh row.
-    _pad: [u32; 3],
+    /// the 16 bytes WGSL aligns one to. The four scalars of the seventh row
+    /// leave exactly this much of it over.
+    _pad: u32,
 }
 
 const _: () = assert!(size_of::<GpuCamera>() == 112);
@@ -80,14 +103,18 @@ impl From<&CameraOptions> for GpuCamera {
             focus_distance: camera.focus_dist,
             w,
             max_bounces: camera.max_bounces,
-            background: camera.background,
+            environment_rotation: 0.0,
+            environment_intensity: 1.0,
+            _pad0: 0.0,
             sample: 1,
             width,
             height,
             light_count: 0,
             light_power: 0.0,
             strata: (camera.samples as f32).sqrt() as u32,
-            _pad: [0; 3],
+            sky_width: 0,
+            sky_height: 0,
+            _pad: 0,
         }
     }
 }
@@ -124,6 +151,7 @@ look_at = [0.0, 0.0, 0.0]
         assert_eq!(gpu.sample, 1, "samples are counted from one");
         assert_eq!(gpu.light_count, 0, "the scene is what knows about lights");
         assert_eq!(gpu.light_power, 0.0);
+        assert_eq!(gpu.sky_width, 0, "and about the sky it aims samples at");
         assert_eq!(gpu.defocus_radius, 0.0, "a scene without one is a pinhole");
         assert_eq!(
             gpu.strata, 2,

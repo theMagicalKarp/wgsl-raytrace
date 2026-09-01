@@ -8,9 +8,10 @@ look_from = [0.815, 0.94, 3.6]
 look_at = [0.0, 0.25, 0.0]
 vup = [0.0, 1.0, 0.0]
 
+[environment]
 # The sphere overhead is the only thing that emits, so anything a path misses is
 # black rather than sky.
-background = [0.0, 0.0, 0.0]
+color = [0.0, 0.0, 0.0]
 
 # Backdrop
 [[objects]]

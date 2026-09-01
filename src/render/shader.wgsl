@@ -39,7 +39,11 @@ struct Camera {
     focus_distance: f32,
     w: vec3f,
     max_bounces: u32,
-    background: vec3f,
+    // Yaw applied to an escaped ray before the environment lookup, in radians,
+    // and the scale on what that lookup returns.
+    environment_rotation: f32,
+    environment_intensity: f32,
+    _pad0: f32,
     // 1-based index of the sample being traced; also reseeds the RNG.
     sample: u32,
     width: u32,
@@ -53,6 +57,11 @@ struct Camera {
     // The side of the square grid a pixel's samples are stratified over. One is
     // an unstratified jitter.
     strata: u32,
+    // Size of the sky's sampling distribution, in cells. Zero width means the
+    // scene has no map worth aiming at, and the whole of sky sampling is
+    // skipped — the same signal `light_count` gives for the triangle half.
+    sky_width: u32,
+    sky_height: u32,
 }
 
 // One surface, packed by `GpuMaterial`. `kind` selects what the other two mean:
@@ -116,6 +125,78 @@ struct Light {
 // rather than the scene: an emitter that is large or bright is worth more shadow
 // rays than one that is small or dim, and the table is what says by how much.
 @group(1) @binding(3) var<storage> lights: array<Light>;
+
+// The sky, as an equirectangular image. A scene that named no HDRI is handed a
+// one-texel map holding its flat color, so this is bound either way and there is
+// no second way for a path to find the background.
+@group(1) @binding(4) var environment: texture_2d<f32>;
+@group(1) @binding(5) var environment_sampler: sampler;
+
+// The sky's sampling distribution, built on the host in `scene/sky.rs`: a
+// marginal over the rows of the map, and one conditional over the columns of
+// each row, laid out row-major behind it. Both are cumulative, so drawing from
+// either is a binary search and the chance of a single cell is the gap between
+// two neighbouring entries — which is why the densities are not uploaded as
+// well.
+@group(1) @binding(6) var<storage> sky_marginal: array<f32>;
+@group(1) @binding(7) var<storage> sky_conditional: array<f32>;
+
+// Yaw about +Y, so the map can be turned to aim its sun at the scene without
+// moving the camera. `environment_direction` asks for the negative of the same
+// angle to undo it.
+fn rotate_y(direction: vec3f, angle: f32) -> vec3f {
+    let s = sin(angle);
+    let c = cos(angle);
+    return vec3f(
+        direction.x * c - direction.z * s,
+        direction.y,
+        direction.x * s + direction.z * c,
+    );
+}
+
+// Where a direction lands on the environment map.
+//
+// Longitude around +Y goes into u and latitude from the +Y pole down into v,
+// which is the layout every equirectangular image ships in. `direction` is
+// already normalized — primary rays and every scattered direction both are — so
+// the latitude is an `acos` and nothing more.
+fn environment_uv(direction: vec3f) -> vec2f {
+    let turned = rotate_y(direction, camera.environment_rotation);
+
+    return vec2f(
+        0.5 + atan2(turned.x, -turned.z) / TWO_PI,
+        acos(clamp(turned.y, -1.0, 1.0)) / PI,
+    );
+}
+
+// The inverse: the direction `environment_uv` maps back to this place on the
+// map.
+//
+// The two have to be exact inverses of each other, because `sample_sky` draws a
+// place on the map, comes here for a direction to aim a shadow ray along, and
+// then prices that direction by going back through `environment_uv`. A round
+// trip that drifted would leave the two halves of the heuristic weighing
+// different directions.
+fn environment_direction(uv: vec2f) -> vec3f {
+    let theta = uv.y * PI;
+    let phi = (uv.x - 0.5) * TWO_PI;
+    let sin_theta = sin(theta);
+
+    let turned = vec3f(sin_theta * sin(phi), cos(theta), -sin_theta * cos(phi));
+
+    return rotate_y(turned, -camera.environment_rotation);
+}
+
+// What a ray aimed at the sky brings home.
+fn environment_radiance(direction: vec3f) -> vec3f {
+    let uv = environment_uv(direction);
+
+    // `textureSampleLevel` and not `textureSample`: a compute shader has no
+    // implicit derivatives to pick a mip from, and there is only the one level
+    // to pick anyway.
+    let texel = textureSampleLevel(environment, environment_sampler, uv, 0.0);
+    return texel.rgb * camera.environment_intensity;
+}
 
 // Every thread draws from its own stream, seeded from where and when it is, so
 // two pixels never walk the same path and a pixel never repeats one across
@@ -668,6 +749,139 @@ fn sample_light(origin: vec3f) -> LightSample {
     return LightSample(direction, distance, material.color, pdf);
 }
 
+// The row of the sky's distribution a uniform draw lands in: the first whose
+// cumulative chance has overtaken it. The same search `select_light` runs, over
+// the marginal rather than the emitter table.
+fn sky_row(draw: f32) -> u32 {
+    var low = 0u;
+    var high = camera.sky_height - 1u;
+
+    loop {
+        if low >= high {
+            break;
+        }
+
+        let middle = (low + high) / 2u;
+        if sky_marginal[middle] > draw {
+            high = middle;
+        } else {
+            low = middle + 1u;
+        }
+    }
+
+    return low;
+}
+
+// And the column within that row, out of the conditional distribution stored
+// for it.
+fn sky_column(row: u32, draw: f32) -> u32 {
+    let base = row * camera.sky_width;
+    var low = 0u;
+    var high = camera.sky_width - 1u;
+
+    loop {
+        if low >= high {
+            break;
+        }
+
+        let middle = (low + high) / 2u;
+        if sky_conditional[base + middle] > draw {
+            high = middle;
+        } else {
+            low = middle + 1u;
+        }
+    }
+
+    return low;
+}
+
+// The density with which [`sample_sky`] draws `direction`, per unit solid angle,
+// and zero for a scene with no distribution to aim with — which is what leaves
+// the sky to scattering alone and gives an escaped ray its full weight in
+// [`trace_path`].
+//
+// The two cumulative tables are differenced back into the chance of the single
+// cell the direction lands in, which is why the host uploads no densities
+// beside them. Multiplied by the cell count that chance is a density over the
+// unit square, and the divisor converts it to one over solid angle: with
+// `theta = PI * v` and `phi = TWO_PI * u`, `sin(theta) dtheta dphi` is
+// `2 PI^2 sin(theta) du dv`.
+//
+// That `sin(theta)` is the real one, taken from the direction being priced. It
+// is not the `sin(theta)` the host folded into each cell's weight, and confusing
+// the two is the easy mistake here. The host's decides *where* samples go; this
+// one converts between measures, and it has to be evaluated pointwise or what
+// comes back is not a density at all.
+fn sky_pdf(direction: vec3f) -> f32 {
+    if camera.sky_width == 0u {
+        return 0.0;
+    }
+
+    let uv = environment_uv(direction);
+    let sin_theta = sin(uv.y * PI);
+    if sin_theta <= 0.0 {
+        // Straight up or straight down: no solid angle to spread a density over.
+        return 0.0;
+    }
+
+    // `atan2` returns PI on the seam, which puts u at exactly one and the index
+    // one past the end of the row.
+    let x = min(u32(uv.x * f32(camera.sky_width)), camera.sky_width - 1u);
+    let y = min(u32(uv.y * f32(camera.sky_height)), camera.sky_height - 1u);
+
+    var row = sky_marginal[y];
+    if y > 0u {
+        row -= sky_marginal[y - 1u];
+    }
+
+    let base = y * camera.sky_width;
+    var column = sky_conditional[base + x];
+    if x > 0u {
+        column -= sky_conditional[base + x - 1u];
+    }
+
+    let cells = f32(camera.sky_width * camera.sky_height);
+    return row * column * cells / (TWO_PI * PI * sin_theta);
+}
+
+// One direction drawn out of the sky, and what the estimator needs to weigh it.
+// The same shape as [`LightSample`] without the distance: nothing stands behind
+// the sky, so the shadow ray that checks it runs to infinity.
+struct SkySample {
+    // From the shading point toward the sky, unit length.
+    direction: vec3f,
+    // What the map holds there.
+    radiance: vec3f,
+    // Solid angle density of having drawn this direction. Zero is unusable.
+    pdf: f32,
+}
+
+// Draws a direction in proportion to how bright the map is along it: a cell out
+// of the distribution, then a point uniformly inside that cell.
+//
+// Uniformly inside is exactly right rather than an approximation — the density
+// is piecewise constant over a cell by construction. It is also why the host is
+// free to build the distribution coarser than the map it describes: a coarse
+// cell aims less precisely and the estimator divides by a correspondingly
+// blunter density, and neither of those is a bias.
+//
+// The pdf comes back through [`sky_pdf`] rather than out of the cell that was
+// drawn, so that the density this sample is divided by and the density a
+// scattered ray arriving the same way is priced at are the same function of the
+// same direction. Two evaluations that disagreed would leave the heuristic's
+// weights summing to something other than one, which loses light on one side and
+// doubles it on the other.
+fn sample_sky() -> SkySample {
+    let row = sky_row(rand_f32());
+    let column = sky_column(row, rand_f32());
+
+    let cell = vec2f(f32(column), f32(row)) + vec2f(rand_f32(), rand_f32());
+    let uv = cell / vec2f(f32(camera.sky_width), f32(camera.sky_height));
+    let direction = environment_direction(uv);
+
+    return SkySample(direction, environment_radiance(direction), sky_pdf(direction));
+}
+
 // Next event estimation: the light this surface receives directly, found by
 // aiming at an emitter instead of waiting for a scattered ray to wander into
 // one.
@@ -707,6 +921,44 @@ fn direct_light(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
     return light.radiance * albedo * cosine * weight / (PI * light.pdf);
 }
 
+// The same thing for the sky, which is an emitter here as much as a triangle is.
+//
+// An escaped ray finds the environment map on its own and always has, so this is
+// not what makes an HDRI light the scene — it is what makes it light the scene
+// *quietly*. A photographed sky puts a fifth of its light into a twentieth of a
+// percent of its texels, so a cosine-weighted bounce finds the sun about one
+// draw in two thousand and comes back carrying thousands of times the average.
+// That is a firefly, and it is why a map like that renders soft ambient light
+// beautifully and a sharp sun shadow not at all. Aiming at the sun finds it
+// every draw, and the shadow ray is what turns it into a shadow.
+//
+// Kept beside [`direct_light`] rather than folded into it because the two are
+// independent estimators and not two strategies for one: a direction either
+// reaches an emissive triangle or escapes to the sky, never both, so each is its
+// own two-way contest against scattering and neither one's weight has anything
+// to say about the other's. A surface under both pays for two shadow rays, which
+// is the honest price of sampling two things.
+fn direct_sky(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
+    let sky = sample_sky();
+
+    // Behind the surface, or a direction the distribution gives no weight to.
+    let cosine = dot(normal, sky.direction);
+    if sky.pdf <= 0.0 || cosine <= 0.0 {
+        return vec3f(0.0);
+    }
+
+    // To infinity, because that is where the sky is: `traverse` reads the limit
+    // as the farthest hit it will accept, so anything at all in the way blocks
+    // this.
+    if occluded(point, sky.direction, FLT_MAX) {
+        return vec3f(0.0);
+    }
+
+    let weight = power_heuristic(sky.pdf, cosine / PI);
+
+    return sky.radiance * albedo * cosine * weight / (PI * sky.pdf);
+}
+
 // Follows one path from the camera until it reaches a light, escapes the scene,
 // is absorbed, or runs out of bounces, and returns the radiance it carried back.
 fn trace_path(primary: Ray) -> vec3f {
@@ -724,8 +976,20 @@ fn trace_path(primary: Ray) -> vec3f {
     for (var bounce = 0u; bounce <= camera.max_bounces; bounce += 1u) {
         let hit = intersect_scene(ray);
         if hit.t < 0.0 {
-            // Nothing was hit, so the path escapes and the background lights it.
-            return radiance + throughput * camera.background;
+            // Nothing was hit, so the path escapes and the sky lights it.
+            //
+            // The previous vertex may already have aimed a shadow ray at this
+            // same part of the sky, in which case keeping all of what this ray
+            // found would count it twice — the identical bookkeeping an emissive
+            // triangle gets below, and the half of it that is easy to forget.
+            // `sky_pdf` returns zero when the scene has no distribution to aim
+            // with, so a scene that never sampled the sky hands over everything
+            // without needing a second path through here.
+            var weight = 1.0;
+            if !specular {
+                weight = power_heuristic(scatter_pdf, sky_pdf(ray.direction));
+            }
+            return radiance + throughput * environment_radiance(ray.direction) * weight;
         }
 
         let material = materials[hit.material];
@@ -756,10 +1020,17 @@ fn trace_path(primary: Ray) -> vec3f {
         }
 
         // Light arriving straight from an emitter, gathered before the path
-        // wanders off to find whatever else this surface can see.
-        if material.kind == LAMBERTIAN && camera.light_count > 0u {
+        // wanders off to find whatever else this surface can see. Both kinds of
+        // emitter, where a scene has both: the triangles in the light table, and
+        // the sky.
+        if material.kind == LAMBERTIAN {
             let point = point_on_ray(ray, hit.t);
-            radiance += throughput * direct_light(point, hit.normal, material.color);
+            if camera.light_count > 0u {
+                radiance += throughput * direct_light(point, hit.normal, material.color);
+            }
+            if camera.sky_width > 0u {
+                radiance += throughput * direct_sky(point, hit.normal, material.color);
+            }
         }
 
         let scattered = scatter(ray, hit, material);

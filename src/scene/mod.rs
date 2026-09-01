@@ -1,7 +1,9 @@
 mod bvh;
+mod environment;
 mod geometry;
 mod light;
 mod material;
+mod sky;
 mod transform;
 mod wavefront;
 
@@ -9,9 +11,11 @@ mod wavefront;
 mod testing;
 
 pub use bvh::GpuBvhNode;
+pub use environment::Environment;
 pub use geometry::GpuTriangle;
 pub use light::GpuLight;
 pub use material::GpuMaterial;
+pub use sky::Sky;
 
 use crate::config::Config;
 use crate::config::Object;
@@ -37,6 +41,19 @@ pub struct Scene {
     pub nodes: Vec<GpuBvhNode>,
     /// Depth of the hierarchy's deepest leaf, with the root at zero.
     pub depth: u32,
+    /// The sky, when the config named an image to read it from. `None` is a
+    /// scene whose sky is the flat `color` beside it, which the renderer uploads
+    /// as a one-texel map so the shader has only the one lookup either way.
+    pub environment: Option<Environment>,
+    /// The distribution the shader aims sky samples with, built over
+    /// `environment`. `None` whenever there is no map to aim at — a flat sky, or
+    /// a black one — and that is what tells the shader to leave sky sampling
+    /// off and let escaped rays find the background on their own.
+    ///
+    /// A flat sky deliberately gets nothing here. Cosine-weighted scattering
+    /// already draws a uniform background perfectly, so a second strategy could
+    /// only add a shadow ray per bounce and take nothing off the noise.
+    pub sky: Option<Sky>,
 }
 
 impl Scene {
@@ -54,6 +71,12 @@ impl Scene {
             let object = wavefront::read(&wavefront.file)?;
             geometry::append(&object, wavefront, index as u32, &mut triangles)?;
         }
+
+        let environment = match &config.environment.file {
+            Some(file) => Some(environment::read(file)?),
+            None => None,
+        };
+        let sky = environment.as_ref().and_then(sky::build);
 
         // The shader walks the tree rather than the triangle list, so the
         // triangles are permuted into leaf order before they are handed over.
@@ -77,6 +100,8 @@ impl Scene {
             light_power,
             nodes: hierarchy.nodes,
             depth: hierarchy.max_depth,
+            environment,
+            sky,
         })
     }
 }

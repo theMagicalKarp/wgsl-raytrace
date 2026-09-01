@@ -46,7 +46,7 @@ $ wgsl-raytrace --config examples/teapot/render.toml --output render.png
 │           Vup: [0  , 1  , 0  ]                                                 │
 │ Defocus Angle: 0                                                               │
 │Focus Distance: 1                                                               │
-│    Background: [0.7, 0.8, 0.99]                                                │
+│   Environment: [0.7, 0.8, 0.99]                                                │
 │       Objects: 2                                                               │
 │             0: examples/teapot/teapot.obj [Teapot] · metal[0.42, 0.2, 0.7] rou…│
 │             1: examples/teapot/teapot.obj [Plane] · lambertian[0.72, 0.72, 0.7…│
@@ -81,6 +81,21 @@ wgsl-raytrace --config examples/teapot/render.toml --output examples/teapot/rend
 ```
 
 ![The teapot scene](examples/teapot/render.png)
+
+### Field
+
+Four spheres on a plane under a photographed sky. Nothing in the scene emits,
+so every photon in the frame arrives from `sky.exr` — a 4096x2048 HDRI checked
+in beside the config, yawed by `rotation` to put its sun over the camera's
+shoulder. Because the map is sampled directly rather than only stumbled into,
+the sun casts an actual shadow instead of speckling the frame. 800x800, 50000
+samples.
+
+```Bash
+wgsl-raytrace --config examples/field/render.toml --output examples/field/render.png
+```
+
+![The field scene](examples/field/render.png)
 
 ### Normals
 
@@ -117,8 +132,6 @@ look_from = [1.55, 0.0, 1.9]
 look_at = [0.0, -0.5, 0.0]
 vup = [0.0, 1.0, 0.0]
 
-background = [0.70, 0.80, 0.99]
-
 defocus_angle = 0.6
 focus_dist = 10.0
 ```
@@ -140,14 +153,56 @@ focus_dist = 10.0
 - `look_at`: The point the camera is focused on.
 - `vup`: Defines the camera's orientation. _(Defaults to `[0.0, 1.0, 0.0]`,
   where y positive is "up")_
-- `background`: Set the rgb values for the default color when a ray misses every
-  object. This doubles as the scene's ambient light — a path that escapes brings
-  this color home with it — so a scene holding no `light` material and left at
-  the default black renders black. _(Defaults to black `[0.0, 0.0, 0.0]`)_
 - `defocus_angle`: Variation angle of rays through each pixel _(Defaults to
   being disabled)_
 - `focus_dist`: Distance from the camera `look_from` point to the plane of
   perfect focus _(Defaults to being disabled)_
+
+### Environment
+
+The sky, and with it the scene's ambient light. A path that escapes every object
+brings home whatever is here, so a scene holding no `light` material and left at
+the default black renders black.
+
+```toml
+[environment]
+color = [0.70, 0.80, 0.99]
+file = "sky.exr"
+intensity = 1.0
+rotation = 0.0
+```
+
+- `color`: The rgb value a ray finds when it misses everything. _(Defaults to
+  black `[0.0, 0.0, 0.0]`)_
+- `file`: An equirectangular image to read the sky out of instead, relative to
+  the config location. Supersedes `color`. `.exr`, `.hdr`, `.jpg` and `.png` all
+  decode; the first two carry values above one and are what an HDRI is for,
+  while the last two are clamped at white by the format and light a scene
+  flatly by comparison. _(Optional)_
+- `intensity`: Scales whichever of the two is in play, which is where to pull a
+  map's exposure down without re-authoring it. _(Defaults to `1.0`)_
+- `rotation`: Degrees of yaw about the +Y axis, for turning a map so its sun
+  falls where the scene wants it. _(Defaults to `0.0`)_
+
+The whole table is optional. A scene that omits it gets a black sky, which is
+what omitting the old `camera.background` did — that key moved here and is now
+`environment.color`.
+
+A flat `color` is uploaded as a one-texel map, so it is the same lookup the
+shader does for an image and not a second path through it.
+
+The map is sampled directly as well as found by escaping rays. Loading one
+builds a distribution over its texels — brightness weighted by the sky each
+texel covers — and every diffuse bounce aims a shadow ray into it in proportion
+to that, the same next event estimation a `light` material gets. Multiple
+importance sampling combines the two, so a small bright sun casts a shadow
+instead of speckling the frame: 2.9x less error at 200 samples on the field
+scene under the `.exr`, and 5.2x on a scene whose sun is sharper, for about 1.5x
+the time per sample.
+
+A flat `color` deliberately gets none of that. Cosine-weighted scattering
+already samples a uniform sky perfectly, so a second strategy there could only
+add a shadow ray per bounce and take nothing off the noise.
 
 ### Objects
 

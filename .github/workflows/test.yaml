@@ -45,6 +45,7 @@ jobs:
       matrix:
         config:
           - cubes
+          - field
           - glass
           - melee
           - normals

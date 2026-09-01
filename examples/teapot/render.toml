@@ -7,10 +7,12 @@ fov = 30
 look_from = [-1.89, 2.29, 10.68]
 look_at = [-1.68, 2.39, 4.63]
 vup = [0.0, 1.0, 0.0]
-# Nothing in this scene emits, so the background is the only light in it.
-background = [0.70, 0.80, 0.99]
 
-# Teapot
+[environment]
+# Nothing in this scene emits, so the background is the only light in it.
+color = [0.70, 0.80, 0.99]
+
+# Teapot 
 [[objects]]
 shape = "wavefront"
 file = "teapot.obj"
