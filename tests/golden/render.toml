@@ -32,7 +32,8 @@ look_from = [2.5, 1.2, 3.1]
 look_at = [0.0, 0.2, 0.0]
 vup = [0.0, 1.0, 0.0]
 
-background = [0.70, 0.80, 0.99]
+[environment]
+color = [0.70, 0.80, 0.99]
 
 # Teapot
 [[objects]]

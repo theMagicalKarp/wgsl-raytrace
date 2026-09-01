@@ -41,8 +41,9 @@ look_from = [-4.57, 9.01, -5.7]
 look_at = [0.0, 2.0, 0.0]
 vup = [0.0, 1.0, 0.0]
 
+[environment]
 # The two emitters are the only things that give off light.
-background = [0.0, 0.0, 0.0]
+color = [0.0, 0.0, 0.0]
 
 # Orb
 [[objects]]

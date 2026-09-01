@@ -13,6 +13,7 @@ use crate::scene::GpuLight;
 use crate::scene::Scene;
 use bytemuck::Zeroable;
 use bytemuck::cast_slice;
+use half::f16;
 use progress::Progress;
 use std::collections::VecDeque;
 use std::error::Error;
@@ -94,6 +95,12 @@ async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
     let mut camera = GpuCamera::from(&config.camera);
     camera.light_count = scene.lights.len() as u32;
     camera.light_power = scene.light_power;
+    camera.environment_rotation = config.environment.rotation.to_radians();
+    camera.environment_intensity = config.environment.intensity;
+    if let Some(sky) = &scene.sky {
+        camera.sky_width = sky.width;
+        camera.sky_height = sky.height;
+    }
     let (width, height) = (camera.width, camera.height);
 
     let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
@@ -127,6 +134,30 @@ async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
         contents: match scene.lights.is_empty() {
             true => cast_slice(&unused),
             false => cast_slice(&scene.lights),
+        },
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let (environment_texture, environment_sampler) = environment(&device, &queue, config, scene);
+
+    // The sky's sampling distribution, and the same fallback the light table
+    // takes: a scene with no map to aim at still has to bind something, so it
+    // binds one entry nothing reads. `sky_width` is zero alongside it, and that
+    // is what the shader checks.
+    let unaimed = [0.0f32];
+    let sky_marginal = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("sky marginal"),
+        contents: match &scene.sky {
+            Some(sky) => cast_slice(&sky.marginal),
+            None => cast_slice(&unaimed),
+        },
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let sky_conditional = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("sky conditional"),
+        contents: match &scene.sky {
+            Some(sky) => cast_slice(&sky.conditional),
+            None => cast_slice(&unaimed),
         },
         usage: wgpu::BufferUsages::STORAGE,
     });
@@ -194,6 +225,22 @@ async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&environment_texture),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&environment_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: sky_marginal.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: sky_conditional.as_entire_binding(),
             },
         ],
     });
@@ -276,6 +323,81 @@ async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
         renderer,
         timings,
     })
+}
+
+/// Uploads the sky as a texture, with the sampler that reads it.
+///
+/// A scene that named no HDRI gets a **one texel** map holding its flat color.
+/// Sampling a one-texel texture anywhere returns exactly that texel, so the flat
+/// background is not a second path through the shader — it is the same lookup
+/// over a smaller image. This is the trick the light buffer already plays one
+/// level down, where an empty table becomes one zeroed entry because an empty
+/// buffer cannot be bound.
+///
+/// `Rgba16Float` rather than `Rgba32Float`: sixteen-bit float is filterable
+/// everywhere, while a filtering sampler over a thirty-two-bit one needs
+/// `FLOAT32_FILTERABLE`, which the device request above does not ask for and not
+/// every adapter offers. Half is also what an EXR very likely stores already, so
+/// the narrowing usually costs nothing. `Environment::read` has clamped the
+/// texels into the range, so nothing here can overflow to an infinity.
+fn environment(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &Config,
+    scene: &Scene,
+) -> (wgpu::TextureView, wgpu::Sampler) {
+    let flat = [[
+        config.environment.color[0],
+        config.environment.color[1],
+        config.environment.color[2],
+        1.0,
+    ]];
+    let (width, height, texels) = match &scene.environment {
+        Some(map) => (map.width, map.height, map.texels.as_slice()),
+        None => (1, 1, flat.as_slice()),
+    };
+
+    let halves: Vec<f16> = texels
+        .iter()
+        .flatten()
+        .map(|&channel| f16::from_f32(channel))
+        .collect();
+
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("environment"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        cast_slice(&halves),
+    );
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("environment"),
+        // Longitude wraps and latitude does not: the left and right edges of an
+        // equirectangular map are the same meridian, so repeating there hides
+        // the seam, while repeating at the poles would fold the sky back on
+        // itself.
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    (texture.create_view(&Default::default()), sampler)
 }
 
 /// Blocks until the oldest queued sample has run, then counts it.

@@ -7,7 +7,9 @@ fov = 20.4
 look_from = [-45.59, 19.02, -26.83]
 look_at = [1.57, 7.45, -1.32]
 vup = [0.0, 1.0, 0.0]
-background = [0.0, 0.0, 0.0]
+
+[environment]
+color = [0.0, 0.0, 0.0]
 
 # Room
 [[objects]]

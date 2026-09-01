@@ -1,0 +1,49 @@
+[camera]
+aspect_ratio = "square"
+image_width = 800
+samples = 50000
+max_bounces = 64
+fov = 21.0
+look_from = [7.96, 10.19, -17.28]
+look_at = [0.024, 1.1, 0.065]
+vup = [0.0, 1.0, 0.0]
+
+[environment]
+file = "sky.exr"
+rotation = -90.0
+intensity = 1.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "BlueBall"
+material = "lambertian"
+albedo = [0.01, 0.01, 0.8]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "GlassBall"
+material = "glass"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "MetalBall"
+material = "metal"
+albedo = [0.7, 0.7, 0.7]
+roughness = 0.02
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "WhiteBall"
+material = "lambertian"
+albedo = [0.95, 0.95, 0.95]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Floor"
+material = "lambertian"
+albedo = [0.95, 0.95, 0.95]

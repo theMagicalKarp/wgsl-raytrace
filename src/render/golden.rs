@@ -27,6 +27,15 @@ const LIT: Golden = Golden {
     reference: "tests/golden/lit.png",
 };
 
+/// Lit by an environment map with a sun in it, which is the only scene that
+/// reaches the sky's half of next event estimation: a flat background gets no
+/// sampling distribution built for it, so neither of the two above ever calls
+/// `sample_sky`.
+const SKY: Golden = Golden {
+    scene: "tests/golden/sky.toml",
+    reference: "tests/golden/sky.png",
+};
+
 /// How far one channel may drift before its pixel is called an outlier rather
 /// than noise, out of 255.
 const OUTLIER: i32 = 24;
@@ -180,6 +189,11 @@ fn the_render_matches_the_reference() {
 #[test]
 fn the_lit_render_matches_the_reference() {
     compare_to_reference(&LIT, "golden-lit");
+}
+
+#[test]
+fn the_sky_render_matches_the_reference() {
+    compare_to_reference(&SKY, "golden-sky");
 }
 
 #[test]

@@ -104,9 +104,49 @@ pub struct CameraOptions {
     pub defocus_angle: f32,
     #[serde_inline_default(1.0)]
     pub focus_dist: f32,
+}
 
+/// The sky, and with it the scene's ambient light.
+///
+/// A path that escapes the geometry brings home whatever is here, so a scene
+/// holding no `light` material and left at the default black renders black.
+/// `color` and `file` are the same setting at two fidelities — a constant sky
+/// and a photographed one — and `file` wins where both are given.
+#[serde_inline_default]
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentOptions {
+    /// The sky when there is no `file`. Uploaded as a one-texel map, which is
+    /// what keeps a flat background from being a second path through the shader.
     #[serde(default)]
-    pub background: [f32; 3],
+    pub color: [f32; 3],
+
+    /// An equirectangular image to read the sky out of, relative to the config
+    /// file. [`Config::validate`] rewrites this the way it does an object's mesh.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+
+    /// Scales whichever of the two is in play. The place to pull an HDRI's
+    /// exposure down without re-authoring it.
+    #[serde_inline_default(1.0)]
+    pub intensity: f32,
+
+    /// Degrees of yaw about the +Y axis, for aiming a map's sun at the scene.
+    #[serde_inline_default(0.0)]
+    pub rotation: f32,
+}
+
+/// Black, unlit, unrotated — what a config that omits the table entirely gets,
+/// and what `background` defaulted to before it moved here.
+impl Default for EnvironmentOptions {
+    fn default() -> Self {
+        EnvironmentOptions {
+            color: [0.0, 0.0, 0.0],
+            file: None,
+            intensity: 1.0,
+            rotation: 0.0,
+        }
+    }
 }
 
 impl CameraOptions {
@@ -234,6 +274,9 @@ pub struct Config {
     pub camera: CameraOptions,
 
     #[serde(default)]
+    pub environment: EnvironmentOptions,
+
+    #[serde(default)]
     pub objects: Vec<Object>,
 }
 
@@ -256,6 +299,33 @@ impl Config {
             }
         }
 
+        if let Some(file) = &mut self.environment.file {
+            *file = config_dir.join(&file);
+            if !file.is_file() {
+                return Err(format!("Environment file does not exist: {}", file.display()).into());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for EnvironmentOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.file {
+            Some(file) => write!(f, "{}", file.display())?,
+            None => write!(
+                f,
+                "[{}, {}, {}]",
+                self.color[0], self.color[1], self.color[2]
+            )?,
+        }
+        if self.intensity != 1.0 {
+            write!(f, " x{}", self.intensity)?;
+        }
+        if self.rotation != 0.0 {
+            write!(f, " @ {}deg", self.rotation)?;
+        }
         Ok(())
     }
 }
@@ -296,7 +366,7 @@ impl fmt::Display for Config {
             ("Vup", vector(self.camera.vup)),
             ("Defocus Angle", format!("{}", self.camera.defocus_angle)),
             ("Focus Distance", format!("{}", self.camera.focus_dist)),
-            ("Background", vector(self.camera.background)),
+            ("Environment", self.environment.to_string()),
             ("Objects", format!("{}", self.objects.len())),
         ]
         .map(|(k, v)| row(k, &v))
@@ -408,7 +478,7 @@ degrees = 31.5
         assert_eq!(config.camera.vup, [0.0, 1.0, 0.0]);
         assert_eq!(config.camera.defocus_angle, 0.0);
         assert_eq!(config.camera.focus_dist, 1.0);
-        assert_eq!(config.camera.background, [0.0, 0.0, 0.0]);
+        assert_eq!(config.environment.color, [0.0, 0.0, 0.0]);
     }
 
     /// A light is its emitted color and nothing else: emission is always from
@@ -470,6 +540,68 @@ radius = 1.0"#,
             .validate(Path::new("does/not/exist"))
             .expect_err("missing file should not validate");
         assert!(error.to_string().contains("teapot.obj"));
+    }
+
+    /// The whole table is optional, and its absence is the black sky a config
+    /// got from omitting `background` before the setting moved here.
+    #[test]
+    fn a_scene_without_an_environment_table_gets_a_black_sky() {
+        let config: Config = toml::from_str(MINIMAL).unwrap();
+
+        assert_eq!(config.environment.color, [0.0, 0.0, 0.0]);
+        assert_eq!(config.environment.file, None);
+        assert_eq!(config.environment.intensity, 1.0);
+        assert_eq!(config.environment.rotation, 0.0);
+    }
+
+    #[test]
+    fn an_environment_table_reads_a_map_and_how_to_aim_it() {
+        let scene = format!(
+            "{MINIMAL}\n[environment]\nfile = \"sky.exr\"\nintensity = 0.5\nrotation = 90.0\n"
+        );
+        let config: Config = toml::from_str(&scene).unwrap();
+
+        assert_eq!(config.environment.file, Some(PathBuf::from("sky.exr")));
+        assert_eq!(config.environment.intensity, 0.5);
+        assert_eq!(config.environment.rotation, 90.0);
+        // Still black, and still unread while there is a file to read instead.
+        assert_eq!(config.environment.color, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn rejects_unknown_environment_fields() {
+        let scene = format!("{MINIMAL}\n[environment]\nbackground = [1.0, 1.0, 1.0]\n");
+
+        assert!(toml::from_str::<Config>(&scene).is_err());
+    }
+
+    /// `background` used to live on `[camera]`. A scene that still sets it there
+    /// should say so rather than silently render the black it now defaults to.
+    #[test]
+    fn rejects_the_camera_background_that_moved_here() {
+        // Spliced into `[camera]`, not appended: the end of MINIMAL is inside
+        // an object's transform table.
+        let (camera, rest) = MINIMAL.split_once("[[objects]]").unwrap();
+        let scene = format!("{camera}background = [1.0, 1.0, 1.0]\n\n[[objects]]{rest}");
+
+        assert!(toml::from_str::<Config>(&scene).is_err());
+    }
+
+    /// The map is resolved against the config's directory the way a mesh is, and
+    /// a path that is not there is named before any GPU work starts.
+    #[test]
+    fn a_missing_environment_file_fails_validation() {
+        // No objects, so the mesh check ahead of it cannot be what fails.
+        let scene = format!(
+            "{}\n[environment]\nfile = \"sky.exr\"\n",
+            MINIMAL.split("[[objects]]").next().unwrap()
+        );
+        let mut config: Config = toml::from_str(&scene).unwrap();
+
+        let error = config
+            .validate(Path::new("does/not/exist"))
+            .expect_err("a missing map should not validate");
+        assert!(error.to_string().contains("sky.exr"), "{error}");
     }
 
     #[test]
