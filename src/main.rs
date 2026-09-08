@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod config;
 mod math;
 mod render;
@@ -56,7 +58,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
 
     let started = Instant::now();
-    let render = render::render(&config, &scene)?;
+    let render = match args.preview {
+        true => render::preview(&config, &scene)?,
+        false => render::render(&config, &scene)?,
+    };
     render.image.save(&args.output)?;
 
     println!(

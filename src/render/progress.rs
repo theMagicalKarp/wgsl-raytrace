@@ -1,7 +1,11 @@
 use std::io::Write;
 use std::io::stdout;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
+
+/// Held by whoever is writing to the terminal.
+pub static TERMINAL: Mutex<()> = Mutex::new(());
 
 /// Lower bound on the gap between redraws, so a slow terminal can never become
 /// the bottleneck.
@@ -34,13 +38,20 @@ impl Progress {
         self.completed += 1;
 
         let due = self.drawn.elapsed() >= REDRAW_INTERVAL;
-        if due || self.completed == 1 || self.completed == self.total {
-            self.draw();
+        if (due || self.completed == 1 || self.completed == self.total) && self.draw() {
             self.drawn = Instant::now();
         }
     }
 
-    fn draw(&self) {
+    /// Redraws the bar, or does nothing and says so if [`TERMINAL`] is busy.
+    ///
+    /// The timer is left alone on a skipped draw, so the next sample tries again
+    /// rather than waiting out another interval.
+    fn draw(&self) -> bool {
+        let Ok(_writing) = TERMINAL.try_lock() else {
+            return false;
+        };
+
         let fraction = self.completed as f32 / self.total as f32;
         let filled = (fraction * BAR as f32).round() as usize;
         let elapsed = self.started.elapsed().as_secs_f32();
@@ -58,10 +69,19 @@ impl Progress {
             empty = BAR - filled,
         );
         let _ = stdout().flush();
+
+        true
     }
 
     /// Closes off the line so whatever is printed next starts fresh.
-    pub fn finish(self) {
+    ///
+    /// Borrows rather than consumes: the bar lives inside the renderer that
+    /// drives it, and an interrupted preview finishes without giving that up.
+    ///
+    /// This one waits for [`TERMINAL`] rather than skipping: it is the newline
+    /// everything printed after the render sits below.
+    pub fn finish(&self) {
+        let _writing = TERMINAL.lock();
         println!();
     }
 }

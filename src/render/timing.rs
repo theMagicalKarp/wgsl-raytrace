@@ -21,8 +21,6 @@ pub struct Timer {
     stride: u32,
     /// Pairs the query set holds.
     timed: u32,
-    /// Dispatches the render will issue in total.
-    dispatches: u32,
 }
 
 impl Timer {
@@ -57,7 +55,6 @@ impl Timer {
             period: queue.get_timestamp_period(),
             stride,
             timed,
-            dispatches,
         })
     }
 
@@ -73,13 +70,19 @@ impl Timer {
         })
     }
 
-    /// Queues the whole query set for reading. Belongs in the same encoder as
-    /// the accumulator's readback — after the loop has waited on every sample,
-    /// which is what makes the resolve read live counters rather than stale
-    /// ones.
-    pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.resolve_query_set(&self.query_set, 0..2 * self.timed, &self.staging, 0);
-        encoder.copy_buffer_to_buffer(&self.staging, 0, &self.readback, 0, self.readback.size());
+    /// Queues the pairs a render of `dispatches` samples wrote for reading.
+    /// Belongs in the same encoder as the accumulator's readback — after the
+    /// loop has waited on every sample, which is what makes the resolve read
+    /// live counters rather than stale ones.
+    pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder, dispatches: u32) {
+        let pairs = written(dispatches, self.stride, self.timed);
+        if pairs == 0 {
+            return;
+        }
+
+        let size = 2 * pairs as u64 * wgpu::QUERY_SIZE as u64;
+        encoder.resolve_query_set(&self.query_set, 0..2 * pairs, &self.staging, 0);
+        encoder.copy_buffer_to_buffer(&self.staging, 0, &self.readback, 0, size);
     }
 
     /// Reads the timestamps back and reduces them to a summary.
@@ -87,7 +90,17 @@ impl Timer {
     /// Call once the submission holding [`Timer::resolve`] has been made; the
     /// map resolves the same way the accumulator's does, by polling until the
     /// queued work ahead of it has run.
-    pub fn timings(&self, device: &wgpu::Device) -> Result<Option<Timings>, Box<dyn Error>> {
+    ///
+    /// `dispatches` is what the render actually issued, which is fewer than the
+    /// budget the timer was sized for when a preview was interrupted. It bounds
+    /// the read the same way it bounds [`Timer::resolve`]'s write, so the pairs
+    /// past the end are neither resolved nor summarized; [`Timings::traced`]
+    /// reads it a second time, to average over every dispatch issued.
+    pub fn timings(
+        &self,
+        device: &wgpu::Device,
+        dispatches: u32,
+    ) -> Result<Option<Timings>, Box<dyn Error>> {
         let slice = self.readback.slice(..);
         let (sender, receiver) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -100,12 +113,13 @@ impl Timer {
         let stamps: &[u64] = bytemuck::cast_slice(&mapped);
         let deltas: Vec<u64> = stamps
             .chunks_exact(2)
+            .take(written(dispatches, self.stride, self.timed) as usize)
             .map(|pair| pair[1].saturating_sub(pair[0]))
             .collect();
         drop(mapped);
         self.readback.unmap();
 
-        Ok(summarize(&deltas, self.period, self.dispatches))
+        Ok(summarize(&deltas, self.period, dispatches))
     }
 }
 
@@ -114,6 +128,15 @@ impl Timer {
 fn plan(dispatches: u32) -> (u32, u32) {
     let stride = dispatches.div_ceil(MAX_TIMED).max(1);
     (stride, dispatches.div_ceil(stride))
+}
+
+/// Pairs a render of `dispatches` samples has written, which is what bounds
+/// both the resolve and the read back.
+///
+/// Capped at `timed` because the query set is sized for the sample budget, and
+/// a render cannot write past the end of it.
+fn written(dispatches: u32, stride: u32, timed: u32) -> u32 {
+    dispatches.div_ceil(stride).min(timed)
 }
 
 /// Which pair of queries a sample writes, or `None` when the stride skips it.
@@ -301,6 +324,28 @@ mod tests {
     #[test]
     fn a_render_of_nothing_has_no_stride_to_divide_by() {
         assert_eq!(plan(0), (1, 0));
+    }
+
+    /// An interrupted preview stops short of the budget the query set was sized
+    /// for, and the pairs it never wrote are the ones neither the resolve nor
+    /// the readback may touch. Cross-checked against [`entry`], which is what
+    /// actually decides where a sample writes.
+    #[test]
+    fn only_the_pairs_a_render_wrote_are_resolved() {
+        for (dispatches, stride) in [(0, 1), (1, 1), (7, 1), (7, 3), (9, 3), (250, 4)] {
+            assert_eq!(
+                written(dispatches, stride, MAX_TIMED) as usize,
+                (1..=dispatches).filter_map(|s| entry(s, stride)).count(),
+                "{dispatches} dispatches at a stride of {stride}",
+            );
+        }
+    }
+
+    /// And a render that runs past the query set stops at its end rather than
+    /// resolving past it.
+    #[test]
+    fn the_query_set_bounds_what_a_long_render_resolves() {
+        assert_eq!(written(2 * MAX_TIMED, 1, MAX_TIMED), MAX_TIMED);
     }
 
     #[test]

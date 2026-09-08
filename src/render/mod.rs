@@ -1,4 +1,6 @@
 mod camera;
+mod kitty;
+mod preview;
 mod progress;
 mod timing;
 
@@ -6,6 +8,7 @@ mod timing;
 mod golden;
 
 pub use camera::GpuCamera;
+pub use preview::preview;
 pub use timing::Timings;
 
 use crate::config::Config;
@@ -60,269 +63,556 @@ impl Image {
 
 /// Renders `scene` through `config`'s camera, blocking until the GPU is done.
 ///
-/// The adapter is whatever the platform offers — there is no surface to be
-/// compatible with, so any device that can run a compute pass will do.
+/// Every sample, start to finish. [`preview`] drives the same [`Renderer`] one
+/// sample at a time instead, so that it can look at the accumulator on the way
+/// through.
 pub fn render(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
-    pollster::block_on(run(config, scene))
+    let mut renderer = Renderer::new(config, scene)?;
+    while renderer.remaining() > 0 {
+        renderer.sample()?;
+    }
+    renderer.finish()
 }
 
-async fn run(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
-    // An empty buffer cannot be bound, and a scene with nothing in it is a
-    // mistake worth naming rather than a black frame worth writing.
-    if scene.triangles.is_empty() {
-        return Err("scene has no geometry to render".into());
+/// One render's GPU state, driveable a sample at a time.
+///
+/// The split exists for [`preview`], which has to interleave the sample loop
+/// with reading the accumulator and drawing it. Nothing here is preview-specific
+/// — [`render`] runs the same three calls in a row.
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    frame: wgpu::BindGroup,
+    geometry: wgpu::BindGroup,
+    camera_buffer: wgpu::Buffer,
+    accumulator: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    accumulator_size: u64,
+    timer: Option<Timer>,
+    in_flight: VecDeque<wgpu::SubmissionIndex>,
+    /// Set while a copy into `readback` is queued and its map has not resolved.
+    /// There is one readback buffer, so there is at most one of these.
+    pending: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    progress: Progress,
+    width: u32,
+    height: u32,
+    samples: u32,
+    /// Samples handed to the queue, which runs ahead of `completed`.
+    submitted: u32,
+    /// Samples the GPU has finished, which is what the accumulator holds.
+    completed: u32,
+    /// The adapter's name and backend.
+    renderer: String,
+    /// Set once [`Renderer::finish`] has resolved the query set, which may only
+    /// happen once.
+    finished: bool,
+}
+
+impl Renderer {
+    /// Uploads `scene` and builds the pipeline that will trace it.
+    ///
+    /// The adapter is whatever the platform offers — there is no surface to be
+    /// compatible with, so any device that can run a compute pass will do. That
+    /// stays true of the preview, which draws through the terminal rather than
+    /// through a swapchain.
+    pub fn new(config: &Config, scene: &Scene) -> Result<Renderer, Box<dyn Error>> {
+        pollster::block_on(Renderer::build(config, scene))
     }
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await?;
-    // Timestamps are optional on every backend — Metal wants stage-boundary
-    // counter sampling, Vulkan a queue with enough valid timestamp bits — and
-    // asking for a feature the adapter lacks fails the request outright, so the
-    // ask is whatever it turns out to have.
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("device"),
-            required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
-            ..Default::default()
-        })
-        .await?;
+    async fn build(config: &Config, scene: &Scene) -> Result<Renderer, Box<dyn Error>> {
+        // An empty buffer cannot be bound, and a scene with nothing in it is a
+        // mistake worth naming rather than a black frame worth writing.
+        if scene.triangles.is_empty() {
+            return Err("scene has no geometry to render".into());
+        }
 
-    let info = adapter.get_info();
-    let renderer = format!("{} ({:?})", info.name, info.backend);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await?;
+        // Timestamps are optional on every backend — Metal wants stage-boundary
+        // counter sampling, Vulkan a queue with enough valid timestamp bits — and
+        // asking for a feature the adapter lacks fails the request outright, so the
+        // ask is whatever it turns out to have.
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("device"),
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+                ..Default::default()
+            })
+            .await?;
 
-    let mut camera = GpuCamera::from(&config.camera);
-    camera.light_count = scene.lights.len() as u32;
-    camera.light_power = scene.light_power;
-    camera.environment_rotation = config.environment.rotation.to_radians();
-    camera.environment_intensity = config.environment.intensity;
-    if let Some(sky) = &scene.sky {
-        camera.sky_width = sky.width;
-        camera.sky_height = sky.height;
-    }
-    let (width, height) = (camera.width, camera.height);
+        let info = adapter.get_info();
+        let renderer = format!("{} ({:?})", info.name, info.backend);
 
-    let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("camera"),
-        contents: bytemuck::bytes_of(&camera),
-        // COPY_DST so the sample index can be rewritten between passes.
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-    let material_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("materials"),
-        contents: cast_slice(&scene.materials),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let triangle_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("triangles"),
-        contents: cast_slice(&scene.triangles),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let bvh_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("bvh"),
-        contents: cast_slice(&scene.nodes),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    // A scene may legitimately have no emitters — every example but melee is lit
-    // by its background alone — but an empty buffer cannot be bound, so the
-    // binding falls back to this one entry. Nothing reads it: `light_count` is
-    // zero alongside it, and that is what the shader checks.
-    let unused = [GpuLight::zeroed()];
-    let light_buffer = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("lights"),
-        contents: match scene.lights.is_empty() {
-            true => cast_slice(&unused),
-            false => cast_slice(&scene.lights),
-        },
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+        let mut camera = GpuCamera::from(&config.camera);
+        camera.light_count = scene.lights.len() as u32;
+        camera.light_power = scene.light_power;
+        camera.environment_rotation = config.environment.rotation.to_radians();
+        camera.environment_intensity = config.environment.intensity;
+        if let Some(sky) = &scene.sky {
+            camera.sky_width = sky.width;
+            camera.sky_height = sky.height;
+        }
+        let (width, height) = (camera.width, camera.height);
 
-    let (environment_texture, environment_sampler) = environment(&device, &queue, config, scene);
-
-    // The sky's sampling distribution, and the same fallback the light table
-    // takes: a scene with no map to aim at still has to bind something, so it
-    // binds one entry nothing reads. `sky_width` is zero alongside it, and that
-    // is what the shader checks.
-    let unaimed = [0.0f32];
-    let sky_marginal = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("sky marginal"),
-        contents: match &scene.sky {
-            Some(sky) => cast_slice(&sky.marginal),
-            None => cast_slice(&unaimed),
-        },
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let sky_conditional = device.create_buffer_init(&BufferInitDescriptor {
-        label: Some("sky conditional"),
-        contents: match &scene.sky {
-            Some(sky) => cast_slice(&sky.conditional),
-            None => cast_slice(&unaimed),
-        },
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    // One `vec4<f32>` of summed radiance per pixel, started at zero.
-    let accumulator_size = (width as u64) * (height as u64) * size_of::<[f32; 4]>() as u64;
-    let accumulator = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("accumulator"),
-        size: accumulator_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    // A storage buffer cannot be mapped, so the sums come back through a second
-    // buffer that exists only to be read.
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: accumulator_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("path tracer"),
-        // Reflected from the shader: the two groups it declares are the two
-        // built below, so a binding that changes there fails here and not in
-        // some later frame.
-        layout: None,
-        module: &shader,
-        entry_point: Some("trace"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-
-    let frame = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("frame"),
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: accumulator.as_entire_binding(),
-            },
-        ],
-    });
-    let geometry = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("scene"),
-        layout: &pipeline.get_bind_group_layout(1),
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: material_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: triangle_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: bvh_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: light_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&environment_texture),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::Sampler(&environment_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: sky_marginal.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: sky_conditional.as_entire_binding(),
-            },
-        ],
-    });
-
-    // One dispatch per sample, each reseeding the shader's RNG from the sample
-    // index it is handed.
-    let sample_offset = std::mem::offset_of!(GpuCamera, sample) as wgpu::BufferAddress;
-    let mut in_flight: VecDeque<wgpu::SubmissionIndex> = VecDeque::new();
-    let mut progress = Progress::new(config.camera.samples);
-    let timer = Timer::new(&device, &queue, config.camera.samples);
-
-    for sample in 1..=config.camera.samples {
-        // A queued write lands before the submission that follows it.
-        queue.write_buffer(&camera_buffer, sample_offset, bytemuck::bytes_of(&sample));
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("sample"),
+        let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("camera"),
+            contents: bytemuck::bytes_of(&camera),
+            // COPY_DST so the sample index can be rewritten between passes.
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let material_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("materials"),
+            contents: cast_slice(&scene.materials),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let triangle_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("triangles"),
+            contents: cast_slice(&scene.triangles),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let bvh_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("bvh"),
+            contents: cast_slice(&scene.nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        // A scene may legitimately have no emitters — every example but melee is lit
+        // by its background alone — but an empty buffer cannot be bound, so the
+        // binding falls back to this one entry. Nothing reads it: `light_count` is
+        // zero alongside it, and that is what the shader checks.
+        let unused = [GpuLight::zeroed()];
+        let light_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("lights"),
+            contents: match scene.lights.is_empty() {
+                true => cast_slice(&unused),
+                false => cast_slice(&scene.lights),
+            },
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let (environment_texture, environment_sampler) =
+            environment(&device, &queue, config, scene);
+
+        // The sky's sampling distribution, and the same fallback the light table
+        // takes: a scene with no map to aim at still has to bind something, so it
+        // binds one entry nothing reads. `sky_width` is zero alongside it, and that
+        // is what the shader checks.
+        let unaimed = [0.0f32];
+        let sky_marginal = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("sky marginal"),
+            contents: match &scene.sky {
+                Some(sky) => cast_slice(&sky.marginal),
+                None => cast_slice(&unaimed),
+            },
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let sky_conditional = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("sky conditional"),
+            contents: match &scene.sky {
+                Some(sky) => cast_slice(&sky.conditional),
+                None => cast_slice(&unaimed),
+            },
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        // One `vec4<f32>` of summed radiance per pixel, started at zero.
+        let accumulator_size = (width as u64) * (height as u64) * size_of::<[f32; 4]>() as u64;
+        let accumulator = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("accumulator"),
+            size: accumulator_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // A storage buffer cannot be mapped, so the sums come back through a second
+        // buffer that exists only to be read.
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: accumulator_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("path tracer"),
+            // Reflected from the shader: the two groups it declares are the two
+            // built below, so a binding that changes there fails here and not in
+            // some later frame.
+            layout: None,
+            module: &shader,
+            entry_point: Some("trace"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let frame = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: accumulator.as_entire_binding(),
+                },
+            ],
+        });
+        let geometry = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene"),
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: material_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: triangle_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bvh_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&environment_texture),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&environment_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: sky_marginal.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: sky_conditional.as_entire_binding(),
+                },
+            ],
+        });
+
+        let timer = Timer::new(&device, &queue, config.camera.samples);
+
+        Ok(Renderer {
+            device,
+            queue,
+            pipeline,
+            frame,
+            geometry,
+            camera_buffer,
+            accumulator,
+            readback,
+            accumulator_size,
+            timer,
+            in_flight: VecDeque::new(),
+            pending: None,
+            progress: Progress::new(config.camera.samples),
+            width,
+            height,
+            samples: config.camera.samples,
+            submitted: 0,
+            completed: 0,
+            renderer,
+            finished: false,
+        })
+    }
+
+    /// The frame's dimensions, which the preview fits its block to.
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Samples the budget has left to hand out.
+    pub fn remaining(&self) -> u32 {
+        self.samples - self.submitted
+    }
+
+    /// Queues the next sample, blocking on an older one if too many are in
+    /// flight. A no-op once the budget is spent.
+    ///
+    /// One dispatch per sample, each reseeding the shader's RNG from the sample
+    /// index it is handed.
+    pub fn sample(&mut self) -> Result<(), wgpu::PollError> {
+        if self.remaining() == 0 {
+            return Ok(());
+        }
+
+        self.submitted += 1;
+        let sample = self.submitted;
+        let offset = std::mem::offset_of!(GpuCamera, sample) as wgpu::BufferAddress;
+        // A queued write lands before the submission that follows it.
+        self.queue
+            .write_buffer(&self.camera_buffer, offset, bytemuck::bytes_of(&sample));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sample"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("trace"),
-                timestamp_writes: timer.as_ref().and_then(|timer| timer.writes(sample)),
+                timestamp_writes: self.timer.as_ref().and_then(|timer| timer.writes(sample)),
             });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &frame, &[]);
-            pass.set_bind_group(1, &geometry, &[]);
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.frame, &[]);
+            pass.set_bind_group(1, &self.geometry, &[]);
             // Rounded up to whole workgroups; the shader drops the threads that
             // land outside the image.
-            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
-        in_flight.push_back(queue.submit([encoder.finish()]));
+        self.in_flight
+            .push_back(self.queue.submit([encoder.finish()]));
 
         // Let a few samples queue up, then block on the oldest. Waiting keeps
         // the count honest — without it every sample would "finish" instantly
         // and the GPU would still be tracing long after the loop ended.
-        if in_flight.len() > IN_FLIGHT_SAMPLES {
-            wait_for(&device, &mut in_flight, &mut progress)?;
+        if self.in_flight.len() > IN_FLIGHT_SAMPLES {
+            self.retire()?;
         }
+
+        Ok(())
     }
-    while !in_flight.is_empty() {
-        wait_for(&device, &mut in_flight, &mut progress)?;
+
+    /// Blocks until the oldest queued sample has run, then counts it.
+    fn retire(&mut self) -> Result<(), wgpu::PollError> {
+        let Some(submission) = self.in_flight.pop_front() else {
+            return Ok(());
+        };
+
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })?;
+        self.completed += 1;
+        self.progress.advance();
+
+        Ok(())
     }
-    progress.finish();
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("readback"),
-    });
-    encoder.copy_buffer_to_buffer(&accumulator, 0, &readback, 0, accumulator_size);
-    if let Some(timer) = &timer {
-        timer.resolve(&mut encoder);
+    /// Queues a copy of the accumulator and asks for it to be mapped, waiting
+    /// for neither. [`Renderer::snapshot`] collects the result.
+    ///
+    /// Safe mid-render: the copy is queued on the same queue as the samples, so
+    /// it is ordered behind every one already submitted and cannot catch a
+    /// dispatch half-written. Samples submitted *after* it land in the
+    /// accumulator after it has been read, which is what makes a snapshot a
+    /// consistent frame rather than a smear.
+    ///
+    /// A no-op while a request is already outstanding. There is one readback
+    /// buffer and it cannot be written to while it is mapped.
+    ///
+    /// It deliberately does **not** resolve the query set. [`Timer::resolve`]
+    /// documents why that has to wait for the end.
+    pub fn request(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_buffer_to_buffer(
+            &self.accumulator,
+            0,
+            &self.readback,
+            0,
+            self.accumulator_size,
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let (sender, receiver) = mpsc::channel();
+        self.readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.pending = Some(receiver);
     }
-    queue.submit([encoder.finish()]);
 
-    let slice = readback.slice(..);
-    let (sender, receiver) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    // The map only resolves once the queued work ahead of it has run, so this
-    // is also where the render is waited on.
-    device.poll(wgpu::PollType::wait_indefinitely())?;
-    receiver.recv()??;
+    /// The sums from an outstanding [`Renderer::request`], or `None` while the
+    /// GPU has not finished the copy yet.
+    ///
+    /// Returning `None` rather than waiting is the whole point: the sample loop
+    /// asks every iteration, keeps tracing while the answer is no, and picks the
+    /// frame up whenever it happens to be ready.
+    pub fn snapshot(&mut self) -> Result<Option<Vec<[f32; 4]>>, Box<dyn Error>> {
+        let Some(receiver) = self.pending.take() else {
+            return Ok(None);
+        };
 
-    let mapped = slice.get_mapped_range()?;
-    let pixels = resolve(cast_slice(&mapped));
-    drop(mapped);
-    readback.unmap();
+        // A map callback only fires from inside a poll. `retire` does a blocking
+        // one every few samples and would deliver this on its own, but a
+        // non-blocking check here is what keeps that an optimisation rather than
+        // a dependency.
+        self.device.poll(wgpu::PollType::Poll)?;
+        match receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {
+                self.pending = Some(receiver);
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(result) => result?,
+        }
 
-    let timings = match &timer {
-        Some(timer) => timer.timings(&device)?,
-        None => None,
-    };
+        let slice = self.readback.slice(..);
+        let mapped = slice.get_mapped_range()?;
+        let sums: Vec<[f32; 4]> = cast_slice(&mapped).to_vec();
+        drop(mapped);
+        self.readback.unmap();
 
-    Ok(Render {
-        image: Image {
-            width,
-            height,
-            pixels,
-        },
-        renderer,
-        timings,
-    })
+        Ok(Some(sums))
+    }
+
+    /// [`Renderer::request`] and [`Renderer::snapshot`], waited on.
+    pub fn sums(&mut self) -> Result<Vec<[f32; 4]>, Box<dyn Error>> {
+        self.read(<[[f32; 4]]>::to_vec)
+    }
+
+    /// A fresh copy of the accumulator, handed to `read` as the mapped range
+    /// rather than as a `Vec`.
+    ///
+    /// The closure is what keeps [`Renderer::finish`] from allocating a
+    /// full-frame copy of the sums — sixteen bytes a pixel, 130MB at 1080p — on
+    /// the way to pixels that are a quarter of the size. [`Renderer::sums`] is
+    /// the same call with that copy asked for explicitly, because the preview
+    /// hands the sums to another thread and cannot hold the buffer mapped while
+    /// it draws.
+    ///
+    /// This is the one that costs a pipeline drain, and the reason the preview
+    /// uses [`Renderer::request`] and [`Renderer::snapshot`] instead: the map
+    /// only resolves once every submission ahead of it has run, so the queue
+    /// empties and has to refill.
+    fn read<T>(&mut self, read: impl FnOnce(&[[f32; 4]]) -> T) -> Result<T, Box<dyn Error>> {
+        self.discard()?;
+        self.request();
+
+        let receiver = self
+            .pending
+            .take()
+            .expect("`request` leaves a request outstanding");
+        loop {
+            self.device.poll(wgpu::PollType::wait_indefinitely())?;
+            match receiver.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => continue,
+                Err(error) => return Err(error.into()),
+                Ok(result) => break result?,
+            }
+        }
+
+        let slice = self.readback.slice(..);
+        let mapped = slice.get_mapped_range()?;
+        let value = read(cast_slice(&mapped));
+        drop(mapped);
+        self.readback.unmap();
+
+        Ok(value)
+    }
+
+    /// Waits out a request the preview left outstanding and throws it away,
+    /// which is what frees the one readback buffer for the next one.
+    ///
+    /// Thrown away rather than returned because those sums read the accumulator
+    /// as it stood when that request was *queued*, which is not what a caller
+    /// asking now is asking for.
+    fn discard(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(receiver) = self.pending.take() else {
+            return Ok(());
+        };
+
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        receiver.recv()??;
+        self.readback.unmap();
+
+        Ok(())
+    }
+
+    /// Waits until every sample handed to the queue has landed.
+    ///
+    /// [`Renderer::finish`] does this on the way past, so [`render`] never calls
+    /// it. The preview does, to draw one last frame that is level with the sums
+    /// it is about to resolve — and to draw it *before* [`Renderer::resolved`]
+    /// closes off the progress bar's line, which would otherwise leave the
+    /// cursor a row below the block the frame is placed against.
+    pub fn drain(&mut self) -> Result<(), wgpu::PollError> {
+        while !self.in_flight.is_empty() {
+            self.retire()?;
+        }
+
+        Ok(())
+    }
+
+    /// Waits on everything still in flight and resolves the frame.
+    ///
+    /// Takes `&mut self` rather than consuming, so that an interrupted preview
+    /// can finish without unwinding the state it is still drawing from.
+    pub fn finish(&mut self) -> Result<Render, Box<dyn Error>> {
+        self.drain()?;
+        // Resolved straight off the mapped range: the pixels are all this path
+        // wants, so there is no reason for a copy of the sums to exist on the
+        // way to them.
+        let pixels = self.read(resolve)?;
+
+        self.assembled(pixels)
+    }
+
+    /// [`Renderer::finish`] from sums the caller has already read back.
+    ///
+    /// The preview reads the accumulator itself to paint the last frame, and
+    /// the renderer is drained by then, so nothing can have moved between that
+    /// read and this one. Resolving what it read rather than asking the GPU for
+    /// the same buffer again saves a second drain, a second full-frame copy
+    /// over the bus, and a second full-frame allocation.
+    pub fn resolved(&mut self, sums: &[[f32; 4]]) -> Result<Render, Box<dyn Error>> {
+        self.assembled(resolve(sums))
+    }
+
+    /// The half of a finish that is not the pixels: the progress bar closed off,
+    /// the query set read, and a [`Render`] built out of the three.
+    fn assembled(&mut self, pixels: Vec<u8>) -> Result<Render, Box<dyn Error>> {
+        if !self.finished {
+            self.progress.finish();
+        }
+
+        // A query set may only be resolved once, and only after the passes that
+        // wrote it have completed — so this is the one place it can happen, and
+        // only on the first call.
+        let timings = match (&self.timer, self.finished) {
+            (Some(timer), false) => {
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("timestamps"),
+                        });
+                timer.resolve(&mut encoder, self.completed);
+                self.queue.submit([encoder.finish()]);
+                timer.timings(&self.device, self.completed)?
+            }
+            _ => None,
+        };
+        self.finished = true;
+
+        Ok(Render {
+            image: Image {
+                width: self.width,
+                height: self.height,
+                pixels,
+            },
+            renderer: self.renderer.clone(),
+            timings,
+        })
+    }
 }
 
 /// Uploads the sky as a texture, with the sampler that reads it.
@@ -400,23 +690,60 @@ fn environment(
     (texture.create_view(&Default::default()), sampler)
 }
 
-/// Blocks until the oldest queued sample has run, then counts it.
-fn wait_for(
-    device: &wgpu::Device,
-    in_flight: &mut VecDeque<wgpu::SubmissionIndex>,
-    progress: &mut Progress,
-) -> Result<(), wgpu::PollError> {
-    let Some(submission) = in_flight.pop_front() else {
-        return Ok(());
-    };
+/// Box-averages the accumulated sums down to `to`, for a preview that has to fit
+/// in a terminal.
+///
+/// Averaging the sums rather than the resolved pixels is the whole point: the
+/// radiance in the accumulator is linear, and averaging linear light before
+/// gamma-encoding it is the correct order. Reversing the two darkens every edge
+/// — a black and a white pixel average to mid-grey, which is 186 out of 255
+/// after a gamma of 2.2 and not 128.
+///
+/// The sample count in `w` is summed alongside the radiance, so [`resolve`]'s
+/// divide still lands on the right number with nothing special-cased.
+///
+/// A `to` at or above `from` in either axis is returned unscaled: this exists to
+/// shrink a render into a terminal, and there is nothing to be gained by
+/// magnifying one first.
+fn downsample(sums: &[[f32; 4]], from: (u32, u32), to: (u32, u32)) -> Vec<[f32; 4]> {
+    let (width, height) = from;
+    let (target_width, target_height) = to;
+    if target_width == 0 || target_height == 0 {
+        return Vec::new();
+    }
+    if target_width >= width && target_height >= height {
+        return sums.to_vec();
+    }
 
-    device.poll(wgpu::PollType::Wait {
-        submission_index: Some(submission),
-        timeout: None,
-    })?;
-    progress.advance();
+    let mut out = Vec::with_capacity((target_width * target_height) as usize);
+    for y in 0..target_height {
+        // The source rows this output row covers. Computed from the edges rather
+        // than from a stride so that every source pixel lands in exactly one
+        // box, whatever the ratio between the two sizes.
+        let top = (y as u64 * height as u64 / target_height as u64) as u32;
+        let bottom = (((y + 1) as u64 * height as u64 / target_height as u64) as u32).max(top + 1);
 
-    Ok(())
+        for x in 0..target_width {
+            let left = (x as u64 * width as u64 / target_width as u64) as u32;
+            let right =
+                (((x + 1) as u64 * width as u64 / target_width as u64) as u32).max(left + 1);
+
+            let mut total = [0.0f64; 4];
+            for row in top..bottom {
+                for column in left..right {
+                    let sum = sums[(row * width + column) as usize];
+                    for (channel, value) in total.iter_mut().zip(sum) {
+                        *channel += value as f64;
+                    }
+                }
+            }
+
+            let count = ((bottom - top) * (right - left)) as f64;
+            out.push(total.map(|channel| (channel / count) as f32));
+        }
+    }
+
+    out
 }
 
 /// Averages each pixel's accumulated radiance and gamma-encodes it to 8-bit
@@ -512,6 +839,65 @@ mod tests {
         let nan = f32::NAN;
         assert_eq!(resolve(&[[nan, nan, nan, 1.0]]), [0, 0, 0, 255]);
         assert_eq!(resolve(&[[f32::INFINITY, 0.0, 0.0, 1.0]]), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn downsampling_box_averages() {
+        // A 4x2 whose left half is one sample of 1.0 and right half two of 0.5,
+        // halved in width: each output pixel is the mean of its two inputs.
+        let sums = vec![
+            [1.0, 1.0, 1.0, 1.0],
+            [3.0, 3.0, 3.0, 1.0],
+            [0.5, 0.5, 0.5, 2.0],
+            [1.5, 1.5, 1.5, 2.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [3.0, 3.0, 3.0, 1.0],
+            [0.5, 0.5, 0.5, 2.0],
+            [1.5, 1.5, 1.5, 2.0],
+        ];
+        let scaled = downsample(&sums, (4, 2), (2, 1));
+
+        assert_eq!(scaled.len(), 2);
+        assert_eq!(scaled[0], [2.0, 2.0, 2.0, 1.0]);
+        assert_eq!(scaled[1], [1.0, 1.0, 1.0, 2.0]);
+    }
+
+    /// The whole reason the averaging happens on the sums rather than on the
+    /// resolved pixels. A black pixel beside a white one is mid-grey in *linear*
+    /// light, which gamma 2.2 encodes to 186 out of 255. Averaging the other way
+    /// round — resolve first, then average — would give 128, and every edge in
+    /// the preview would come out darker than the render it is previewing.
+    #[test]
+    fn downsampling_averages_before_the_gamma_curve() {
+        let sums = [[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]];
+        let pixels = resolve(&downsample(&sums, (2, 1), (1, 1)));
+
+        assert_eq!(pixels[0], 186, "0.5 linear should encode to 186");
+        assert_ne!(pixels[0], 128, "that is the wrong order, not this one");
+    }
+
+    /// A ratio that does not divide evenly still has to put every source pixel
+    /// in exactly one box, and never read past the end of the buffer.
+    #[test]
+    fn downsampling_covers_an_uneven_ratio() {
+        let sums: Vec<[f32; 4]> = (0..7 * 5).map(|n| [n as f32, 0.0, 0.0, 1.0]).collect();
+        let scaled = downsample(&sums, (7, 5), (3, 2));
+
+        assert_eq!(scaled.len(), 6);
+        assert!(scaled.iter().all(|sum| sum[3] == 1.0), "{scaled:?}");
+        // The first box is the top-left 2x2 of a 7x5: indices 0, 1, 7 and 8.
+        assert_eq!(scaled[0][0], (0.0 + 1.0 + 7.0 + 8.0) / 4.0);
+    }
+
+    /// The preview only ever shrinks a frame. Asking for more than there is
+    /// returns what there is rather than inventing pixels.
+    #[test]
+    fn downsampling_never_magnifies() {
+        let sums = [[1.0, 2.0, 3.0, 1.0], [4.0, 5.0, 6.0, 1.0]];
+
+        assert_eq!(downsample(&sums, (2, 1), (2, 1)), sums);
+        assert_eq!(downsample(&sums, (2, 1), (9, 9)), sums);
+        assert!(downsample(&sums, (2, 1), (0, 1)).is_empty());
     }
 
     #[test]
