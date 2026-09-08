@@ -29,6 +29,10 @@ pub struct Args {
     /// Directly override the sample count listed in the configuration file
     #[arg(short, long)]
     pub samples: Option<u32>,
+
+    /// Draw the frame in the terminal as it converges, and stop early on Ctrl-C
+    #[arg(short, long)]
+    pub preview: bool,
 }
 
 fn file_exists(path: &str) -> Result<PathBuf, String> {

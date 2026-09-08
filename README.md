@@ -31,6 +31,7 @@ Options:
   -c, --config <CONFIG>    Path of toml configuration file
   -o, --output <OUTPUT>    Path of file to save the render to [default: render.png]
   -s, --samples <SAMPLES>  Directly override the sample count listed in the configuration file
+  -p, --preview            Draw the frame in the terminal as it converges, and stop early on Ctrl-C
   -h, --help               Print help
   -V, --version            Print version
 
@@ -66,9 +67,9 @@ timestamps, which is allowed on every one of them.
 
 ## Examples
 
-`mise run examples` renders every scene under `examples/`, writing the image
-back beside the config it came from. Those images are checked in, so what
-follows is what this tracer currently produces.
+`mise run examples` renders every scene under `examples/` with `--preview`,
+writing the image back beside the config it came from. Those images are checked
+in, so what follows is what this tracer currently produces.
 
 ### Teapot
 
@@ -344,6 +345,8 @@ src/
   scene/mod.rs       meshes and materials, flattened into GPU buffers
   scene/bvh.rs       the bounding volume hierarchy built over those triangles
   render/mod.rs      the wgpu pass: buffers in, pixels out, PNG on disk
+  render/preview.rs  the frame drawn in the terminal as it converges
+  render/kitty.rs    the terminal graphics protocol that draws it
   render/timing.rs   timestamp queries, and what they average to
   render/golden.rs   the rendered frame, diffed against a checked-in one
   render/shader.wgsl the WGSL kernel — the path tracer itself
@@ -380,7 +383,18 @@ rather than a hope.
 
 `render` owns the GPU and nothing else. It uploads those arrays plus a
 `GpuCamera` uniform, runs the dispatch loop, and averages the accumulated
-radiance into 8-bit sRGB. The bind group layouts are reflected out of the shader
+radiance into 8-bit sRGB. The loop lives in a `Renderer` that can be stepped a
+sample at a time, which is the only concession the headless path makes to
+`--preview`: the preview interleaves the same three calls with reading the
+accumulator and drawing it, so there is one sample loop and not two.
+
+That the accumulator holds a running sum _and its sample count_ per pixel is what
+makes a preview nearly free — `sum.rgb / sum.w` is a finished frame at any point
+mid-render, so the preview resolves it with the same `resolve` that writes the
+PNG rather than a second copy of the tone curve. What it shrinks is the sums
+rather than the resolved pixels, because the radiance in them is linear and
+averaging linear light before gamma-encoding it is the correct order; the other
+way round darkens every edge. The bind group layouts are reflected out of the shader
 rather than declared twice, so a binding that changes in WGSL fails at pipeline
 creation instead of quietly reading the wrong bytes — and because the four
 structs are the contract between the two languages, a test parses the shader
