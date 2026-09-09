@@ -9,7 +9,9 @@ look_at = [1.0, 1.0, 0.0]
 vup = [0.0, 1.0, 0.0]
 
 [environment]
-color = [0.70, 0.80, 0.99]
+file = "sky.exr"
+rotation = -100.0
+intensity = 1.0
 
 [[objects]]
 shape = "wavefront"
