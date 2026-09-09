@@ -187,15 +187,24 @@ fn environment_direction(uv: vec2f) -> vec3f {
     return rotate_y(turned, -camera.environment_rotation);
 }
 
-// What a ray aimed at the sky brings home.
-fn environment_radiance(direction: vec3f) -> vec3f {
-    let uv = environment_uv(direction);
-
+// What the map holds at a place on it.
+//
+// Split from [`environment_radiance`] because half the callers already know the
+// uv: [`sample_sky`] draws one out of the distribution and only converts it to a
+// direction to aim a shadow ray along. Handing that uv straight to the sampler
+// saves the round trip back through [`environment_uv`], which is an `atan2`, an
+// `acos` and a rotation.
+fn environment_radiance_uv(uv: vec2f) -> vec3f {
     // `textureSampleLevel` and not `textureSample`: a compute shader has no
     // implicit derivatives to pick a mip from, and there is only the one level
     // to pick anyway.
     let texel = textureSampleLevel(environment, environment_sampler, uv, 0.0);
     return texel.rgb * camera.environment_intensity;
+}
+
+// What a ray aimed at the sky brings home.
+fn environment_radiance(direction: vec3f) -> vec3f {
+    return environment_radiance_uv(environment_uv(direction));
 }
 
 // Every thread draws from its own stream, seeded from where and when it is, so
@@ -328,6 +337,41 @@ fn intersect_triangle(ray: Ray, tri: Triangle) -> Intersection {
     return Intersection(normal, t, tri.material, front_face, 0u);
 }
 
+// The same test as [`intersect_triangle`], answering only whether the triangle
+// was met inside `limit`.
+//
+// A shadow ray does not shade anything: `occluded` wants a yes or a no, and
+// every attribute the full test builds on the way to one — the interpolated
+// normal, its `normalize`, the side that was struck, the material — is computed
+// and thrown away. Dropping them takes the work out, and it takes the live
+// state out too, which on this kernel is the half that pays.
+fn hits_triangle(ray: Ray, tri: Triangle, limit: f32) -> bool {
+    let e1 = tri.v1 - tri.v0;
+    let e2 = tri.v2 - tri.v0;
+
+    let p = cross(ray.direction, e2);
+    let det = dot(e1, p);
+    if abs(det) < 1e-8 {
+        return false;
+    }
+    let inv_det = 1.0 / det;
+
+    let s = ray.origin - tri.v0;
+    let u = dot(s, p) * inv_det;
+    if u < 0.0 || u > 1.0 {
+        return false;
+    }
+
+    let q = cross(s, e1);
+    let v = dot(ray.direction, q) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+        return false;
+    }
+
+    let t = dot(e2, q) * inv_det;
+    return t >= EPSILON && t < limit;
+}
+
 // Slab test, returning the distance at which the ray enters the node, or FLT_MAX
 // if it never enters within (EPSILON, closest).
 //
@@ -352,11 +396,10 @@ fn hit_aabb(origin: vec3f, inv_direction: vec3f, node: BvhNode, closest: f32) ->
 // test per triangle in the scene; this costs a couple of dozen box tests and a
 // handful of triangle tests, whatever the scene size.
 //
-// Nothing beyond `limit` is considered, which is what lets a shadow ray stop at
-// the light it is aimed at. `any_hit` returns the first thing found rather than
-// the nearest: a shadow ray only asks whether the path is blocked, so it can
-// abandon the tree the moment anything says yes.
-fn traverse(ray: Ray, limit: f32, any_hit: bool) -> Intersection {
+// Nothing beyond `limit` is considered. Shadow rays do not come through here at
+// all — [`occluded`] walks the tree itself, for the first thing rather than the
+// nearest and without an intersection to fill in.
+fn traverse(ray: Ray, limit: f32) -> Intersection {
     var closest = no_intersection();
     closest.t = limit;
 
@@ -376,9 +419,6 @@ fn traverse(ray: Ray, limit: f32, any_hit: bool) -> Intersection {
                 if hit.t > 0.0 && hit.t < closest.t {
                     closest = hit;
                     closest.triangle = primitive;
-                    if any_hit {
-                        return closest;
-                    }
                 }
             }
         } else {
@@ -432,14 +472,71 @@ fn traverse(ray: Ray, limit: f32, any_hit: bool) -> Intersection {
 
 // The nearest thing the ray meets anywhere in the scene.
 fn intersect_scene(ray: Ray) -> Intersection {
-    return traverse(ray, FLT_MAX, false);
+    return traverse(ray, FLT_MAX);
 }
 
 // Whether anything at all stands between `origin` and a point `distance` away
 // along `direction`. The limit stops an epsilon short so that the emitter being
 // aimed at does not shadow itself.
+//
+// Its own walk rather than a flag on [`traverse`]. The two look alike, and the
+// difference is the point: this one carries a bound that never moves and no
+// candidate at all, where the other carries an `Intersection` it narrows as it
+// goes. Next event estimation aims a shadow ray from every diffuse bounce — two
+// where a scene has both an emitter and a sky — so this is at least half the
+// traversals in the render, and the cheapest possible version of it is worth
+// the duplicated loop.
 fn occluded(origin: vec3f, direction: vec3f, distance: f32) -> bool {
-    return traverse(Ray(origin, direction), distance - EPSILON, true).t > 0.0;
+    let ray = Ray(origin, direction);
+    // Nothing found here shrinks anything, so the bound handed to every box test
+    // is the same one from the first node to the last.
+    let limit = distance - EPSILON;
+
+    let inv_direction = 1.0 / ray.direction;
+    var stack: array<u32, MAX_BVH_STACK>;
+    var stack_depth = 0u;
+    var index = 0u;
+
+    loop {
+        let node = bvh[index];
+        if node.primitive_count > 0u {
+            for (var i = 0u; i < node.primitive_count; i += 1u) {
+                if hits_triangle(ray, triangles[node.left_or_first + i], limit) {
+                    return true;
+                }
+            }
+        } else {
+            var near = node.left_or_first;
+            var far = node.left_or_first + 1u;
+            var near_t = hit_aabb(ray.origin, inv_direction, bvh[near], limit);
+            var far_t = hit_aabb(ray.origin, inv_direction, bvh[far], limit);
+            if far_t < near_t {
+                let closer = far;
+                far = near;
+                near = closer;
+
+                let closer_t = far_t;
+                far_t = near_t;
+                near_t = closer_t;
+            }
+            if near_t < FLT_MAX {
+                if far_t < FLT_MAX && stack_depth < MAX_BVH_STACK {
+                    stack[stack_depth] = far;
+                    stack_depth += 1u;
+                }
+                index = near;
+                continue;
+            }
+        }
+
+        if stack_depth == 0u {
+            break;
+        }
+        stack_depth -= 1u;
+        index = stack[stack_depth];
+    }
+
+    return false;
 }
 
 struct Scatter {
@@ -813,11 +910,23 @@ fn sky_column(row: u32, draw: f32) -> u32 {
 // one converts between measures, and it has to be evaluated pointwise or what
 // comes back is not a density at all.
 fn sky_pdf(direction: vec3f) -> f32 {
+    return sky_pdf_uv(environment_uv(direction));
+}
+
+// The same density, given the place on the map rather than the direction that
+// reaches it.
+//
+// [`sample_sky`] holds a uv and wants its density; an escaped ray holds a
+// direction and wants the same number for it. Both go through this one function
+// so the two strategies cannot disagree about what a cell is worth — which was
+// the reason the pdf was taken from the direction in the first place, and is
+// still the reason, just enforced a level lower down where the sampler does not
+// have to make a round trip to get it.
+fn sky_pdf_uv(uv: vec2f) -> f32 {
     if camera.sky_width == 0u {
         return 0.0;
     }
 
-    let uv = environment_uv(direction);
     let sin_theta = sin(uv.y * PI);
     if sin_theta <= 0.0 {
         // Straight up or straight down: no solid angle to spread a density over.
@@ -877,9 +986,15 @@ fn sample_sky() -> SkySample {
 
     let cell = vec2f(f32(column), f32(row)) + vec2f(rand_f32(), rand_f32());
     let uv = cell / vec2f(f32(camera.sky_width), f32(camera.sky_height));
-    let direction = environment_direction(uv);
 
-    return SkySample(direction, environment_radiance(direction), sky_pdf(direction));
+    // The uv is what was drawn, so it is what the map is read at and what the
+    // density is taken from. Only the shadow ray needs a direction, and that
+    // conversion happens once rather than being undone and redone twice.
+    return SkySample(
+        environment_direction(uv),
+        environment_radiance_uv(uv),
+        sky_pdf_uv(uv),
+    );
 }
 
 // Next event estimation: the light this surface receives directly, found by
