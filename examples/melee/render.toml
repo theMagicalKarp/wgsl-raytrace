@@ -1,7 +1,8 @@
 [camera]
 aspect_ratio = "widescreen"
 image_width = 1200
-samples = 10000
+samples = 5000
+exposure = 1.5
 max_bounces = 64
 fov = 25
 look_from = [0.815, 0.94, 3.6]

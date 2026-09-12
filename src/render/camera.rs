@@ -41,10 +41,15 @@ pub struct GpuCamera {
     /// default here but a black sky, so a camera that never reached
     /// [`render`](crate::render::render) should still light its scene.
     pub environment_intensity: f32,
-    /// `sample` is a `u32` and the two above are `f32`, so this row is four
-    /// scalars where every other one is a `vec3<f32>` and a scalar. It measures
-    /// the same sixteen bytes either way.
-    _pad0: f32,
+    /// How many standard deviations above a pixel's running mean a sample may
+    /// land before it is treated as an outlier and scaled back. Zero turns the
+    /// rejection off entirely, which is the default and the only setting under
+    /// which a render is guaranteed unbiased at every sample count rather than
+    /// only in the limit.
+    ///
+    /// Rides here because the shader wants it as a scalar, in the slot the
+    /// padding beside `sample` was already spending.
+    pub outlier_k: f32,
     /// 1-based index of the sample being traced, which also reseeds the RNG.
     pub sample: u32,
 
@@ -81,13 +86,40 @@ pub struct GpuCamera {
     pub sky_width: u32,
     pub sky_height: u32,
 
+    /// Samples a pixel must have gathered before [`GpuCamera::outlier_k`] is
+    /// allowed to act on it.
+    ///
+    /// Early on the variance estimate is noise and the running mean is far below
+    /// where it will settle, so a naive threshold rejects the light source
+    /// itself — melee's emitter is at 15.0, and no mean over three samples is
+    /// anywhere near it.
+    pub outlier_warmup: u32,
+
+    /// Decorrelates one render from another drawn of the same scene.
+    ///
+    /// Zero is the default and is *exactly* the sequence this renderer has
+    /// always drawn: the shader folds this in as `jenkins_hash(seed)`, and that
+    /// hash maps zero to zero, so the XOR is an identity. Any other value gives
+    /// every pixel a different stream.
+    ///
+    /// This exists for measurement rather than for pictures. Comparing a render
+    /// against a high-sample reference the *same* sampler drew is what lets a
+    /// 20000-sample frame measure a 500-sample one at all — their shared prefix
+    /// makes the reference's own noise cancel — but that cancellation hides
+    /// systematic error along with it. A reference drawn at a different seed
+    /// shares no noise to cancel, and a mean signed difference against one is
+    /// the only honest way to ask whether a change has biased the image.
+    pub seed: u32,
+
     /// Every row above is a `vec3<f32>` paired with a scalar and so is exactly
-    /// the 16 bytes WGSL aligns one to. The four scalars of the seventh row
-    /// leave exactly this much of it over.
-    _pad: u32,
+    /// the 16 bytes WGSL aligns one to. `seed` opens an eighth row and uses one
+    /// scalar of it; this is the rest.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-const _: () = assert!(size_of::<GpuCamera>() == 112);
+const _: () = assert!(size_of::<GpuCamera>() == 128);
 
 impl From<&CameraOptions> for GpuCamera {
     fn from(camera: &CameraOptions) -> Self {
@@ -105,7 +137,9 @@ impl From<&CameraOptions> for GpuCamera {
             max_bounces: camera.max_bounces,
             environment_rotation: 0.0,
             environment_intensity: 1.0,
-            _pad0: 0.0,
+            // Off. Like the scene fields above, `render` fills these in — the
+            // rejection is a render setting rather than a camera one.
+            outlier_k: 0.0,
             sample: 1,
             width,
             height,
@@ -114,7 +148,11 @@ impl From<&CameraOptions> for GpuCamera {
             strata: (camera.samples as f32).sqrt() as u32,
             sky_width: 0,
             sky_height: 0,
-            _pad: 0,
+            outlier_warmup: 0,
+            seed: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 }
@@ -153,6 +191,8 @@ look_at = [0.0, 0.0, 0.0]
         assert_eq!(gpu.light_power, 0.0);
         assert_eq!(gpu.sky_width, 0, "and about the sky it aims samples at");
         assert_eq!(gpu.defocus_radius, 0.0, "a scene without one is a pinhole");
+        assert_eq!(gpu.outlier_k, 0.0, "outlier rejection is off unless asked");
+        assert_eq!(gpu.seed, 0, "and zero is the sequence this always drew");
         assert_eq!(
             gpu.strata, 2,
             "eight samples stratify over a two by two grid"

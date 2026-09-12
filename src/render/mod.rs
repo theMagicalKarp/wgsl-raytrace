@@ -1,19 +1,28 @@
+mod aov;
 mod camera;
+mod denoise;
 mod kitty;
 mod preview;
 mod progress;
 mod timing;
+mod tonemap;
+mod variance;
 
 #[cfg(test)]
 mod golden;
 
+pub use aov::Aovs;
 pub use camera::GpuCamera;
+pub use denoise::Denoised;
+pub use denoise::GpuDenoise;
 pub use preview::preview;
 pub use timing::Timings;
+pub use variance::Statistics;
 
 use crate::config::Config;
 use crate::scene::GpuLight;
 use crate::scene::Scene;
+use bytemuck::Pod;
 use bytemuck::Zeroable;
 use bytemuck::cast_slice;
 use half::f16;
@@ -22,6 +31,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Instant;
 use timing::Timer;
 use wgpu::util::BufferInitDescriptor;
 use wgpu::util::DeviceExt;
@@ -31,6 +41,38 @@ use wgpu::util::DeviceExt;
 /// progress readout reflects samples the GPU has actually finished.
 const IN_FLIGHT_SAMPLES: usize = 4;
 
+/// Storage buffers the shader binds across its two groups: the accumulator, the
+/// moments and the two feature buffers in the frame's, and the materials,
+/// triangles, BVH, light table and the sky's two distributions in the scene's.
+///
+/// wgpu defaults this limit to eight, which is a floor every backend can meet
+/// including WebGL. This renderer is native, offline and will never see one of
+/// those, so it asks the adapter for what it actually needs — and a test below
+/// counts the shader's own bindings against this number, so adding one and
+/// forgetting to raise it fails without a GPU in the room.
+const STORAGE_BUFFERS: u32 = 10;
+
+/// Materials the object-id vote can hold: sixteen bits, less the zero that
+/// stands for a miss.
+const OBJECT_IDS: usize = 0xffff;
+
+/// What a run wants out of a render beyond the frame itself.
+///
+/// Each costs something a run that only wants a picture should not pay — two
+/// full-frame copies over the bus for the features, a shader compile and a
+/// handful of dispatches for the filter, a frame's worth of allocation for the
+/// heatmap — so each is asked for rather than assumed.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct Outputs {
+    /// Resolve the feature buffers into images.
+    pub aovs: bool,
+    /// Run the a-trous filter over the finished frame.
+    pub denoise: bool,
+    /// Keep the per-pixel variance field as a heatmap. The summary beside it is
+    /// built either way; this is only about the picture of it.
+    pub variance: bool,
+}
+
 /// A finished render: the frame, the GPU that drew it, and what that cost.
 pub struct Render {
     pub image: Image,
@@ -39,6 +81,21 @@ pub struct Render {
     pub renderer: String,
     /// `None` on an adapter that cannot write timestamps.
     pub timings: Option<Timings>,
+    /// What the frame's own samples say about how converged it is, recovered
+    /// from the moments the shader accumulated beside the radiance.
+    pub statistics: Statistics,
+    /// The feature buffers, resolved — `None` unless the render was asked for
+    /// them. Reading them back costs two full-frame copies over the bus and
+    /// three images' worth of allocation, which is not worth spending on a run
+    /// that is only after a picture.
+    pub aovs: Option<Aovs>,
+    /// The same frame with the filter run over it — `None` unless the render was
+    /// asked for it. Beside [`Render::image`] rather than in place of it: tuning
+    /// the filter's sigmas means comparing the two, so the unfiltered frame has
+    /// to survive the filter running. Which of them a caller writes where is the
+    /// caller's business — `--denoise` gives this one `--output` and leaves the
+    /// other for `--debug`.
+    pub denoised: Option<Denoised>,
 }
 
 /// A finished frame, 8-bit RGBA and ready to write.
@@ -66,8 +123,9 @@ impl Image {
 /// Every sample, start to finish. [`preview`] drives the same [`Renderer`] one
 /// sample at a time instead, so that it can look at the accumulator on the way
 /// through.
-pub fn render(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
+pub fn render(config: &Config, scene: &Scene, outputs: Outputs) -> Result<Render, Box<dyn Error>> {
     let mut renderer = Renderer::new(config, scene)?;
+    renderer.wants(outputs);
     while renderer.remaining() > 0 {
         renderer.sample()?;
     }
@@ -89,6 +147,28 @@ pub struct Renderer {
     accumulator: wgpu::Buffer,
     readback: wgpu::Buffer,
     accumulator_size: u64,
+    /// The luminance moments, and the buffer they come home through. Kept off
+    /// [`Renderer::request`]'s path entirely — the preview never wants them, and
+    /// the one readback buffer that path shares is exactly what makes its
+    /// unblocked loop work.
+    moments: wgpu::Buffer,
+    moments_readback: wgpu::Buffer,
+    moments_size: u64,
+    /// The feature buffers. Bound and written every sample whether or not
+    /// anything will read them — they are two more stores in a shader that is
+    /// already storing — and read back only when [`Renderer::wants_aovs`] says
+    /// somebody asked.
+    normals: wgpu::Buffer,
+    albedos: wgpu::Buffer,
+    /// The filter's settings, resolved out of the scene at construction. Its
+    /// `samples` is filled in at the end, from the count the render actually
+    /// reached rather than the one it was budgeted.
+    denoise: GpuDenoise,
+    iterations: u32,
+    /// Linear gain into the tone curve, off the scene's camera. Read at resolve
+    /// time and nowhere else.
+    exposure: f32,
+    outputs: Outputs,
     timer: Option<Timer>,
     in_flight: VecDeque<wgpu::SubmissionIndex>,
     /// Set while a copy into `readback` is queued and its map has not resolved.
@@ -127,6 +207,17 @@ impl Renderer {
             return Err("scene has no geometry to render".into());
         }
 
+        // The shader's object-id vote packs `material + 1` into sixteen bits
+        // (`shader.wgsl`'s `Albedo`), and an id past that would silently alias
+        // another object's and let the filter blur across their shared edge.
+        if scene.materials.len() > OBJECT_IDS {
+            return Err(format!(
+                "scene has {} materials and the denoiser can tell at most {OBJECT_IDS} apart",
+                scene.materials.len(),
+            )
+            .into());
+        }
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -135,10 +226,23 @@ impl Renderer {
         // counter sampling, Vulkan a queue with enough valid timestamp bits — and
         // asking for a feature the adapter lacks fails the request outright, so the
         // ask is whatever it turns out to have.
+        let available = adapter.limits().max_storage_buffers_per_shader_stage;
+        if available < STORAGE_BUFFERS {
+            return Err(format!(
+                "adapter binds at most {available} storage buffers per stage \
+                 and the tracer needs {STORAGE_BUFFERS}",
+            )
+            .into());
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("device"),
                 required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: STORAGE_BUFFERS,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await?;
@@ -147,6 +251,9 @@ impl Renderer {
         let renderer = format!("{} ({:?})", info.name, info.backend);
 
         let mut camera = GpuCamera::from(&config.camera);
+        camera.outlier_k = config.outliers.k;
+        camera.outlier_warmup = config.outliers.warmup;
+        camera.seed = config.seed;
         camera.light_count = scene.lights.len() as u32;
         camera.light_power = scene.light_power;
         camera.environment_rotation = config.environment.rotation.to_radians();
@@ -234,6 +341,39 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // And two `vec2<f32>`s of summed luminance and summed squared luminance,
+        // which is what a variance is recovered from: one over every sample as
+        // drawn, for the firefly rejection, and one over what the accumulator
+        // kept, for everything else (`shader.wgsl`'s `Moments`). The width of
+        // the accumulator and read exactly once, at the end.
+        let moments_size = (width as u64) * (height as u64) * size_of::<[f32; 4]>() as u64;
+        let moments = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("moments"),
+            size: moments_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let moments_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("moments readback"),
+            size: moments_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // The features, at the accumulator's width: `vec4f` each, one holding
+        // the normal with the depth in its fourth channel and one the albedo
+        // with the object-id vote packed into its.
+        let feature = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: accumulator_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let normals = feature("normals");
+        let albedos = feature("albedos");
+
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("path tracer"),
@@ -258,6 +398,18 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: accumulator.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: moments.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: normals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: albedos.as_entire_binding(),
                 },
             ],
         });
@@ -312,6 +464,15 @@ impl Renderer {
             accumulator,
             readback,
             accumulator_size,
+            moments,
+            moments_readback,
+            moments_size,
+            normals,
+            albedos,
+            denoise: GpuDenoise::new(&config.denoise, (width, height), config.camera.samples),
+            iterations: config.denoise.iterations,
+            exposure: config.camera.exposure,
+            outputs: Outputs::default(),
             timer,
             in_flight: VecDeque::new(),
             pending: None,
@@ -324,6 +485,22 @@ impl Renderer {
             renderer,
             finished: false,
         })
+    }
+
+    /// Asks for whatever a run wants beyond the frame.
+    ///
+    /// Nothing here changes the sample loop. The shader fills the feature
+    /// buffers either way — leaving them unbound would be a second pipeline —
+    /// and the filter does not exist until the last sample has landed, so what
+    /// this decides is only what happens after.
+    pub fn wants(&mut self, outputs: Outputs) {
+        self.outputs = outputs;
+    }
+
+    /// The gain the preview has to paint through, so that what it draws is what
+    /// the PNG will hold.
+    pub fn exposure(&self) -> f32 {
+        self.exposure
     }
 
     /// The frame's dimensions, which the preview fits its block to.
@@ -490,34 +667,51 @@ impl Renderer {
     /// hands the sums to another thread and cannot hold the buffer mapped while
     /// it draws.
     ///
-    /// This is the one that costs a pipeline drain, and the reason the preview
-    /// uses [`Renderer::request`] and [`Renderer::snapshot`] instead: the map
-    /// only resolves once every submission ahead of it has run, so the queue
-    /// empties and has to refill.
+    /// It is [`read_back`], so it costs a pipeline drain — which is what the
+    /// preview's [`Renderer::request`] and [`Renderer::snapshot`] exist to
+    /// avoid mid-render.
     fn read<T>(&mut self, read: impl FnOnce(&[[f32; 4]]) -> T) -> Result<T, Box<dyn Error>> {
+        // The preview may have left a snapshot outstanding, and there is one
+        // readback buffer: it cannot be copied into again until that map has
+        // resolved and been thrown away.
         self.discard()?;
-        self.request();
 
-        let receiver = self
-            .pending
-            .take()
-            .expect("`request` leaves a request outstanding");
-        loop {
-            self.device.poll(wgpu::PollType::wait_indefinitely())?;
-            match receiver.try_recv() {
-                Err(mpsc::TryRecvError::Empty) => continue,
-                Err(error) => return Err(error.into()),
-                Ok(result) => break result?,
-            }
-        }
+        read_back(
+            &self.device,
+            &self.queue,
+            &self.accumulator,
+            &self.readback,
+            self.accumulator_size,
+            read,
+        )
+    }
 
-        let slice = self.readback.slice(..);
-        let mapped = slice.get_mapped_range()?;
-        let value = read(cast_slice(&mapped));
-        drop(mapped);
-        self.readback.unmap();
+    /// What the moments say about this frame's noise.
+    ///
+    /// Its own buffer and its own readback, so none of this touches the one the
+    /// preview's [`Renderer::request`]/[`Renderer::snapshot`] pair shares — the
+    /// moments are wanted once, at the end, and never mid-render.
+    ///
+    /// The variance is built inside the closure for the same reason
+    /// [`Renderer::read`] takes one: sixteen bytes a pixel of moments never has to
+    /// exist as a `Vec` on the way to the summary. Nor does the variance field
+    /// itself, unless [`Outputs::variance`] asked for a picture of it.
+    pub fn statistics(&mut self) -> Result<Statistics, Box<dyn Error>> {
+        let dimensions = (self.width, self.height);
+        // Every pixel is in every dispatch, so the frame's sample count is the
+        // pixel's. `completed` rather than `samples` because an interrupted
+        // preview stops somewhere in between, and the moments only count the
+        // dispatches that actually ran.
+        let samples = self.completed;
 
-        Ok(value)
+        read_back(
+            &self.device,
+            &self.queue,
+            &self.moments,
+            &self.moments_readback,
+            self.moments_size,
+            |moments| Statistics::new(moments, dimensions, samples, self.outputs.variance),
+        )
     }
 
     /// Waits out a request the preview left outstanding and throws it away,
@@ -553,6 +747,225 @@ impl Renderer {
         Ok(())
     }
 
+    /// The feature buffers, averaged and encoded, or `None` if nobody asked.
+    ///
+    /// Both come home through the accumulator's own readback buffer, which is
+    /// exactly the right size for them and is free by the time this runs. The
+    /// normals have to become a `Vec` because the two are needed together and
+    /// only one buffer can be mapped at a time; the albedos never do.
+    fn features(&mut self) -> Result<Option<Aovs>, Box<dyn Error>> {
+        if !self.outputs.aovs {
+            return Ok(None);
+        }
+
+        // The preview may still have a snapshot outstanding against the buffer
+        // both of these are about to use.
+        self.discard()?;
+
+        let dimensions = (self.width, self.height);
+        let samples = self.completed;
+        let normals: Vec<[f32; 4]> = read_back(
+            &self.device,
+            &self.queue,
+            &self.normals,
+            &self.readback,
+            self.accumulator_size,
+            <[[f32; 4]]>::to_vec,
+        )?;
+
+        let aovs = read_back(
+            &self.device,
+            &self.queue,
+            &self.albedos,
+            &self.readback,
+            self.accumulator_size,
+            |albedos| Aovs::new(&normals, albedos, dimensions, samples),
+        )?;
+
+        Ok(Some(aovs))
+    }
+
+    /// Runs the a-trous filter over the finished frame, or `None` if nobody
+    /// asked.
+    ///
+    /// Everything here is built on the spot and dropped on the way out: a shader
+    /// compile, two full-frame scratch buffers and a handful of dispatches, none
+    /// of which a render that only wants a picture should be paying for. It is
+    /// also the only reason any of it can be this simple — the sample loop is
+    /// over, the queue is empty, and the tracer's four buffers are read-only from
+    /// here.
+    fn filtered(&mut self) -> Result<Option<Denoised>, Box<dyn Error>> {
+        if !self.outputs.denoise {
+            return Ok(None);
+        }
+
+        let started = Instant::now();
+
+        // The frame comes home through the accumulator's readback buffer at the
+        // end of this, and the preview may still have a snapshot outstanding
+        // against it. Both callers happen to have read the accumulator already,
+        // which clears it — this is what keeps that a coincidence rather than a
+        // requirement.
+        self.discard()?;
+
+        let module = self
+            .device
+            .create_shader_module(wgpu::include_wgsl!("denoise.wgsl"));
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("denoise"),
+                // Reflected out of the shader, as the tracer's is. The one entry
+                // point reaches every binding through the three passes it
+                // branches between, so both groups come back whole and the
+                // ping-pong pair stays interchangeable.
+                layout: None,
+                module: &module,
+                entry_point: Some("denoise_pass"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let mut uniform = self.denoise;
+        // The count the render reached, which an interrupted preview leaves
+        // short of the one it was budgeted.
+        uniform.samples = self.completed.max(1) as f32;
+
+        let settings = self.device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("denoise settings"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let scratch = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: self.accumulator_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let ping = scratch("denoise ping");
+        let pong = scratch("denoise pong");
+
+        let inputs = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("denoise inputs"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: settings.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.accumulator.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.moments.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.normals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.albedos.as_entire_binding(),
+                },
+            ],
+        });
+
+        // The two directions the pair can be read in. A pass picks whichever one
+        // writes into the buffer it is that pass's turn to fill.
+        let layout = pipeline.get_bind_group_layout(1);
+        let pair = |label, source: &wgpu::Buffer, destination: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: source.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: destination.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let into_pong = pair("denoise ping to pong", &ping, &pong);
+        let into_ping = pair("denoise pong to ping", &pong, &ping);
+
+        // One submission per pass, because each rewrites the uniform and a
+        // queued write only lands before the submission that follows it. Seven
+        // submissions for a default schedule, once, at the end of a render that
+        // has already made several hundred.
+        // `prepare` has to land in `ping`, and every pass after it reads what
+        // the one before wrote, so the pair alternates from there.
+        let mut into_ping_now = true;
+        for (pass, stride) in denoise::schedule(self.iterations) {
+            uniform.stage = pass;
+            uniform.stride = stride;
+            self.queue
+                .write_buffer(&settings, 0, bytemuck::bytes_of(&uniform));
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("denoise"),
+                });
+            {
+                let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("denoise"),
+                    timestamp_writes: None,
+                });
+                compute.set_pipeline(&pipeline);
+                compute.set_bind_group(0, &inputs, &[]);
+                compute.set_bind_group(
+                    1,
+                    match into_ping_now {
+                        true => &into_ping,
+                        false => &into_pong,
+                    },
+                    &[],
+                );
+                compute.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+            }
+            self.queue.submit([encoder.finish()]);
+
+            // The buffer this pass just filled is the next one's source, so the
+            // next one writes into the other.
+            into_ping_now = !into_ping_now;
+        }
+
+        // The flag has moved on past the buffer the last pass wrote.
+        let filled = match into_ping_now {
+            true => &pong,
+            false => &ping,
+        };
+        // `remodulate` writes a sample count of one alongside the colour, so the
+        // frame resolves through exactly the code an unfiltered one does.
+        let exposure = self.exposure;
+        let pixels = read_back(
+            &self.device,
+            &self.queue,
+            filled,
+            &self.readback,
+            self.accumulator_size,
+            |sums| resolve(sums, exposure),
+        )?;
+
+        Ok(Some(Denoised {
+            image: Image {
+                width: self.width,
+                height: self.height,
+                pixels,
+            },
+            elapsed: started.elapsed(),
+        }))
+    }
+
     /// Waits on everything still in flight and resolves the frame.
     ///
     /// Takes `&mut self` rather than consuming, so that an interrupted preview
@@ -562,7 +975,8 @@ impl Renderer {
         // Resolved straight off the mapped range: the pixels are all this path
         // wants, so there is no reason for a copy of the sums to exist on the
         // way to them.
-        let pixels = self.read(resolve)?;
+        let exposure = self.exposure;
+        let pixels = self.read(|sums| resolve(sums, exposure))?;
 
         self.assembled(pixels)
     }
@@ -575,12 +989,19 @@ impl Renderer {
     /// the same buffer again saves a second drain, a second full-frame copy
     /// over the bus, and a second full-frame allocation.
     pub fn resolved(&mut self, sums: &[[f32; 4]]) -> Result<Render, Box<dyn Error>> {
-        self.assembled(resolve(sums))
+        self.assembled(resolve(sums, self.exposure))
     }
 
     /// The half of a finish that is not the pixels: the progress bar closed off,
     /// the query set read, and a [`Render`] built out of the three.
     fn assembled(&mut self, pixels: Vec<u8>) -> Result<Render, Box<dyn Error>> {
+        // Before the progress bar closes off its line: this is a copy and a map
+        // like any other, and both callers have already drained, so it costs a
+        // round trip and no waiting on the sample loop.
+        let statistics = self.statistics()?;
+        let aovs = self.features()?;
+        let denoised = self.filtered()?;
+
         if !self.finished {
             self.progress.finish();
         }
@@ -611,8 +1032,62 @@ impl Renderer {
             },
             renderer: self.renderer.clone(),
             timings,
+            statistics,
+            aovs,
+            denoised,
         })
     }
+}
+
+/// Copies `source` into `readback`, waits for the map, and hands the mapped
+/// range to `read`.
+///
+/// A free function rather than a method because it is called with two different
+/// pairs of buffers and a method taking `&mut self` could not be handed one of
+/// the renderer's own fields.
+///
+/// This is the call that costs a pipeline drain: the map only resolves once
+/// every submission ahead of it has run, so the queue empties and has to refill.
+/// The preview avoids it mid-render with [`Renderer::request`] and
+/// [`Renderer::snapshot`], which ask the same question without waiting for the
+/// answer.
+fn read_back<T: Pod, R>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    readback: &wgpu::Buffer,
+    size: u64,
+    read: impl FnOnce(&[T]) -> R,
+) -> Result<R, Box<dyn Error>> {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("readback"),
+    });
+    encoder.copy_buffer_to_buffer(source, 0, readback, 0, size);
+    queue.submit([encoder.finish()]);
+
+    let (sender, receiver) = mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+    loop {
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        match receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => continue,
+            Err(error) => return Err(error.into()),
+            Ok(result) => break result?,
+        }
+    }
+
+    let slice = readback.slice(..);
+    let mapped = slice.get_mapped_range()?;
+    let value = read(cast_slice(&mapped));
+    drop(mapped);
+    readback.unmap();
+
+    Ok(value)
 }
 
 /// Uploads the sky as a texture, with the sampler that reads it.
@@ -746,21 +1221,44 @@ fn downsample(sums: &[[f32; 4]], from: (u32, u32), to: (u32, u32)) -> Vec<[f32; 
     out
 }
 
-/// Averages each pixel's accumulated radiance and gamma-encodes it to 8-bit
-/// sRGB.
-fn resolve(sums: &[[f32; 4]]) -> Vec<u8> {
+/// Averages each pixel's accumulated radiance, exposes it, tone maps it, and
+/// gamma-encodes the result to 8-bit sRGB.
+///
+/// Three steps in that order, and the order is the whole of it. The average is
+/// taken on linear radiance, because that is the only space in which averaging
+/// samples means anything. The curve then decides what happens to the light that
+/// will not fit in a display — see [`tonemap`], which is where the reasoning
+/// lives. Only then does the gamma encode run, which is a statement about how a
+/// monitor reads a byte and not about the image.
+///
+/// Everything upstream of this function works in linear light: the accumulator,
+/// the downsample the preview draws through, the a-trous filter's edge-stopping
+/// weights, and the standard error the noise figure reports. This is the one
+/// place any of it stops being linear — and the only place `exposure` is
+/// applied, so no amount of it can flatter a render that has not converged.
+fn resolve(sums: &[[f32; 4]], exposure: f32) -> Vec<u8> {
     sums.iter()
         .flat_map(|sum| {
             let scale = match sum[3] > 0.0 {
                 true => 1.0 / sum[3],
                 false => 0.0,
             };
-            let encode = |channel: f32| {
-                let corrected = (channel * scale).max(0.0).powf(1.0 / 2.2);
-                (corrected.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
-            };
 
-            [encode(sum[0]), encode(sum[1]), encode(sum[2]), 255]
+            // Exposure folds into the averaging divide, so it is free: one gain
+            // on the way into the curve, and the only step between the scene's
+            // radiance and the display's.
+            let scale = scale * exposure;
+            let display = tonemap::aces([sum[0] * scale, sum[1] * scale, sum[2] * scale]);
+            // `aces` has already bounded this to [0, 1] and taken the NaN with
+            // it, so the encode is only the curve a monitor expects.
+            let encode = |channel: f32| (channel.powf(1.0 / 2.2) * 255.0 + 0.5) as u8;
+
+            [
+                encode(display[0]),
+                encode(display[1]),
+                encode(display[2]),
+                255,
+            ]
         })
         .collect()
 }
@@ -768,6 +1266,10 @@ fn resolve(sums: &[[f32; 4]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unity gain: what every scene gets unless it says otherwise, and what the
+    /// tests below that are not about exposure resolve at.
+    const NEUTRAL: f32 = 1.0;
     use crate::scene::GpuBvhNode;
     use crate::scene::GpuMaterial;
     use crate::scene::GpuTriangle;
@@ -780,7 +1282,10 @@ mod tests {
     /// structs measures, so the tests below can hold the two sides of the
     /// binding against each other without a GPU in the room.
     fn shader_struct_sizes() -> Vec<(String, u32)> {
-        let source = include_str!("shader.wgsl");
+        struct_sizes(include_str!("shader.wgsl"))
+    }
+
+    fn struct_sizes(source: &str) -> Vec<(String, u32)> {
         let module = naga::front::wgsl::parse_str(source).expect("the shader should parse");
         Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
@@ -794,6 +1299,42 @@ mod tests {
             .iter()
             .filter_map(|(handle, ty)| Some((ty.name.clone()?, layouter[handle].size)))
             .collect()
+    }
+
+    /// The device asks for exactly the limit the shader turns out to need, so
+    /// a binding added without raising [`STORAGE_BUFFERS`] fails here rather
+    /// than inside `create_compute_pipeline` on whichever machine runs it next.
+    #[test]
+    fn the_device_asks_for_the_storage_buffers_the_shader_binds() {
+        let storage_bindings = |source: &str| {
+            let module = naga::front::wgsl::parse_str(source).expect("the shader should parse");
+            module
+                .global_variables
+                .iter()
+                .filter(|(_, global)| matches!(global.space, naga::AddressSpace::Storage { .. }))
+                .count() as u32
+        };
+
+        // The limit is per stage, so it is the hungrier of the two pipelines
+        // that sets it — today the tracer, with the filter reading four of its
+        // buffers and ping-ponging between two more.
+        let tracer = storage_bindings(include_str!("shader.wgsl"));
+        let filter = storage_bindings(include_str!("denoise.wgsl"));
+
+        assert_eq!(tracer.max(filter), STORAGE_BUFFERS);
+    }
+
+    /// The filter is a second module with its own pipeline, and it has to
+    /// compile and lay out the same way the tracer does.
+    #[test]
+    fn the_filter_agrees_with_the_struct_it_is_handed() {
+        let sizes = struct_sizes(include_str!("denoise.wgsl"));
+        let denoise = sizes
+            .iter()
+            .find(|(name, _)| name == "Denoise")
+            .unwrap_or_else(|| panic!("the filter should declare Denoise, found {sizes:?}"));
+
+        assert_eq!(denoise.1 as usize, size_of::<GpuDenoise>());
     }
 
     #[test]
@@ -812,13 +1353,16 @@ mod tests {
         assert_eq!(wgsl("Material"), size_of::<GpuMaterial>());
         assert_eq!(wgsl("Triangle"), size_of::<GpuTriangle>());
         assert_eq!(wgsl("BvhNode"), size_of::<GpuBvhNode>());
+        // Never uploaded, but read back: the host walks them as `[f32; 4]`.
+        assert_eq!(wgsl("Moments"), size_of::<[f32; 4]>());
+        assert_eq!(wgsl("Albedo"), size_of::<[f32; 4]>());
     }
 
     #[test]
     fn averages_by_the_sample_count_it_was_given() {
         // Four passes of mid-grey average back to mid-grey, not to four times it.
-        let one = resolve(&[[0.25, 0.5, 0.75, 1.0]]);
-        let four = resolve(&[[1.0, 2.0, 3.0, 4.0]]);
+        let one = resolve(&[[0.25, 0.5, 0.75, 1.0]], NEUTRAL);
+        let four = resolve(&[[1.0, 2.0, 3.0, 4.0]], NEUTRAL);
 
         assert_eq!(one, four);
         assert_eq!(one[3], 255, "the frame is opaque");
@@ -826,7 +1370,7 @@ mod tests {
 
     #[test]
     fn an_untouched_pixel_is_black_and_not_a_nan() {
-        assert_eq!(resolve(&[[0.0; 4]]), [0, 0, 0, 255]);
+        assert_eq!(resolve(&[[0.0; 4]], NEUTRAL), [0, 0, 0, 255]);
     }
 
     /// The shader rejects a non-finite sample before it reaches the accumulator,
@@ -834,11 +1378,19 @@ mod tests {
     /// is the other half of that guarantee: `f32::max` returns its non-NaN
     /// operand, which is the only reason a poisoned sum resolves to black rather
     /// than to whatever `as u8` makes of a NaN.
+    ///
+    /// An infinity comes back white in all three channels rather than in the one
+    /// it arrived in. That is the tone curve rather than a loss of information —
+    /// a colour bleaches toward neutral as it gets brighter, the way film does,
+    /// and nothing is brighter than this.
     #[test]
     fn a_poisoned_sum_still_resolves_to_a_pixel() {
         let nan = f32::NAN;
-        assert_eq!(resolve(&[[nan, nan, nan, 1.0]]), [0, 0, 0, 255]);
-        assert_eq!(resolve(&[[f32::INFINITY, 0.0, 0.0, 1.0]]), [255, 0, 0, 255]);
+        assert_eq!(resolve(&[[nan, nan, nan, 1.0]], NEUTRAL), [0, 0, 0, 255]);
+        assert_eq!(
+            resolve(&[[f32::INFINITY, 0.0, 0.0, 1.0]], NEUTRAL),
+            [255, 255, 255, 255],
+        );
     }
 
     #[test]
@@ -864,16 +1416,22 @@ mod tests {
 
     /// The whole reason the averaging happens on the sums rather than on the
     /// resolved pixels. A black pixel beside a white one is mid-grey in *linear*
-    /// light, which gamma 2.2 encodes to 186 out of 255. Averaging the other way
-    /// round — resolve first, then average — would give 128, and every edge in
-    /// the preview would come out darker than the render it is previewing.
+    /// light, and mid-grey resolves to 163. Averaging the other way round —
+    /// resolve each, then average the bytes — would land halfway between 0 and
+    /// whatever white resolves to, and every edge in the preview would come out
+    /// darker than the render it is previewing.
     #[test]
-    fn downsampling_averages_before_the_gamma_curve() {
+    fn downsampling_averages_before_the_tone_curve() {
         let sums = [[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]];
-        let pixels = resolve(&downsample(&sums, (2, 1), (1, 1)));
+        let pixels = resolve(&downsample(&sums, (2, 1), (1, 1)), NEUTRAL);
+        let white = resolve(&[[1.0, 1.0, 1.0, 1.0]], NEUTRAL)[0];
 
-        assert_eq!(pixels[0], 186, "0.5 linear should encode to 186");
-        assert_ne!(pixels[0], 128, "that is the wrong order, not this one");
+        assert_eq!(pixels[0], 163, "0.5 linear should resolve to 163");
+        assert_ne!(
+            pixels[0],
+            (white as u16).div_ceil(2) as u8,
+            "that is the wrong order, not this one",
+        );
     }
 
     /// A ratio that does not divide evenly still has to put every source pixel
@@ -900,13 +1458,64 @@ mod tests {
         assert!(downsample(&sums, (2, 1), (0, 1)).is_empty());
     }
 
+    /// One linear unit is no longer the top of the range: the curve keeps
+    /// headroom above it so that a light at 15 and a surface at 1 are still
+    /// different pixels, which is the entire reason the curve is here.
     #[test]
-    fn gamma_encodes_and_clamps() {
-        let pixels = resolve(&[[0.0, 0.5, 1.0, 1.0], [-1.0, 2.0, 1.0, 1.0]]);
+    fn resolve_leaves_headroom_above_one() {
+        let pixels = resolve(
+            &[[1.0; 4], [4.0, 4.0, 4.0, 1.0], [15.0, 15.0, 15.0, 1.0]],
+            NEUTRAL,
+        );
 
-        assert_eq!(pixels[0], 0);
-        assert_eq!(pixels[2], 255);
+        assert!(pixels[0] < 255, "one should not clip: {}", pixels[0]);
+        assert!(pixels[0] < pixels[4], "four is brighter than one");
+        assert!(pixels[4] < pixels[8], "and fifteen brighter than four");
+    }
+
+    /// Exposure is a gain on the way into the curve, so it moves a frame up and
+    /// down the same way pointing the camera at more light would.
+    #[test]
+    fn exposure_scales_the_frame_before_the_curve() {
+        let sums = [[0.18, 0.18, 0.18, 1.0]];
+
+        let dim = resolve(&sums, 0.5)[0];
+        let neutral = resolve(&sums, NEUTRAL)[0];
+        let bright = resolve(&sums, 2.0)[0];
+
+        assert!(dim < neutral, "{dim} vs {neutral}");
+        assert!(neutral < bright, "{neutral} vs {bright}");
+
+        // And it is exactly a gain, not a curve of its own: twice the exposure
+        // on half the light is the same pixel.
+        assert_eq!(resolve(&[[0.09, 0.09, 0.09, 1.0]], 2.0)[0], neutral);
+    }
+
+    /// A gain of zero is a legal thing to ask for and is not a special case: it
+    /// is a black frame, the way pointing a camera at nothing is.
+    #[test]
+    fn an_exposure_of_zero_is_a_black_frame_rather_than_a_divide() {
+        let pixels = resolve(&[[1.0, 2.0, 3.0, 1.0]], 0.0);
+
+        assert_eq!(pixels, [0, 0, 0, 255]);
+    }
+
+    /// A negative channel floors and a bright one rolls off rather than
+    /// clipping. The small red in the first pixel is the tone curve's doing and
+    /// not a bug: the curve runs in a wider set of primaries than sRGB, and a
+    /// colour on the edge of the display's gamut picks up a little of its
+    /// neighbours coming back out. That is what stops a saturated highlight from
+    /// swinging its hue on the way to white.
+    #[test]
+    fn resolve_bounds_what_the_curve_is_given() {
+        let pixels = resolve(&[[0.0, 0.5, 1.0, 1.0], [-1.0, 2.0, 1.0, 1.0]], NEUTRAL);
+
+        assert!(pixels[0] < 32, "black-ish, not black: {}", pixels[0]);
         assert!(pixels[1] > 128, "0.5 should brighten to {}", pixels[1]);
-        assert_eq!(&pixels[4..7], &[0, 255, 255], "out of range should clamp");
+        assert!(pixels[2] > pixels[1], "and 1.0 further still");
+        assert!(
+            pixels[4] < pixels[5],
+            "a negative floors below its neighbour"
+        );
     }
 }

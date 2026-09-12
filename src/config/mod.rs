@@ -23,7 +23,7 @@ pub struct Args {
     pub config: PathBuf,
 
     /// Path of file to save the render to
-    #[arg(short, long, default_value = "render.png")]
+    #[arg(short, long, default_value = "render.png", value_parser=parent_exists)]
     pub output: PathBuf,
 
     /// Directly override the sample count listed in the configuration file
@@ -33,6 +33,61 @@ pub struct Args {
     /// Draw the frame in the terminal as it converges, and stop early on Ctrl-C
     #[arg(short, long)]
     pub preview: bool,
+
+    /// Also write a heatmap of the render's per-pixel variance here
+    #[arg(long, value_parser=parent_exists)]
+    pub variance: Option<PathBuf>,
+
+    /// Also write the frame the tracer drew before any filtering into this
+    /// directory, beside the render's normal, albedo and depth buffers, for an
+    /// external denoiser to read and for the filter to be judged against
+    #[arg(long, value_parser=directory_exists)]
+    pub debug: Option<PathBuf>,
+
+    /// Run the a-trous filter over the finished frame. The filtered frame is
+    /// the render, so it is what --output gets; --debug is where the unfiltered
+    /// one it was built from stays reachable
+    #[arg(long)]
+    pub denoise: bool,
+
+    /// Directly override the firefly rejection strength listed in the
+    /// configuration file. Zero is off
+    #[arg(long)]
+    pub outlier_k: Option<f32>,
+
+    /// Draw a different sample sequence for the same scene. Zero, the default,
+    /// is the sequence every render draws; any other value shares no noise with
+    /// it, which is what a reference for measuring bias has to do
+    #[arg(long, default_value_t = 0)]
+    pub seed: u32,
+}
+
+/// A file a finished render will be written to. The file itself will not exist
+/// yet; the directory holding it has to.
+///
+/// Checked at parse time for the same reason `--debug`'s directory is: a typo in
+/// an output path is only discovered when the write fails, which is after the
+/// render, and on a scene like `examples/stairs` that is the difference between
+/// a typo costing a second and costing the whole thing.
+fn parent_exists(path: &str) -> Result<PathBuf, String> {
+    let path_buf = PathBuf::from(path);
+    // A bare filename has an empty parent, which is the working directory and
+    // always exists.
+    match path_buf.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() && !parent.is_dir() => {
+            Err(format!("Directory does not exist: {}", parent.display()))
+        }
+        _ => Ok(path_buf),
+    }
+}
+
+fn directory_exists(path: &str) -> Result<PathBuf, String> {
+    let path_buf = PathBuf::from(path);
+    if path_buf.is_dir() {
+        Ok(path_buf)
+    } else {
+        Err(format!("Directory does not exist: {}", path))
+    }
 }
 
 fn file_exists(path: &str) -> Result<PathBuf, String> {
@@ -108,6 +163,21 @@ pub struct CameraOptions {
     pub defocus_angle: f32,
     #[serde_inline_default(1.0)]
     pub focus_dist: f32,
+
+    /// Linear gain on the scene's radiance, applied on the way into the tone
+    /// curve and nowhere else.
+    ///
+    /// A camera setting rather than a scene one, which is why it lives here
+    /// beside the lens: it changes how much of the light reaches the film and
+    /// not how much of it there is. Nothing upstream of the tone curve sees it —
+    /// the accumulator, the denoiser and the noise figure all work in the
+    /// radiance the scene actually carries, so turning this up cannot make a
+    /// render converge faster or a filter look better than it is.
+    ///
+    /// Multiplicative, matching `environment.intensity` rather than counting
+    /// stops: `2.0` is one stop up, `0.5` one stop down.
+    #[serde_inline_default(1.0)]
+    pub exposure: f32,
 }
 
 /// The sky, and with it the scene's ambient light.
@@ -149,6 +219,126 @@ impl Default for EnvironmentOptions {
             file: None,
             intensity: 1.0,
             rotation: 0.0,
+        }
+    }
+}
+
+/// The most a-trous passes a scene may ask for.
+///
+/// Past this the stride is 65536 and every further pass is a no-op that still
+/// costs a dispatch, so an unbounded count buys nothing and a mistyped one would
+/// build a `Vec` of dispatches the size of whatever number was typed.
+pub const MAX_ITERATIONS: u32 = 16;
+
+/// How hard the a-trous filter is allowed to blur, and how far.
+///
+/// Every field has an inline default, because a scene written before the filter
+/// existed must still parse — the whole table is optional and the numbers below
+/// are what a scene that never mentions it gets.
+///
+/// The three sigmas are all thresholds on a difference between two pixels, and
+/// they run in opposite directions: `normal` is an exponent, so **larger is
+/// stricter**, while `depth` and `luminance` divide, so larger is *looser*.
+#[serde_inline_default]
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct DenoiseOptions {
+    /// A-trous passes, each doubling the tap stride of the one before it. Five
+    /// passes of a 5x5 kernel reach 125 pixels for the cost of 125 taps, which
+    /// is the whole trick — and the reason this is not worth turning up much
+    /// further, since a sixth pass reaches a quarter of a 1080p frame.
+    ///
+    /// Bounded by [`MAX_ITERATIONS`], which is where the strides stop meaning
+    /// anything rather than where they stop being useful.
+    #[serde_inline_default(5)]
+    pub iterations: u32,
+
+    /// Exponent on `dot(n_p, n_q)`. High by design: two surfaces eight degrees
+    /// apart still share 0.99 of a dot product, and only an exponent this steep
+    /// turns that into a rejection.
+    #[serde_inline_default(128.0)]
+    pub sigma_normal: f32,
+
+    /// Scales the depth difference a tap is allowed, in multiples of how fast
+    /// depth is already changing across the surface under the pixel. Relative
+    /// rather than absolute, so one number works on a teapot and a landscape.
+    #[serde_inline_default(1.0)]
+    pub sigma_depth: f32,
+
+    /// Scales the luminance difference a tap is allowed, in multiples of the
+    /// centre pixel's own standard error. This is the term that does the actual
+    /// denoising: a difference the pixel's noise can explain gets blurred away,
+    /// and one it cannot is an edge and survives.
+    #[serde_inline_default(4.0)]
+    pub sigma_luminance: f32,
+}
+
+impl Default for DenoiseOptions {
+    fn default() -> Self {
+        DenoiseOptions {
+            iterations: 5,
+            sigma_normal: 128.0,
+            sigma_depth: 1.0,
+            sigma_luminance: 4.0,
+        }
+    }
+}
+
+impl fmt::Display for DenoiseOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} iterations · normal {} · depth {} · luminance {}",
+            self.iterations, self.sigma_normal, self.sigma_depth, self.sigma_luminance,
+        )
+    }
+}
+
+/// Firefly rejection: what a sample has to look like before the tracer decides
+/// it is a lucky path rather than light that is really there.
+///
+/// Its own table rather than a field of `[denoise]`, because it is not a filter.
+/// Everything under `[denoise]` runs once after the last sample has landed and
+/// cannot touch the render it was given; this acts *during* tracing, on the way
+/// into the accumulator, and it is the only setting in the tree that can bias
+/// the image. `k` of zero is off, and off is the default.
+#[serde_inline_default]
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OutlierOptions {
+    /// Standard deviations above a pixel's running mean a sample may reach
+    /// before it is scaled back to that edge.
+    ///
+    /// The window widens as the fourth root of the sample count, so a sample
+    /// capped early is accepted later and the estimator still converges on the
+    /// unbiased answer — it simply gets there without the variance one lucky
+    /// path would have injected. Zero disables the whole mechanism, which is the
+    /// only setting under which the render is unbiased at *every* sample count
+    /// rather than in the limit.
+    #[serde_inline_default(0.0)]
+    pub k: f32,
+
+    /// Samples a pixel must have gathered before `k` is allowed to act on it.
+    ///
+    /// Over the first handful of samples the variance estimate is noise and the
+    /// running mean is far below where it will settle, so a threshold built from
+    /// them rejects the light source itself — melee's emitter is at 15.0, and no
+    /// mean over three samples is anywhere near that.
+    #[serde_inline_default(32)]
+    pub warmup: u32,
+}
+
+impl Default for OutlierOptions {
+    fn default() -> Self {
+        OutlierOptions { k: 0.0, warmup: 32 }
+    }
+}
+
+impl fmt::Display for OutlierOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.k > 0.0 {
+            true => write!(f, "k {} after {} samples", self.k, self.warmup),
+            false => write!(f, "off"),
         }
     }
 }
@@ -281,6 +471,19 @@ pub struct Config {
     pub environment: EnvironmentOptions,
 
     #[serde(default)]
+    pub denoise: DenoiseOptions,
+
+    #[serde(default)]
+    pub outliers: OutlierOptions,
+
+    /// Which sample sequence to draw. Never read from the TOML — it comes off
+    /// `--seed` and exists so a second render of the same scene can be drawn
+    /// with no noise in common with the first, which is what measuring bias
+    /// needs. Zero is what every render draws.
+    #[serde(skip)]
+    pub seed: u32,
+
+    #[serde(default)]
     pub objects: Vec<Object>,
 }
 
@@ -308,6 +511,67 @@ impl Config {
             if !file.is_file() {
                 return Err(format!("Environment file does not exist: {}", file.display()).into());
             }
+        }
+
+        // A negative `k` reads as "off" to `reject_outlier`, which tests it
+        // against zero, so a typo asking for rejection silently gets none of it.
+        // A NaN passes that test and reaches the threshold, where it makes a NaN
+        // of the sample and of every pixel it lands on. Both are typos rather
+        // than intentions, and neither says anything about itself.
+        if !self.outliers.k.is_finite() || self.outliers.k < 0.0 {
+            return Err(format!(
+                "Outlier k must be a non-negative number, not {}",
+                self.outliers.k,
+            )
+            .into());
+        }
+
+        // A negative gain floors to black in the tone curve and a NaN resolves
+        // the same way, so either would render a black frame with nothing said
+        // about why.
+        if !self.camera.exposure.is_finite() || self.camera.exposure < 0.0 {
+            return Err(format!(
+                "Camera exposure must be a non-negative number, not {}",
+                self.camera.exposure,
+            )
+            .into());
+        }
+
+        // The filter's three sigmas, which reach the same end by three different
+        // routes. `luminance` and `depth` are divided by, so a negative turns
+        // `exp(-x / -k)` into an overflow to infinity; `normal` is an exponent,
+        // and `pow(0.0, -k)` is infinity directly. Every one of them ends as
+        // `inf / inf`, the tone curve floors the NaN to zero, and `--denoise`
+        // writes an all-black PNG with nothing raised — which is exactly what
+        // the two guards above exist to prevent.
+        //
+        // `normal` has to be strictly positive besides. WGSL leaves `pow(0, 0)`
+        // undefined, and a dot product of zero is routine — beside every
+        // background pixel and across every right-angled edge — so a zero there
+        // is a NaN on any GPU that computes it as `exp2(0 * log2(0))`, spread by
+        // each wider pass into black blotches around it.
+        for (name, sigma, zero) in [
+            ("normal", self.denoise.sigma_normal, false),
+            ("depth", self.denoise.sigma_depth, true),
+            ("luminance", self.denoise.sigma_luminance, true),
+        ] {
+            if !sigma.is_finite() || sigma < 0.0 || (sigma == 0.0 && !zero) {
+                let least = match zero {
+                    true => "a non-negative",
+                    false => "a positive",
+                };
+                return Err(
+                    format!("Denoise sigma_{name} must be {least} number, not {sigma}").into(),
+                );
+            }
+        }
+
+        if self.denoise.iterations > MAX_ITERATIONS {
+            return Err(format!(
+                "Denoise iterations must be at most {MAX_ITERATIONS}, not {}",
+                self.denoise.iterations,
+            )
+            .into());
         }
 
         Ok(())
@@ -370,6 +634,8 @@ impl fmt::Display for Config {
             ("Vup", vector(self.camera.vup)),
             ("Defocus Angle", format!("{}", self.camera.defocus_angle)),
             ("Focus Distance", format!("{}", self.camera.focus_dist)),
+            ("Exposure", format!("{}", self.camera.exposure)),
+            ("Fireflies", self.outliers.to_string()),
             ("Environment", self.environment.to_string()),
             ("Objects", format!("{}", self.objects.len())),
         ]
@@ -482,7 +748,152 @@ degrees = 31.5
         assert_eq!(config.camera.vup, [0.0, 1.0, 0.0]);
         assert_eq!(config.camera.defocus_angle, 0.0);
         assert_eq!(config.camera.focus_dist, 1.0);
+        assert_eq!(
+            config.camera.exposure, 1.0,
+            "unity gain, so scenes written \
+             before the tone curve resolve exactly as they always did"
+        );
         assert_eq!(config.environment.color, [0.0, 0.0, 0.0]);
+        assert_eq!(config.outliers.k, 0.0, "firefly rejection is opt-in");
+        assert_eq!(config.outliers.warmup, 32);
+        assert_eq!(config.seed, 0, "and the seed never comes from the scene");
+    }
+
+    /// The one setting in the tree that can bias the image, so it is worth
+    /// asserting that a scene has to ask for it by name.
+    #[test]
+    fn a_scene_can_ask_for_firefly_rejection() {
+        let source = format!("{MINIMAL}\n[outliers]\nk = 3.0\nwarmup = 64\n");
+        let config: Config = toml::from_str(&source).unwrap();
+
+        assert_eq!(config.outliers.k, 3.0);
+        assert_eq!(config.outliers.warmup, 64);
+        assert_eq!(config.outliers.to_string(), "k 3 after 64 samples");
+    }
+
+    #[test]
+    fn a_negative_k_is_named_rather_than_rendered() {
+        let source = format!("{MINIMAL}\n[outliers]\nk = -1.0\n");
+        let mut config: Config = toml::from_str(&source).unwrap();
+
+        let error = config
+            .validate(Path::new("tests/golden"))
+            .expect_err("a negative k should not be accepted");
+
+        assert!(error.to_string().contains("Outlier k"), "{error}");
+    }
+
+    /// A scene may set a gain, and it is the one camera field the tone curve
+    /// reads.
+    #[test]
+    fn a_scene_can_open_the_aperture() {
+        let source = MINIMAL.replace("fov = 45", "fov = 45\nexposure = 2.5");
+        let config: Config = toml::from_str(&source).unwrap();
+
+        assert_eq!(config.camera.exposure, 2.5);
+    }
+
+    /// Both of these would render a black frame and say nothing about why, so
+    /// they are caught before any GPU work starts rather than after it.
+    #[test]
+    fn a_nonsense_exposure_is_named_rather_than_rendered() {
+        for bad in ["-1.0", "nan"] {
+            let source = MINIMAL.replace("fov = 45", &format!("fov = 45\nexposure = {bad}"));
+            let mut config: Config = toml::from_str(&source).unwrap();
+
+            let error = config
+                .validate(Path::new("tests/golden"))
+                .expect_err(&format!("{bad} should not be accepted"));
+
+            assert!(error.to_string().contains("exposure"), "{bad}: {error}",);
+        }
+    }
+
+    /// Every one of the three sigmas ends as a NaN weight, which the tone curve
+    /// floors to black — the same silent failure the two guards above it exist
+    /// to prevent, so they are caught the same way.
+    #[test]
+    fn a_nonsense_sigma_is_named_rather_than_filtered_with() {
+        for field in ["sigma_normal", "sigma_depth", "sigma_luminance"] {
+            for bad in ["-1.0", "nan"] {
+                let source = format!("{MINIMAL}\n[denoise]\n{field} = {bad}\n");
+                let mut config: Config = toml::from_str(&source).unwrap();
+
+                let error = config
+                    .validate(Path::new("tests/golden"))
+                    .expect_err(&format!("{field} = {bad} should not be accepted"));
+
+                assert!(error.to_string().contains(field), "{field}: {error}");
+            }
+        }
+    }
+
+    /// Zero is the one value the three sigmas disagree about. It is a legal,
+    /// if blunt, setting for the two that are divided by, and a `pow(0, 0)` for
+    /// the exponent — undefined in WGSL, and a NaN on the GPUs that take it
+    /// literally.
+    #[test]
+    fn a_zero_sigma_is_only_refused_where_it_is_an_exponent() {
+        let validate = |field: &str| {
+            let source = format!("{MINIMAL}\n[denoise]\n{field} = 0.0\n");
+            let mut config: Config = toml::from_str(&source).unwrap();
+            config.validate(Path::new("tests/golden"))
+        };
+
+        let error = validate("sigma_normal").expect_err("a zero exponent should not be accepted");
+        assert!(error.to_string().contains("sigma_normal"), "{error}");
+
+        for field in ["sigma_depth", "sigma_luminance"] {
+            validate(field).unwrap_or_else(|error| panic!("{field} = 0 is legal: {error}"));
+        }
+    }
+
+    /// Past the ceiling every pass is a no-op that still costs a dispatch, and
+    /// an unbounded count builds a `Vec` the size of whatever was typed.
+    #[test]
+    fn an_unbounded_iteration_count_is_named_rather_than_dispatched() {
+        let source = format!("{MINIMAL}\n[denoise]\niterations = 4000000000\n");
+        let mut config: Config = toml::from_str(&source).unwrap();
+
+        let error = config
+            .validate(Path::new("tests/golden"))
+            .expect_err("four billion passes should not be accepted");
+
+        assert!(error.to_string().contains("iterations"), "{error}");
+
+        let source = format!("{MINIMAL}\n[denoise]\niterations = {MAX_ITERATIONS}\n");
+        let mut config: Config = toml::from_str(&source).unwrap();
+        config
+            .validate(Path::new("tests/golden"))
+            .expect("the ceiling itself is a legal thing to ask for");
+    }
+
+    /// An output path is checked where `--debug`'s directory is: before the
+    /// render, not after it.
+    #[test]
+    fn an_output_lands_in_a_directory_that_exists() {
+        assert_eq!(parent_exists("render.png"), Ok(PathBuf::from("render.png")));
+        assert_eq!(
+            parent_exists("tests/golden/heat.png"),
+            Ok(PathBuf::from("tests/golden/heat.png")),
+        );
+        assert!(parent_exists("tests/goldne/heat.png").is_err(), "a typo");
+    }
+
+    /// `--output` is the path every render writes, so it is the one a typo
+    /// costs the most on — and the default has to get past the same check.
+    #[test]
+    fn the_render_is_refused_an_output_directory_that_does_not_exist() {
+        let parse = |extra: &[&str]| {
+            let args = ["wgsl-raytrace", "--config", "tests/golden/sky.toml"];
+            Args::try_parse_from(args.iter().chain(extra))
+        };
+
+        assert!(parse(&["--output", "tests/goldne/render.png"]).is_err());
+        assert_eq!(
+            parse(&[]).expect("the default output is legal").output,
+            PathBuf::from("render.png"),
+        );
     }
 
     /// A light is its emitted color and nothing else: emission is always from

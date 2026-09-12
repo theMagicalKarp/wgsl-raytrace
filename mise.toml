@@ -39,7 +39,10 @@ run = "cargo clippy --all-targets --all-features -- -D warnings"
 [tasks.example]
 description = "Preview a single example scene through the binary, e.g. `mise run example teapot`"
 depends = ["release"]
-usage = 'arg "<name>" help="Name of the example directory under examples/"'
+usage = """
+arg "<name>" help="Name of the example directory under examples/"
+flag "--debug" help="Also write the unfiltered frame and the aov buffers to <example>/debug"
+"""
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -52,20 +55,34 @@ if [ ! -f "$dir/render.toml" ]; then
   exit 1
 fi
 
+# --debug wants a directory that already exists, and one per example so that a
+# second scene's buffers do not land on the first one's.
+debug=()
+if [ "${usage_debug:-}" = "true" ]; then
+  mkdir -p "$dir/debug"
+  debug=(--debug "$dir/debug")
+fi
+
 echo "Rendering $dir"
-target/release/wgsl-raytrace --preview --config "$dir/render.toml" --output "$dir/render.png"
+target/release/wgsl-raytrace --preview --config "$dir/render.toml" --output "$dir/render.png" --denoise ${debug[@]+"${debug[@]}"}
 """
 
 [tasks.examples]
 description = "Preview every example scene through the binary, Ctrl-C to move on to the next"
 depends = ["release"]
+usage = 'flag "--debug" help="Also write each unfiltered frame and its aov buffers to <example>/debug"'
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-find examples -name render.toml | sort | while read -r config; do
-  dir="$(dirname "$config")"
-  echo "Rendering $dir"
-  target/release/wgsl-raytrace --preview --config "$config" --output "$dir/render.png"
-done
+debug=()
+if [ "${usage_debug:-}" = "true" ]; then
+  debug=(--debug)
+fi
+
+# Read on fd 3 rather than stdin, so that the terminal the preview talks to is
+# still the one it inherits.
+while read -r config <&3; do
+  mise run example "$(basename "$(dirname "$config")")" ${debug[@]+"${debug[@]}"}
+done 3< <(find examples -name render.toml | sort)
 """

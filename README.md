@@ -1,420 +1,365 @@
 # wgsl-raytrace
 
-A GPU path tracer in Rust, running headless on [wgpu](https://wgpu.rs/) with the
-tracing kernel written in [WGSL](https://www.w3.org/TR/WGSL/). It is the GPU
-counterpart to [raytrace](https://github.com/theMagicalKarp/raytrace), my CPU
-tracer: same TOML scene format, same CLI, a very different back end.
-
-## Requirements
-
-- [mise](https://mise.jdx.dev/) — installs the pinned
-  [Rust](https://www.rust-lang.org/) toolchain and runs the project tasks
-
-```Bash
-mise install     # install the pinned Rust toolchain
-mise run         # test, lint and build a release binary
-mise run check   # run the tests and check formatting and linting
-mise run fix     # auto-apply formatter and linter suggestions
-mise tasks       # list every available task
-```
-
-Running the tracer will additionally need a GPU with a working
-[WebGPU](https://www.w3.org/TR/webgpu/) backend — Metal, Vulkan, DX12 or GL.
-
-## Usage
-
-```Bash
-$ wgsl-raytrace --help
-Usage: wgsl-raytrace [OPTIONS] --config <CONFIG>
-
-Options:
-  -c, --config <CONFIG>    Path of toml configuration file
-  -o, --output <OUTPUT>    Path of file to save the render to [default: render.png]
-  -s, --samples <SAMPLES>  Directly override the sample count listed in the configuration file
-  -p, --preview            Draw the frame in the terminal as it converges, and stop early on Ctrl-C
-  -h, --help               Print help
-  -V, --version            Print version
-
-$ wgsl-raytrace --config examples/teapot/render.toml --output render.png
-┌─── Render Settings ────────────────────────────────────────────────────────────┐
-│    Dimensions: 800x600                                                         │
-│  Aspect Ratio: 4:3                                                             │
-│       Samples: 10000                                                           │
-│   Max Bounces: 64                                                              │
-│ Field of View: 45                                                              │
-│     Look From: [2.5, 1.2, 3.1]                                                 │
-│       Look At: [0  , 0.2, 0  ]                                                 │
-│           Vup: [0  , 1  , 0  ]                                                 │
-│ Defocus Angle: 0                                                               │
-│Focus Distance: 1                                                               │
-│   Environment: [0.7, 0.8, 0.99]                                                │
-│       Objects: 2                                                               │
-│             0: examples/teapot/teapot.obj [Teapot] · metal[0.42, 0.2, 0.7] rou…│
-│             1: examples/teapot/teapot.obj [Plane] · lambertian[0.72, 0.72, 0.7…│
-└────────────────────────────────────────────────────────────────────────────────┘
-scene: 1576 triangles across 2 materials, indexed by 1511 bvh nodes 14 deep
-[########################] 10000/10000 samples  41s elapsed  ~0s left
-render: 800x600 written to render.png in 41.1s on Apple M4 Pro (Metal)
-gpu:    3.94ms/dispatch  ·  39.4s traced  ·  min 3.71  p50 3.92  p95 4.18  max 5.30
-```
-
-The `render:` line is wall time, which includes reading the mesh, building the
-hierarchy, uploading it and every stall the host takes waiting on the GPU. The
-`gpu:` line is the dispatches alone, measured with timestamp queries written
-either side of each compute pass, and is the number a change to the shader
-should be judged by. It is absent on an adapter whose backend cannot write
-timestamps, which is allowed on every one of them.
-
-## Examples
-
-`mise run examples` renders every scene under `examples/` with `--preview`,
-writing the image back beside the config it came from. Those images are checked
-in, so what follows is what this tracer currently produces.
-
-### Teapot
-
-One `.obj`, two blocks, two materials: a metal teapot standing on a lambertian
-plane, with the sky background the only thing lighting it. 800x600, 1000
-samples.
-
-```Bash
-wgsl-raytrace --config examples/teapot/render.toml --output examples/teapot/render.png
-```
-
-![The teapot scene](examples/teapot/render.png)
-
-### Field
-
-Four spheres on a plane under a photographed sky. Nothing in the scene emits,
-so every photon in the frame arrives from `sky.exr` — a 4096x2048 HDRI checked
-in beside the config, yawed by `rotation` to put its sun over the camera's
-shoulder. Because the map is sampled directly rather than only stumbled into,
-the sun casts an actual shadow instead of speckling the frame. 800x800, 50000
-samples.
-
-```Bash
-wgsl-raytrace --config examples/field/render.toml --output examples/field/render.png
-```
-
-![The field scene](examples/field/render.png)
-
-### Normals
-
-The same sphere twice — once authored with smoothed vertex normals, once with
-per-face ones — under a single emissive panel, so the only difference in the
-frame is the normals the shader interpolates. 800x450, 5000 samples.
-
-![The normals scene](examples/normals/render.png)
-
-### Melee
-
-The CPU tracer's stress scene, ported: nine blocks selected out of a single
-mesh, glass and metal and lambertian side by side, lit by an emissive sphere
-above the frame that is the only light in a black background. 1200x675, 10000
-samples.
+A GPU path tracer in Rust. It runs headless on [wgpu](https://wgpu.rs/), and the
+tracing kernel is written in [WGSL](https://www.w3.org/TR/WGSL/). It is the GPU
+counterpart to [raytrace](https://github.com/theMagicalKarp/raytrace) and reads
+the same TOML scene format.
 
 ![The melee scene](examples/melee/render.png)
 
-## Scene Configuration Specification
+## Quick start
 
-### Camera Configuration
+You need [mise](https://mise.jdx.dev/) and a GPU with a working
+[WebGPU](https://www.w3.org/TR/webgpu/) backend (Metal, Vulkan, DX12 or GL).
 
-The camera settings define how the scene is viewed and rendered. Below are the
-parameters that control the camera's behavior:
+```Bash
+mise install                 # install the pinned Rust toolchain
+mise run release             # build target/release/wgsl-raytrace
+target/release/wgsl-raytrace --config examples/teapot/render.toml --denoise --preview
+```
+
+## Command line
+
+```
+wgsl-raytrace [OPTIONS] --config <CONFIG>
+```
+
+| Flag | Description |
+| --- | --- |
+| `-c, --config <FILE>` | Scene TOML. Required. |
+| `-o, --output <FILE>` | Where to write the PNG. Default `render.png`. |
+| `-s, --samples <N>` | Override `camera.samples`. |
+| `-p, --preview` | Draw the frame in the terminal as it converges (Kitty graphics protocol). Ctrl-C stops early and keeps what has been traced. |
+| `--denoise` | Run the [à-trous filter](#denoising) over the finished frame. `--output` gets the filtered frame. |
+| `--debug <DIR>` | Write `raw.png` (the unfiltered frame) and the `normal.png`, `albedo.png` and `depth.png` feature buffers to an existing directory. |
+| `--variance <FILE>` | Write a heatmap of per-pixel variance, normalised to the frame's peak. |
+| `--outlier-k <K>` | Override `outliers.k`. `0` is off. |
+| `--seed <N>` | Draw an independent sample sequence, e.g. for a bias reference that shares no noise with the render. Default `0`. |
+
+### Console output
+
+| Line | Meaning |
+| --- | --- |
+| `scene:` | Triangle, material and BVH node counts, and tree depth. |
+| `render:` | Wall time, covering the mesh load, BVH build, uploads and host stalls. |
+| `denoise:` | Filter settings and wall time. Only shown with `--denoise`. |
+| `noise:` | Mean per-pixel standard error, mean linear luminance, and peak variance. Use the standard error to compare runs of the same scene at the same sample count. |
+| `gpu:` | Per-dispatch GPU time from timestamp queries. Use this when judging a shader change. Missing on adapters that can't write timestamps. |
+
+## Scene configuration
+
+A scene is one TOML file. Paths inside it are resolved relative to the file
+itself. Unknown keys are rejected.
+
+### `[camera]`
 
 ```toml
 [camera]
 aspect_ratio = "standard"
 image_width = 800
-samples = 10000
+samples = 1000
 max_bounces = 64
-fov = 45
-look_from = [1.55, 0.0, 1.9]
-look_at = [0.0, -0.5, 0.0]
-vup = [0.0, 1.0, 0.0]
-
-defocus_angle = 0.6
-focus_dist = 10.0
+fov = 30
+look_from = [-1.89, 2.29, 10.68]
+look_at = [-1.68, 2.39, 4.63]
 ```
 
-- `aspect_ratio`: Specifies the aspect ratio of the rendered image.
-  - `widescreen` _(16:9)_
-  - `square` _(1:1)_
-  - `smartphone` _(9:16)_
-  - `standard` _(4:3)_
-  - `cinema` _(1.85:1)_
-- `image_width`: The width of the rendered image.
-- `samples`: The number of samples per pixel, controlling the quality of the
-  image. Each sample is a separate GPU dispatch, so this trades render time
-  against noise directly.
-- `max_bounces`: Limits the number of light bounces for each ray.
-- `fov`: The camera's
-  [field of view](https://en.wikipedia.org/wiki/Field_of_view) in degrees.
-- `look_from`: The coordinates from which the camera views the scene.
-- `look_at`: The point the camera is focused on.
-- `vup`: Defines the camera's orientation. _(Defaults to `[0.0, 1.0, 0.0]`,
-  where y positive is "up")_
-- `defocus_angle`: Variation angle of rays through each pixel _(Defaults to
-  being disabled)_
-- `focus_dist`: Distance from the camera `look_from` point to the plane of
-  perfect focus _(Defaults to being disabled)_
+| Key | Default | Description |
+| --- | --- | --- |
+| `aspect_ratio` | required | `widescreen` (16:9), `square` (1:1), `smartphone` (9:16), `standard` (4:3), `cinema` (1.85:1). |
+| `image_width` | required | Width in pixels. Height comes from the aspect ratio. |
+| `samples` | required | Samples per pixel. Each sample is one GPU dispatch. |
+| `max_bounces` | required | Path length cap. Russian roulette usually ends paths earlier. |
+| `fov` | required | Vertical field of view, in degrees. |
+| `look_from` | required | Camera position. |
+| `look_at` | required | Point the camera faces. |
+| `vup` | `[0, 1, 0]` | Up vector. |
+| `defocus_angle` | `0.0` | Lens cone angle in degrees. `0` is a pinhole (everything in focus). |
+| `focus_dist` | `1.0` | Distance to the plane of perfect focus. |
+| `exposure` | `1.0` | Linear gain applied just before tone mapping (`2.0` = +1 stop). It has no effect on convergence, the denoiser or the `noise:` figures. |
 
-### Environment
+### `[environment]`
 
-The sky, and with it the scene's ambient light. A path that escapes every object
-brings home whatever is here, so a scene holding no `light` material and left at
-the default black renders black.
+Controls the sky. Rays that escape the scene pick up this radiance. The table is
+optional, and without it the sky is black.
 
 ```toml
 [environment]
-color = [0.70, 0.80, 0.99]
 file = "sky.exr"
-intensity = 1.0
-rotation = 0.0
+rotation = -90.0
 ```
 
-- `color`: The rgb value a ray finds when it misses everything. _(Defaults to
-  black `[0.0, 0.0, 0.0]`)_
-- `file`: An equirectangular image to read the sky out of instead, relative to
-  the config location. Supersedes `color`. `.exr`, `.hdr`, `.jpg` and `.png` all
-  decode; the first two carry values above one and are what an HDRI is for,
-  while the last two are clamped at white by the format and light a scene
-  flatly by comparison. _(Optional)_
-- `intensity`: Scales whichever of the two is in play, which is where to pull a
-  map's exposure down without re-authoring it. _(Defaults to `1.0`)_
-- `rotation`: Degrees of yaw about the +Y axis, for turning a map so its sun
-  falls where the scene wants it. _(Defaults to `0.0`)_
+| Key | Default | Description |
+| --- | --- | --- |
+| `color` | `[0, 0, 0]` | A flat sky colour. |
+| `file` | — | Equirectangular map (`.exr`, `.hdr`, `.jpg`, `.png`). Overrides `color`. Use HDR formats for real lighting, because LDR maps clip at white. |
+| `intensity` | `1.0` | Multiplier on whichever of `color` or `file` is in use. |
+| `rotation` | `0.0` | Yaw about +Y in degrees, for moving the sun. |
 
-The whole table is optional. A scene that omits it gets a black sky, which is
-what omitting the old `camera.background` did — that key moved here and is now
-`environment.color`.
+When `file` is set, the tracer builds a brightness-weighted distribution over
+the map's texels and samples it directly (see [Render pipeline](#render-pipeline)).
+A flat `color` is not importance-sampled, because cosine-weighted bounces
+already sample a uniform sky exactly.
 
-A flat `color` is uploaded as a one-texel map, so it is the same lookup the
-shader does for an image and not a second path through it.
+### `[denoise]`
 
-The map is sampled directly as well as found by escaping rays. Loading one
-builds a distribution over its texels — brightness weighted by the sky each
-texel covers — and every diffuse bounce aims a shadow ray into it in proportion
-to that, the same next event estimation a `light` material gets. Multiple
-importance sampling combines the two, so a small bright sun casts a shadow
-instead of speckling the frame: 2.9x less error at 200 samples on the field
-scene under the `.exr`, and 5.2x on a scene whose sun is sharper, for about 1.5x
-the time per sample.
+These settings only take effect with `--denoise`. For how each one is used, see
+[Denoising](#denoising).
 
-A flat `color` deliberately gets none of that. Cosine-weighted scattering
-already samples a uniform sky perfectly, so a second strategy there could only
-add a shadow ray per bounce and take nothing off the noise.
+| Key | Default | Description |
+| --- | --- | --- |
+| `iterations` | `5` | Number of à-trous passes. Each pass doubles the tap stride. Maximum `16`. |
+| `sigma_normal` | `128.0` | Exponent on the normal similarity. Larger is **stricter**. |
+| `sigma_depth` | `1.0` | Depth tolerance, as a multiple of the local depth gradient. Larger is looser. |
+| `sigma_luminance` | `4.0` | Brightness tolerance, as a multiple of the pixel's standard error. Larger is looser. |
 
-### Objects
+### `[outliers]`
 
-A scene is a list of objects, each one a combination of "geometry" and
-"material".
+Firefly rejection, applied during tracing. Each sample is checked as it goes
+into the accumulator. This is the only setting that can bias the image.
 
-### Geometry
+| Key | Default | Description |
+| --- | --- | --- |
+| `k` | `0.0` | A sample whose luminance exceeds `mean + k · max(σ, mean) · n^¼` is scaled down to that threshold, keeping its hue. `0` is off. |
+| `warmup` | `32` | Number of samples a pixel must gather before `k` applies. |
 
-#### Wavefront _(.obj file)_
+Because the threshold widens as `n^¼`, the render still converges to the
+unbiased result. It is off by default because testing showed it wasn't worth
+it. On `examples/glass` it cut raw error by about 20% but tripled the bias.
+With `--denoise`, `k = 0` had both the lowest error and the lowest bias.
 
-Wavefront meshes are the **only** geometry this tracer supports. Triangles are
-the single primitive the shader intersects, so anything that would be a sphere
-or a quad in the CPU tracer is authored as a mesh here instead.
+### `[[objects]]`
+
+Each object pairs a mesh with a material. Wavefront `.obj` is the only geometry,
+and triangles are the only primitive.
 
 ```toml
 [[objects]]
 shape = "wavefront"
-file = "teapot.obj"
+file = "scene.obj"
 group = "Teapot"
-```
-
-- `file`: Path to the `.obj` file _(relative to the config location)_
-- `group`: Optional name of a single `o`/`g` block to load from the file. When
-  omitted the whole file is used. This is how one `.obj` gets several materials
-  — list it once per block, as `examples/teapot` does. A name that does not
-  match lists the ones the file does have. _(A block whose name contains a space
-  cannot be selected — the `.obj` grammar allows one word after a `g`.)_
-
-Faces with more than three corners are fanned into triangles, and a corner with
-no normal of its own gets the face's geometric one, so every triangle reaching
-the shader is smooth-shaded the same way.
-
-### Transforms
-
-Each object may carry an ordered list of transforms, applied first to last and
-baked into the mesh before it reaches the GPU, so the tracer works entirely in
-world space. Normals are carried by the inverse transpose of that transform, so
-a non-uniform `scale` tilts the surface the way it actually should.
-
-```toml
-[[objects.transform]]
-type = "scale"
-scalar = [0.5, 0.5, 0.5]
+material = "metal"
+albedo = [0.7, 0.7, 0.7]
+roughness = 0.13
 
 [[objects.transform]]
 type = "rotate"
 axis = "y"
 degrees = 31.5
-
-[[objects.transform]]
-type = "translate"
-offset = [0.0, 1.0, 0.0]
 ```
 
-- `scale`: `scalar` — per-axis scale factors.
-- `rotate`: `axis` (`x`, `y` or `z`) and `degrees`.
-- `translate`: `offset` — the vector to move by.
+| Key | Description |
+| --- | --- |
+| `shape` | Always `"wavefront"`. |
+| `file` | Path to the `.obj`. |
+| `group` | Optional name of one `o`/`g` block. Leave it out to load the whole file. To give one file several materials, list it once per group. Group names can't contain spaces. |
 
-### Materials
+Faces with more than three vertices are split into triangles, and vertices
+without normals get the face normal.
 
-Materials define the visual properties of the objects. The set is smaller than
-the CPU tracer's: the shader carries one scalar per material, so the
-texture-backed materials (checkered, image, noise) are absent until there is
-somewhere to put them.
+#### Transforms
 
-#### Lambertian
+`[[objects.transform]]` entries are applied in order, first to last, and baked
+into world space at load time.
 
-```toml
-[[objects]]
-material = "lambertian"
-albedo = [1.0, 0.2, 0.3] # red
+| `type` | Fields |
+| --- | --- |
+| `scale` | `scalar = [x, y, z]` |
+| `rotate` | `axis = "x" \| "y" \| "z"`, `degrees` |
+| `translate` | `offset = [x, y, z]` |
+
+#### Materials
+
+| `material` | Fields | Notes |
+| --- | --- | --- |
+| `lambertian` | `albedo = [r, g, b]` | Diffuse. Gets direct light sampling. |
+| `metal` | `albedo`, `roughness` | Higher roughness gives blurrier reflections. |
+| `dielectric` | `refraction_index` | Refracts, and reflects by Schlick's approximation. |
+| `glass` | — | Dielectric with IOR 1.5. |
+| `water` | — | Dielectric with IOR 1.33. |
+| `light` | `emit = [r, g, b]` | Emits from its front face only (the side its winding faces). Values above 1 are normal. |
+
+## Render pipeline
+
+```mermaid
+flowchart LR
+    toml[render.toml] --> load["Scene::load<br/>meshes · transforms · BVH<br/>light table · sky distribution"]
+    load --> trace["shader.wgsl × samples<br/>one dispatch per sample"]
+    trace --> buffers[("accum · moments<br/>normals · albedos")]
+    buffers --> resolve["resolve<br/>exposure → ACES → sRGB"]
+    buffers -- "--denoise" --> denoise["denoise.wgsl<br/>prepare → à-trous ×N → remodulate"]
+    denoise --> resolve
+    resolve --> png[render.png]
 ```
 
-- `albedo`: The diffuse reflection color as an RGB array.
+1. **Load.** The host parses and validates the config, loads each mesh, applies
+   its transforms, and builds a binned-SAH BVH (depth-capped to fit the shader's
+   fixed traversal stack). It also builds a power-weighted table of emissive
+   triangles and, when an HDRI is present, a marginal/conditional CDF over its
+   texels. All of this is uploaded once as storage buffers.
+2. **Trace.** One compute dispatch per sample, with one thread per pixel
+   (`shader.wgsl`). Each thread:
+   - Casts a stratified, jittered primary ray. With a lens, the ray starts on
+     the lens disk.
+   - Walks the BVH to find the nearest hit.
+   - At diffuse surfaces, sends shadow rays to one sampled emitter and one
+     sampled sky direction (next event estimation). These are combined with
+     the BSDF sample using the power heuristic (MIS), so no light is counted
+     twice.
+   - Scatters by material, and applies Russian roulette after bounce 4.
+   - Drops non-finite samples, and applies outlier rejection if `k > 0`.
+3. **Accumulate.** Each sample adds to four per-pixel buffers:
+   - `accum`: radiance sum and sample count.
+   - `moments`: sum of luminance and of luminance², used to recover per-pixel
+     variance. Kept twice: once over every sample as drawn (for outlier
+     rejection) and once over what `accum` kept (for the denoiser and the
+     `noise:` figures).
+   - `normals` and `albedos`: feature sums for the denoiser (normal, depth,
+     albedo), plus a majority vote for the object id.
 
-#### Metal
+   Because everything is stored as a sum, `sum / n` is a finished frame at any
+   point. That is how `--preview` works without a separate code path.
+4. **Denoise** (optional). See below.
+5. **Resolve** (`render/tonemap.rs`). The pixel is averaged, multiplied by
+   `exposure`, tone mapped with an ACES fit in ACEScg primaries, and
+   gamma-encoded to 8-bit sRGB. The filmic curve compresses highlights instead
+   of clipping them. Applying it in ACEScg stops saturated highlights from
+   shifting hue. This is the only non-linear step; everything before it works in
+   linear radiance.
 
-```toml
-[[objects]]
-material = "metal"
-albedo = [0.7, 0.7, 0.7]
-roughness = 0.13
+## Denoising
+
+`--denoise` runs an edge-avoiding à-trous wavelet filter: the spatial half of
+[SVGF](https://research.nvidia.com/publication/2017-07_spatiotemporal-variance-guided-filtering-real-time-reconstruction-path-traced).
+It runs once, after the last sample, on the GPU (`render/denoise.wgsl`). It only
+reads the tracer's buffers and never writes to them, so the unfiltered frame is
+still available through `--debug`. On `examples/melee` it takes 500 samples from
+4.02 to 1.24 mean error against a 10 000-sample reference, and adds about 10 ms.
+
+### Feature buffers
+
+As each path is traced, the shader records features of the **first opaque
+surface** it reaches (diffuse or emissive). It records the first hit instead
+only when a path never reaches an opaque surface. Glass and metal are passed
+through, so a floor seen through a glass torus keeps its own edges instead of
+taking on the torus's silhouette. The features are:
+
+| Feature | Use |
+| --- | --- |
+| normal | Tells apart surfaces facing different directions. Zero normal means a miss, and those pixels are not filtered. |
+| depth | Distance along the whole path, so it stays continuous through refraction. |
+| albedo | Surface colour, divided out before filtering and multiplied back after. |
+| object id | Pixels are only blended with others from the same object. Voted rather than averaged, so an edge pixel gets the object most of its samples saw. |
+
+These features barely change from sample to sample, so they are almost free of
+noise. That makes them reliable for deciding which neighbouring pixels show the
+same surface.
+
+### Passes
+
+All three passes share one entry point and ping-pong between two scratch
+buffers.
+
+1. **Prepare.**
+   - Demodulate: `irradiance = radiance / max(albedo, 0.01)`. Texture and colour
+     detail stays in the noise-free albedo, so the filter only smooths lighting.
+   - Estimate the variance of each pixel's *mean* from the moments:
+     `(E[x²] − E[x]²) / n`, divided by the albedo luminance squared to match the
+     demodulated signal.
+   - Blur that variance with a 3×3 binomial kernel. Without this, pixels with a
+     variance of exactly zero would reject every neighbour and stay as isolated
+     speckles.
+2. **Filter** × `iterations`. Each pass is a 5×5 B3-spline kernel
+   (`1/16, 1/4, 3/8, 1/4, 1/16`) with taps `2^i` pixels apart. Strides of
+   1, 2, 4, 8 and 16 give a 125-pixel footprint for 125 taps per pixel. Each
+   tap `q` around pixel `p` is weighted by:
+
+   ```
+   w = kernel
+     · max(0, n_p · n_q) ^ sigma_normal                               normal
+     · exp(−|d_p − d_q| / (sigma_depth · |∇d · offset|))              depth
+     · exp(−|l_p − l_q| / (sigma_luminance · √var_p))                 luminance
+     · [id_p == id_q]                                                 object
+   ```
+
+   The luminance term does the actual smoothing. It blends away differences
+   that the pixel's own noise can explain and keeps differences it can't. The
+   other terms decide *where* smoothing is allowed. Variance is carried forward
+   with squared weights (`Σw²·var / (Σw)²`), so each wider pass knows how much
+   noise the previous one left. Taps outside the frame are dropped and the
+   remaining weights renormalised.
+3. **Remodulate.** Multiply by the same clamped albedo. The result then goes
+   through the same resolve step as an unfiltered frame. With `iterations = 0`,
+   the output matches the input to within one 8-bit step, and the test suite
+   checks this.
+
+### Tuning
+
+Render with `--denoise --debug <dir>` and compare `render.png` with
+`<dir>/raw.png`.
+
+| Symptom | Adjust |
+| --- | --- |
+| Lighting detail or soft shadows smeared | Lower `sigma_luminance` |
+| Noise left everywhere | Raise `sigma_luminance` or `iterations`, or add samples |
+| Noise left on curved surfaces | Lower `sigma_normal` |
+| Light bleeding across creases | Raise `sigma_normal` |
+| Noise left on sloped or distant surfaces | Raise `sigma_depth` |
+
+## Examples
+
+Each directory under `examples/` holds a `render.toml` and its checked-in
+`render.png`.
+
+```Bash
+mise run examples            # render every example with --preview --denoise
+mise run example melee       # render one
+mise run example melee --debug   # also write raw frame + AOVs to examples/melee/debug
 ```
 
-- `albedo`: The reflective color of the metal.
-- `roughness`: Controls the scattering of reflected light. _(The higher, the
-  more scattering)_
+| | |
+| --- | --- |
+| ![teapot](examples/teapot/render.png) `teapot`: lit only by a flat sky | ![field](examples/field/render.png) `field`: lit only by an HDRI with an importance-sampled sun |
+| ![normals](examples/normals/render.png) `normals`: smooth vs. per-face normals | ![melee](examples/melee/render.png) `melee`: mixed materials, one emitter |
+| ![glass](examples/glass/render.png) `glass`: glass monkeys, two lights; the scene with the most fireflies | ![cubes](examples/cubes/render.png) `cubes`: a room of objects lit by one emitter |
+| ![stairs](examples/stairs/render.png) `stairs`: glass orbs and a staircase, two lights | ![tunnel](examples/tunnel/render.png) `tunnel`: coloured walls under an HDRI |
 
-#### Dielectric
+## Development
 
-```toml
-[[objects]]
-material = "dielectric"
-refraction_index = 1.5
-```
+| Task | Description |
+| --- | --- |
+| `mise run` | Tests, lints, and a release build |
+| `mise run check` | Tests, plus `cargo fmt --check` and `clippy -D warnings` |
+| `mise run fix` | Apply formatter and clippy fixes |
+| `mise run test` | `cargo test --all-features` |
 
-- `refraction_index`: The index of refraction for the material.
+Most tests run without a GPU:
+- WGSL struct sizes are checked against their Rust `#[repr(C)]` counterparts
+  using naga.
+- A Rust port of the shader's BVH traversal is tested against brute-force
+  intersection.
 
-#### Glass
+`render/golden.rs` renders the small scenes in `tests/golden/` and diffs each
+one against its reference PNG. Regenerate them with `UPDATE_GOLDEN=1 cargo test
+golden`. On a machine with no GPU adapter, set `WGSL_RAYTRACE_SKIP_GPU_TESTS=1`.
 
-```toml
-[[objects]]
-material = "glass"
-```
-
-_This is a dielectric with an index of refraction of `1.5`_
-
-#### Water
-
-```toml
-[[objects]]
-material = "water"
-```
-
-_This is a dielectric with an index of refraction of `1.33`_
-
-#### Light
-
-```toml
-[[objects]]
-material = "light"
-emit = [7.0, 7.0, 7.0]
-```
-
-- `emit`: The RGB color of the emitted light.
-
-Emission is one-sided: a surface gives off light through the face its winding
-points at and nothing through the other, so a ceiling panel wound to face down
-lights the room and not the cavity above it. A closed mesh is unaffected — its
-inside is never seen — but open geometry has to be wound to face where the light
-is wanted.
-
-## Layout
+### Source layout
 
 ```
 src/
-  main.rs            CLI entry point: read scene, validate, load, render, save
-  config/mod.rs      the TOML scene format and its CLI arguments
-  scene/mod.rs       meshes and materials, flattened into GPU buffers
-  scene/bvh.rs       the bounding volume hierarchy built over those triangles
-  render/mod.rs      the wgpu pass: buffers in, pixels out, PNG on disk
-  render/preview.rs  the frame drawn in the terminal as it converges
-  render/kitty.rs    the terminal graphics protocol that draws it
-  render/timing.rs   timestamp queries, and what they average to
-  render/golden.rs   the rendered frame, diffed against a checked-in one
-  render/shader.wgsl the WGSL kernel — the path tracer itself
-  math/mod.rs        just enough linear algebra to bake a model transform
-examples/
-  teapot/            a two-object scene, mesh included
-  normals/           smoothed against per-face normals, side by side
-  melee/             the many-material stress scene, and its light
-tests/
-  golden/            the scene behind the golden-image test, and its reference
+  main.rs              CLI: parse, validate, load, render, write outputs
+  config/mod.rs        TOML schema and CLI args (pure data, no GPU)
+  scene/               .obj loading, transforms, materials, BVH, light table, sky CDF
+  math/mod.rs          matrices for model transforms
+  render/
+    mod.rs             device setup, sample loop, readback, resolve
+    shader.wgsl        the path tracer
+    camera.rs          GpuCamera uniform
+    denoise.rs/.wgsl   à-trous filter
+    aov.rs             feature buffers → normal/albedo/depth PNGs
+    variance.rs        moments → noise statistics and heatmap
+    tonemap.rs         ACES curve in ACEScg
+    preview.rs         terminal preview (kitty.rs draws it)
+    timing.rs          GPU timestamp queries
+    golden.rs          golden-image test
 ```
-
-`config` is deliberately pure data — deserializing a scene touches nothing but
-the config file, and `Config::validate` is the separate pass that resolves
-object paths against the config's directory. Keeping those apart is what lets
-the whole scene format be tested without a GPU, or a mesh, in sight.
-
-`scene` is the one place that knows what a `.obj` file is. `Scene::load` takes a
-config and returns flat arrays — `GpuTriangle`, `GpuMaterial` and `GpuBvhNode`,
-all `#[repr(C)]` and laid out to match their WGSL counterparts — with the
-polygon fanning, missing normals, block selection and model transforms already
-resolved. A triangle names its material by index into the material array, which
-is one entry per object in config order.
-
-The hierarchy is what makes a scene of any size tractable: a linear scan pays
-for every triangle in the scene on every bounce, while a tree of nested boxes
-lets a ray reject whole subtrees with one slab test. It is built with a binned
-surface area heuristic — the alternatives do badly on exactly this shape of
-scene, where two enormous floor triangles sit alongside a thousand small ones —
-and the triangles are permuted into leaf order on the way out, so a leaf can
-name its own with an offset and a count. The builder caps the tree's depth below
-the shader's fixed traversal stack, which is what makes that stack a bound
-rather than a hope.
-
-`render` owns the GPU and nothing else. It uploads those arrays plus a
-`GpuCamera` uniform, runs the dispatch loop, and averages the accumulated
-radiance into 8-bit sRGB. The loop lives in a `Renderer` that can be stepped a
-sample at a time, which is the only concession the headless path makes to
-`--preview`: the preview interleaves the same three calls with reading the
-accumulator and drawing it, so there is one sample loop and not two.
-
-That the accumulator holds a running sum _and its sample count_ per pixel is what
-makes a preview nearly free — `sum.rgb / sum.w` is a finished frame at any point
-mid-render, so the preview resolves it with the same `resolve` that writes the
-PNG rather than a second copy of the tone curve. What it shrinks is the sums
-rather than the resolved pixels, because the radiance in them is linear and
-averaging linear light before gamma-encoding it is the correct order; the other
-way round darkens every edge. The bind group layouts are reflected out of the shader
-rather than declared twice, so a binding that changes in WGSL fails at pipeline
-creation instead of quietly reading the wrong bytes — and because the four
-structs are the contract between the two languages, a test parses the shader
-with naga and checks their sizes against the Rust ones. That runs without a GPU,
-so CI catches a layout drift that only a render would otherwise reveal.
-
-The same trick covers the traversal: `scene/bvh.rs` carries a Rust
-reimplementation of the shader's walk, structurally line-for-line with the WGSL,
-and tests it against a brute-force scan over thousands of rays — including the
-axis-aligned ones that make an inverse direction infinite. A tree the shader
-would traverse wrongly fails on CPU first.
-
-Both of those check the seams rather than the picture, and a shader that
-compiles, traverses correctly and shades wrongly passes them. `render/golden.rs`
-closes that: it renders `tests/golden/render.toml` — the teapot at 32x32 — and
-diffs it against `tests/golden/reference.png`. The comparison carries a
-tolerance because the reference is generated on one backend and checked on
-another, and the constants behind it are documented where they are declared,
-with the measurements they came from. Regenerate the reference with
-`UPDATE_GOLDEN=1 cargo test golden` whenever the render is meant to change; a
-machine with no working adapter can opt out with
-`WGSL_RAYTRACE_SKIP_GPU_TESTS=1`, which is deliberately opt-in rather than a
-silent skip.

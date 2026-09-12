@@ -1,7 +1,7 @@
 [camera]
 aspect_ratio = "smartphone"
 image_width = 800
-samples = 100000
+samples = 5000
 max_bounces = 64
 fov = 20.4
 look_from = [-45.59, 19.02, -26.83]
