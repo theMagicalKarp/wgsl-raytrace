@@ -7,6 +7,7 @@ fov = 23
 look_from = [-20.56, 6.758, 19.48]
 look_at = [-16.25, 5.63528, 15.3784]
 vup = [0.0, 1.0, 0.0]
+exposure = 1.5
 
 # Cubes
 [[objects]]
