@@ -7,11 +7,15 @@ fov = 35
 look_from = [0.0, 1.0, 0.0]
 look_at = [1.0, 1.0, 0.0]
 vup = [0.0, 1.0, 0.0]
+exposure = 2.0
 
 [environment]
 file = "sky.exr"
 rotation = -100.0
 intensity = 1.0
+
+[outliers]
+k = 0.01
 
 [[objects]]
 shape = "wavefront"

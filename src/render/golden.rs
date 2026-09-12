@@ -91,7 +91,7 @@ fn render(golden: &Golden) -> Image {
         .expect("the golden scene's mesh should exist");
 
     let scene = Scene::load(&config).expect("the golden scene should load");
-    super::render(&config, &scene)
+    super::render(&config, &scene, super::Outputs::default())
         .expect(
             "the golden scene should render — set WGSL_RAYTRACE_SKIP_GPU_TESTS=1 \
              on a machine with no working adapter",
@@ -194,6 +194,61 @@ fn the_lit_render_matches_the_reference() {
 #[test]
 fn the_sky_render_matches_the_reference() {
     compare_to_reference(&SKY, "golden-sky");
+}
+
+/// The filter with nothing to filter has to hand back exactly what it was
+/// given.
+///
+/// Zero iterations still runs the two passes that bracket every schedule: the
+/// radiance is divided by the surface albedo on the way in and multiplied by it
+/// on the way out. Asserting that round trip is what pins down the whole of the
+/// filter's plumbing without a second reference frame — the demodulation and its
+/// inverse agreeing, the ping-pong buffers being routed the way the schedule
+/// thinks they are, and the final pass resolving through the same code an
+/// unfiltered frame does. Any of those wrong and this moves.
+///
+/// One 8-bit step of tolerance rather than bit-for-bit, and only because
+/// `(r / a) * a != r` in IEEE754 in general. Both halves now build the
+/// demodulator the same way, so what is left is the multiply and its inverse,
+/// which this adapter happens to round back to exactly where it started and
+/// another is under no obligation to. Every failure the test is actually for
+/// moves a pixel by far more than one.
+#[test]
+fn the_filter_with_nothing_to_filter_returns_the_frame_it_was_given() {
+    if env::var_os("WGSL_RAYTRACE_SKIP_GPU_TESTS").is_some() {
+        return;
+    }
+
+    let source = fs::read_to_string(UNLIT.scene).expect("the golden scene should be readable");
+    let mut config: Config = toml::from_str(&source).expect("the golden scene should parse");
+    config
+        .validate(Path::new(UNLIT.scene).parent().unwrap())
+        .expect("the golden scene's mesh should exist");
+    config.denoise.iterations = 0;
+
+    let scene = Scene::load(&config).expect("the golden scene should load");
+    let outputs = super::Outputs {
+        denoise: true,
+        ..Default::default()
+    };
+    let render = super::render(&config, &scene, outputs).expect("the golden scene should render");
+    let denoised = render
+        .denoised
+        .expect("a render asked to denoise should come back denoised");
+
+    let drift = denoised
+        .image
+        .pixels
+        .iter()
+        .zip(&render.image.pixels)
+        .map(|(filtered, raw)| filtered.abs_diff(*raw))
+        .max()
+        .expect("the golden frame should not be empty");
+
+    assert!(
+        drift <= 1,
+        "demodulating and remodulating should cancel, and drifted by {drift}",
+    );
 }
 
 #[test]

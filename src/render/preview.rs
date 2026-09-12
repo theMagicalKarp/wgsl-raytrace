@@ -14,6 +14,7 @@
 //! SSH. What it costs is that only some terminals can show it, and that each
 //! frame drains the sample queue to read the accumulator.
 
+use super::Outputs;
 use super::Render;
 use super::Renderer;
 use super::downsample;
@@ -71,10 +72,10 @@ const ASSUMED_CELL: (u32, u32) = (8, 16);
 /// `Ctrl-C` stops sampling and resolves what has converged so far, which is what
 /// makes the preview useful for iterating on a scene: you stop when the frame
 /// looks right rather than when the budget runs out.
-pub fn preview(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
+pub fn preview(config: &Config, scene: &Scene, outputs: Outputs) -> Result<Render, Box<dyn Error>> {
     if let Err(reason) = supported() {
         eprintln!("{}{} {}", "warning".bold().yellow(), ":".bold(), reason);
-        return fallback(config, scene);
+        return fallback(config, scene, outputs);
     }
 
     // Both checks come before the renderer, because the fallback builds one of
@@ -87,10 +88,12 @@ pub fn preview(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>>
             "warning".bold().yellow(),
             ":".bold(),
         );
-        return fallback(config, scene);
+        return fallback(config, scene, outputs);
     };
 
     let mut renderer = Renderer::new(config, scene)?;
+    renderer.wants(outputs);
+    let exposure = renderer.exposure();
 
     // Scroll the block into view and leave the cursor on the line below it,
     // which is where `Progress` draws. Every frame from here on climbs back up
@@ -146,7 +149,7 @@ pub fn preview(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>>
             // `try_send` rather than `send`: a painter still working on the last
             // frame is a reason to drop this one, not to stall the tracer. The
             // next request is 200ms away and will carry more samples anyway.
-            let frame = Frame::new(Arc::new(sums), renderer.dimensions(), block);
+            let frame = Frame::new(Arc::new(sums), renderer.dimensions(), block, exposure);
             let _ = frames.try_send(frame);
         }
 
@@ -163,7 +166,7 @@ pub fn preview(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>>
     // stays on the screen.
     renderer.drain()?;
     let sums = Arc::new(renderer.sums()?);
-    let frame = Frame::new(Arc::clone(&sums), renderer.dimensions(), block);
+    let frame = Frame::new(Arc::clone(&sums), renderer.dimensions(), block, exposure);
     let _ = frames.send(frame);
     drop(frames);
     let painted = painter.join();
@@ -198,8 +201,9 @@ pub fn preview(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>>
 /// picture — `mise run example` passes it unconditionally, so redirecting the
 /// output to a file lands here, and killing *that* run with nothing written is
 /// the outcome the flag exists to prevent.
-fn fallback(config: &Config, scene: &Scene) -> Result<Render, Box<dyn Error>> {
+fn fallback(config: &Config, scene: &Scene, outputs: Outputs) -> Result<Render, Box<dyn Error>> {
     let mut renderer = Renderer::new(config, scene)?;
+    renderer.wants(outputs);
     let interrupts = Interrupts::install()?;
 
     while renderer.remaining() > 0 && !interrupts.interrupted() {
@@ -225,14 +229,19 @@ struct Frame {
     sums: Arc<Vec<[f32; 4]>>,
     source: (u32, u32),
     block: Block,
+    /// Carried rather than looked up, because [`draw`] runs on the painter
+    /// thread and the renderer it would have to ask is busy filling the
+    /// accumulator these sums came out of.
+    exposure: f32,
 }
 
 impl Frame {
-    fn new(sums: Arc<Vec<[f32; 4]>>, source: (u32, u32), block: Block) -> Frame {
+    fn new(sums: Arc<Vec<[f32; 4]>>, source: (u32, u32), block: Block, exposure: f32) -> Frame {
         Frame {
             sums,
             source,
             block,
+            exposure,
         }
     }
 }
@@ -243,10 +252,11 @@ fn draw(frame: Frame) -> Result<(), Box<dyn Error>> {
         sums,
         source,
         block,
+        exposure,
     } = frame;
     let size = transmitted(source, block.pixels);
     let scaled = downsample(&sums, source, size);
-    let pixels = resolve(&scaled);
+    let pixels = resolve(&scaled, exposure);
 
     // `resolve` writes a hardcoded 255 into every alpha, so a quarter of what it
     // returns is a constant this does not need to send.

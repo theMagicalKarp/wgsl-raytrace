@@ -39,6 +39,7 @@ jobs:
           name: build
           path: target/release/wgsl-raytrace
           retention-days: 3
+          if-no-files-found: error
 
   scenes:
     name: scene ${{ matrix.config }}
@@ -66,15 +67,19 @@ jobs:
           name: build
           path: target/release
       - run: chmod +x ./target/release/wgsl-raytrace
+      - run: mkdir ./render
       - env:
           CONFIG: ${{ matrix.config }}
         run: >
           ./target/release/wgsl-raytrace
           --config "examples/$CONFIG/render.toml"
-          --output render.png
+          --output ./render/render.png
           --samples 10
+          --denoise
+          --debug ./render
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ matrix.config }}-render
-          path: render.png
+          path: ./render
           retention-days: 3
+          if-no-files-found: error

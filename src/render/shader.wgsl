@@ -43,7 +43,9 @@ struct Camera {
     // and the scale on what that lookup returns.
     environment_rotation: f32,
     environment_intensity: f32,
-    _pad0: f32,
+    // Standard deviations above a pixel's running mean a sample may reach before
+    // it is scaled back. Zero turns outlier rejection off.
+    outlier_k: f32,
     // 1-based index of the sample being traced; also reseeds the RNG.
     sample: u32,
     width: u32,
@@ -62,6 +64,15 @@ struct Camera {
     // skipped — the same signal `light_count` gives for the triangle half.
     sky_width: u32,
     sky_height: u32,
+    // Samples a pixel needs before `outlier_k` is allowed to act on it.
+    outlier_warmup: u32,
+    // Decorrelates one render of a scene from another. Zero is an identity —
+    // `jenkins_hash` maps zero to zero — and is what every render draws unless
+    // something asked for a second, independent one to measure against.
+    seed: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 // One surface, packed by `GpuMaterial`. `kind` selects what the other two mean:
@@ -107,6 +118,47 @@ struct BvhNode {
 // touching the megabytes of geometry behind it.
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<storage, read_write> accum: array<vec4f>;
+// The first two moments of each pixel's sample luminances, `vec2f(sum, sum of
+// squares)`, which is everything needed to recover a variance. A second buffer
+// rather than two more channels on `accum`: this is read and written once per
+// sample per pixel just as the radiance is, and luminance is what every
+// consumer of it wants — a per-channel version would double that traffic to
+// answer a question nobody asked.
+//
+// Two pairs, because two consumers want two different distributions. The
+// firefly rejection has to measure every sample as it was drawn, or its window
+// collapses onto whatever it already capped (see `trace`). Everything else —
+// the filter's noise estimate and the host's variance figures — has to measure
+// what the accumulator actually kept, or it reports noise the image no longer
+// has. With the rejection off the two pairs are identical.
+struct Moments {
+    drawn: vec2f,
+    kept: vec2f,
+}
+@group(0) @binding(2) var<storage, read_write> moments: array<Moments>;
+// The feature buffers, summed the same way the radiance is so that a pixel
+// straddling an edge averages the surfaces its samples actually found rather
+// than keeping whichever one landed last. `accum`'s `w` counts for all three.
+//
+// Packed two to a `vec4f` because a `vec3f` in a storage array is padded to
+// sixteen bytes anyway: the fourth channel is free, and putting the scalar
+// there costs nothing over storing the vector alone.
+@group(0) @binding(3) var<storage, read_write> normals: array<vec4f>;
+// The albedo's fourth channel is the object id, and it is the one feature that
+// is *not* summed: an average of two ids is a third id belonging to neither
+// surface. It is a majority vote instead — Boyer-Moore, which finds whichever id
+// more than half of a pixel's samples saw in one candidate and one counter:
+//
+//   - high 16 bits: the candidate id plus one, so a miss (-1) is zero;
+//   - low 16 bits: the candidate's lead, saturating rather than wrapping.
+//
+// Zeroed, that reads as no candidate and no lead, so the first sample to
+// arrive takes the seat. The host guards the material count that has to fit.
+struct Albedo {
+    color: vec3f,
+    votes: u32,
+}
+@group(0) @binding(4) var<storage, read_write> albedos: array<Albedo>;
 
 @group(1) @binding(0) var<storage> materials: array<Material>;
 @group(1) @binding(1) var<storage> triangles: array<Triangle>;
@@ -213,7 +265,12 @@ fn environment_radiance(direction: vec3f) -> vec3f {
 var<private> rng_state: u32;
 
 fn init_rng(pixel: vec2u) {
-    let seed = (pixel.x + pixel.y * camera.width) ^ jenkins_hash(camera.sample);
+    // `jenkins_hash(0)` is zero — every operation in it leaves zero alone — so a
+    // seed of zero XORs nothing in and this is bit for bit the stream the
+    // renderer drew before the seed existed. That is what keeps a defaulted
+    // render reproducible while a seeded one shares no noise with it.
+    let stream = jenkins_hash(camera.sample) ^ jenkins_hash(camera.seed);
+    let seed = (pixel.x + pixel.y * camera.width) ^ stream;
     rng_state = jenkins_hash(seed);
 }
 
@@ -287,6 +344,46 @@ struct Intersection {
     // does not know where it is stored — and light sampling needs it to recover
     // the emitter's area from a hit.
     triangle: u32,
+}
+
+// What a path saw of the surface it landed on, for a denoiser to steer by.
+// None of it is radiance: these are the noise-free facts about the geometry
+// that say which neighbouring pixels are looking at the same thing.
+struct Features {
+    // Zero for a path that hit nothing, which is a value no real hit can take —
+    // an interpolated normal is unit length — and so is the signal a consumer
+    // uses to leave the background alone.
+    normal: vec3f,
+    // Distance from the camera in world units, rays being unit length. Summed
+    // along the path rather than read off the hit: `trace_path` re-origins the
+    // ray at every bounce, so a `t` from bounce one on measures that segment
+    // alone, and a surface captured behind glass would otherwise file the
+    // distance from the refraction rather than from the camera. Both consumers
+    // — the filter's depth gradient and `depth.png` — need one common origin.
+    //
+    // Zero for a miss rather than the infinity that would be the natural
+    // sentinel: these are summed across every sample before they are averaged,
+    // and no number near the top of the range survives being added to itself
+    // five hundred times. `normal` is the miss flag; this is only a distance.
+    depth: f32,
+    // The surface's own colour, with the lighting divided out of it. One for a
+    // miss, so that dividing by it is the identity.
+    albedo: vec3f,
+    // Which material the surface came from — one per config object, so it
+    // doubles as an object id. Negative for a miss.
+    object: i32,
+}
+
+// What one traced path came home with: the light, and the surface that carried
+// it. Two things rather than one because the second is not a colour and must
+// never be filtered as though it were.
+struct Path {
+    radiance: vec3f,
+    features: Features,
+}
+
+fn no_features() -> Features {
+    return Features(vec3f(0.0), 0.0, vec3f(1.0), -1);
 }
 
 fn no_intersection() -> Intersection {
@@ -647,7 +744,14 @@ fn primary_ray(pixel: vec2u) -> Ray {
     // pixel still visits every cell exactly once per `s * s` samples. Both
     // offsets are reduced before the addition so the sum cannot wrap a u32,
     // which would cost the map its bijectivity for the pixels it happened to.
-    let shuffle = jenkins_hash(pixel.x + pixel.y * camera.width);
+    //
+    // The seed goes in here as well as into `rng_state`, and this is the only
+    // dimension that needs telling about it: everything else a sample draws is
+    // already decorrelated by the stream. Without it two seeds would still
+    // assign sample `k` to the same cell of the grid for every pixel in the
+    // frame, which is the one thing a reference "sharing no noise" cannot do.
+    // `jenkins_hash(0)` is zero, so the default render is unchanged.
+    let shuffle = jenkins_hash(pixel.x + pixel.y * camera.width) ^ jenkins_hash(camera.seed);
     let x = (cell % s + shuffle % s) % s;
     let y = (cell / s + (shuffle >> 16u) % s) % s;
 
@@ -1076,10 +1180,21 @@ fn direct_sky(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
 
 // Follows one path from the camera until it reaches a light, escapes the scene,
 // is absorbed, or runs out of bounces, and returns the radiance it carried back.
-fn trace_path(primary: Ray) -> vec3f {
+fn trace_path(primary: Ray) -> Path {
     var ray = primary;
     var radiance = vec3f(0.0);
     var throughput = vec3f(1.0);
+
+    // The surface this path will be filed under, and whether it is the one we
+    // actually wanted. See the capture rule below.
+    var features = no_features();
+    var captured = false;
+
+    // How far the path has already walked when it reaches the current vertex.
+    // Every scattered ray starts at the surface it left, so `hit.t` is the
+    // length of one segment; a depth that means anything to a consumer is the
+    // sum of the segments before it plus that.
+    var traveled = 0.0;
 
     // How the current direction was chosen, which is what decides how much of an
     // emitter this ray is allowed to keep. A camera ray counts as specular:
@@ -1104,10 +1219,32 @@ fn trace_path(primary: Ray) -> vec3f {
             if !specular {
                 weight = power_heuristic(scatter_pdf, sky_pdf(ray.direction));
             }
-            return radiance + throughput * environment_radiance(ray.direction) * weight;
+            let escaped = environment_radiance(ray.direction) * weight;
+            return Path(radiance + throughput * escaped, features);
         }
 
         let material = materials[hit.material];
+
+        // The surface a denoiser gets to steer by, and it is deliberately not
+        // the first one the ray met. Following melee's glass torus through to
+        // the diffuse floor behind it hands over an edge that is really there;
+        // capturing the glass itself hands over the torus's own silhouette and
+        // smears the whole refraction behind it.
+        //
+        // So: the first opaque hit, and the first hit of any kind as a fallback
+        // for a path that never finds one — a ray that leaves through the far
+        // side of a dielectric and escapes still has to be filed under
+        // something. An emitter counts as a surface too and ends the search the
+        // same way a diffuse one does, which is why it is named here and why
+        // this sits ahead of the `LIGHT` branch below rather than after it: a
+        // light seen through glass is as much a surface behind that glass as a
+        // floor is. Nothing sets `captured` for it because that branch returns.
+        let opaque = material.kind == LAMBERTIAN || material.kind == LIGHT;
+        if !captured && (bounce == 0u || opaque) {
+            features = Features(hit.normal, traveled + hit.t, material.color, i32(hit.material));
+        }
+        captured = captured || material.kind == LAMBERTIAN;
+
         if material.kind == LIGHT {
             // An emitter is where a path ends: it is the only thing in the scene
             // that adds rather than attenuates.
@@ -1124,14 +1261,14 @@ fn trace_path(primary: Ray) -> vec3f {
             // points on the geometric surface.
             let front = dot(geometric_normal(triangles[hit.triangle]), ray.direction) < 0.0;
             if !front {
-                return radiance;
+                return Path(radiance, features);
             }
 
             var weight = 1.0;
             if !specular {
                 weight = power_heuristic(scatter_pdf, light_pdf(hit, ray.direction));
             }
-            return radiance + throughput * material.color * weight;
+            return Path(radiance + throughput * material.color * weight, features);
         }
 
         // Light arriving straight from an emitter, gathered before the path
@@ -1160,6 +1297,7 @@ fn trace_path(primary: Ray) -> vec3f {
 
         throughput *= scattered.attenuation;
         ray = scattered.ray;
+        traveled += hit.t;
 
         // Russian roulette. Past the first few bounces a path is killed with
         // probability `1 - survival` and the survivors are divided by
@@ -1189,7 +1327,49 @@ fn trace_path(primary: Ray) -> vec3f {
     }
 
     // Out of bounces, or absorbed: whatever it had gathered is all it gets.
-    return radiance;
+    return Path(radiance, features);
+}
+
+fn index_of(pixel: vec2u) -> u32 {
+    return pixel.y * camera.width + pixel.x;
+}
+
+// A sample scaled back to the top of this pixel's acceptance window, or handed
+// straight back if it is inside it.
+//
+// The window is `mean + k * deviation * n^(1/4)` over the samples gathered so
+// far, and three things about it are load-bearing:
+//
+//   - **The deviation is floored at the mean.** A pixel whose samples have all
+//     agreed has a variance near zero and would reject the next one to differ at
+//     any `k` at all; the floor means a sample has to be several times the
+//     pixel's own brightness before it counts as an outlier, however tightly the
+//     samples so far happened to agree.
+//   - **A pixel with no light yet accepts anything.** Its mean and its variance
+//     are both zero, so the window is zero and it would swallow the first real
+//     sample to arrive — which in a dim corner is the one carrying the whole
+//     pixel.
+//   - **The scale keeps the hue.** Discarding a sample outright loses its energy
+//     unconditionally; scaling all three channels by the same factor caps the
+//     magnitude and leaves the colour it arrived with.
+fn reject_outlier(index: u32, radiance: vec3f) -> vec3f {
+    let n = f32(camera.sample - 1u);
+    if camera.outlier_k <= 0.0 || camera.sample <= camera.outlier_warmup || n <= 0.0 {
+        return radiance;
+    }
+
+    let moment = moments[index].drawn / n;
+    let mean = moment.x;
+    let variance = max(0.0, moment.y - mean * mean);
+    let deviation = max(sqrt(variance), mean);
+
+    let threshold = mean + camera.outlier_k * deviation * pow(n, 0.25);
+    let luma = luminance(radiance);
+    if threshold <= 0.0 || luma <= threshold {
+        return radiance;
+    }
+
+    return radiance * (threshold / luma);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1202,7 +1382,8 @@ fn trace(@builtin(global_invocation_id) id: vec3u) {
 
     let pixel = id.xy;
     init_rng(pixel);
-    let radiance = trace_path(primary_ray(pixel));
+    let path = trace_path(primary_ray(pixel));
+    let radiance = path.radiance;
 
     // A backstop for whatever still manages to produce one. The accumulator sums
     // across every dispatch, so a single non-finite sample would otherwise turn
@@ -1216,8 +1397,77 @@ fn trace(@builtin(global_invocation_id) id: vec3u) {
     let finite = abs(radiance) < vec3f(FLT_MAX);
     let clean = select(vec3f(0.0), radiance, finite);
 
+    // Firefly rejection: a sample far enough above what this pixel has been
+    // averaging is scaled back to the edge of the window rather than kept whole.
+    //
+    // The window widens as `n^(1/4)`, which is the entire reason this converges
+    // rather than biasing the image permanently — a sample capped at a hundred
+    // samples is accepted at ten thousand, so the estimator still reaches the
+    // right answer, it just gets there without the variance a single lucky path
+    // would otherwise inject. Off unless a scene asks for it.
+    let capped = reject_outlier(index_of(pixel), clean);
+
     // Radiance sums in `rgb`, samples in `w`, so the host can average without
     // being told how many passes ran.
-    let index = pixel.y * camera.width + pixel.x;
-    accum[index] = accum[index] + vec4f(clean, 1.0);
+    let index = index_of(pixel);
+    accum[index] = accum[index] + vec4f(capped, 1.0);
+
+    // `drawn` takes `clean` and not `capped`, which is the trap this whole stage
+    // turns on. Those moments are what the threshold above is computed from;
+    // feed them the value the threshold already shrank and the variance
+    // collapses toward it, the window tightens in response, and the bias locks
+    // in at a level no sample count undoes. They have to keep measuring the
+    // distribution the tracer actually draws from, not the one the rejection
+    // leaves behind.
+    //
+    // `kept` takes `capped`, for the opposite reason: the filter and the host
+    // ask how noisy the *image* is, and a firefly the rejection already scaled
+    // down is noise the image does not have. Measured off `clean`, one capped
+    // firefly would widen the filter's luminance threshold around exactly the
+    // pixel it was removed from, and the filter would blur across edges there.
+    //
+    // The non-finite guard still applies: a NaN would poison the variance of the
+    // pixel for the rest of the render exactly as it would have poisoned its
+    // colour.
+    //
+    // This draws nothing from the RNG and feeds nothing back into the path, so
+    // with the rejection off the image is bit-for-bit what it was without any of
+    // it.
+    let drawn = luminance(clean);
+    let kept = luminance(capped);
+    let moment = moments[index];
+    moments[index] = Moments(
+        moment.drawn + vec2f(drawn, drawn * drawn),
+        moment.kept + vec2f(kept, kept * kept),
+    );
+
+    // The features, summed the same way. Unguarded, and deliberately: a normal,
+    // a distance and a surface colour are finite whatever the path did with
+    // them, and a sample whose radiance was thrown away still saw a real
+    // surface worth averaging in.
+    normals[index] = normals[index] + vec4f(path.features.normal, path.features.depth);
+    let albedo = albedos[index];
+    albedos[index] = Albedo(albedo.color + path.features.albedo, vote(albedo.votes, path.features.object));
+}
+
+// One sample's ballot in a pixel's object-id vote, packed as `Albedo` describes.
+//
+// Boyer-Moore: a matching id extends the candidate's lead, any other id cuts it,
+// and a lead cut to nothing hands the seat to the next id to arrive. Whatever
+// holds more than half the samples is guaranteed to be sitting there at the end,
+// which is exactly "whichever surface most of its samples saw" — a silhouette
+// pixel that is nine-tenths teapot is filed under the teapot, and a pane of
+// glass over a floor under the floor, rather than under the mean of the two.
+fn vote(votes: u32, object: i32) -> u32 {
+    let ballot = u32(object + 1);
+    let candidate = votes >> 16u;
+    let lead = votes & 0xffffu;
+
+    if lead == 0u {
+        return (ballot << 16u) | 1u;
+    }
+    if candidate == ballot {
+        return (candidate << 16u) | min(lead + 1u, 0xffffu);
+    }
+    return (candidate << 16u) | (lead - 1u);
 }

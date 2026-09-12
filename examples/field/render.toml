@@ -1,7 +1,7 @@
 [camera]
 aspect_ratio = "square"
 image_width = 800
-samples = 50000
+samples = 5000
 max_bounces = 64
 fov = 21.0
 look_from = [7.96, 10.19, -17.28]
