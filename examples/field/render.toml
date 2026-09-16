@@ -17,8 +17,9 @@ intensity = 1.0
 shape = "wavefront"
 file = "scene.obj"
 group = "BlueBall"
-material = "lambertian"
-albedo = [0.01, 0.01, 0.8]
+material = "principled"
+base_color = [0.01, 0.01, 0.8]
+roughness = 0.24
 
 [[objects]]
 shape = "wavefront"
@@ -38,8 +39,9 @@ roughness = 0.02
 shape = "wavefront"
 file = "scene.obj"
 group = "WhiteBall"
-material = "lambertian"
-albedo = [0.95, 0.95, 0.95]
+material = "principled"
+base_color = [0.95, 0.95, 0.95]
+roughness = 0.36
 
 [[objects]]
 shape = "wavefront"

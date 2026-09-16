@@ -17,8 +17,9 @@ color = [0.70, 0.80, 0.99]
 shape = "wavefront"
 file = "teapot.obj"
 group = "Teapot"
-material = "lambertian"
-albedo = [0.72, 0.72, 0.75]
+material = "principled"
+base_color = [0.72, 0.72, 0.75]
+roughness = 0.1
 
 # Floor
 [[objects]]

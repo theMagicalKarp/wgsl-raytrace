@@ -19,7 +19,7 @@ file = "scene.obj"
 group = "Smooth"
 material = "metal"
 albedo = [0.9, 0.9, 0.9]
-roughness = 0.4
+roughness = 0.2
 
 # Sharp Orb
 [[objects]]
@@ -28,8 +28,7 @@ file = "scene.obj"
 group = "Sharp"
 material = "metal"
 albedo = [0.9, 0.9, 0.9]
-roughness = 0.4
-
+roughness = 0.2
 
 # Light
 [[objects]]
@@ -38,7 +37,6 @@ file = "scene.obj"
 group = "Light"
 material = "light"
 emit = [9.0, 9.0, 9.0]
-
 
 # Floor
 [[objects]]

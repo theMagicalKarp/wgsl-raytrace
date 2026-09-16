@@ -1,59 +1,116 @@
 use crate::config::Material;
+use crate::config::Principled;
 use bytemuck::Pod;
 use bytemuck::Zeroable;
 
-/// The surface models, as the shader's `switch` will see them.
+/// The surface models, as the shader's branches will see them.
 ///
-/// Glass and water are absent on purpose: they are dielectrics with a fixed
-/// index of refraction, flattened on the way in, so the shader never learns
-/// that the scene format has names for them.
-pub(crate) const LAMBERTIAN: u32 = 0;
-pub(crate) const METAL: u32 = 1;
-pub(crate) const DIELECTRIC: u32 = 2;
-pub(crate) const LIGHT: u32 = 3;
+/// Lambertian, metal and the dielectrics are absent on purpose: they are
+/// principled surfaces with a few fields pinned. All of them are flattened on
+/// the way in, so the shader never learns that the scene format has names for
+/// them.
+pub(crate) const PRINCIPLED: u32 = 0;
+pub(crate) const LIGHT: u32 = 1;
 
 /// A material as the shader reads it.
 ///
-/// One `vec3<f32>` and two scalars cover every model in the scene format: the
-/// vector is an albedo or an emitted radiance, and the scalar is a roughness or
-/// an index of refraction. Which of those a field means is decided by `kind`,
-/// and nothing else in the struct varies, so the buffer stays a flat array.
+/// The same fields for every kind, so the buffer stays a flat array. A light
+/// reads only `color`.
+///
+/// WGSL pads a struct to its largest alignment, which is the `vec3f`'s sixteen,
+/// so the five scalars after `kind` round up to a trailing twelve bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct GpuMaterial {
-    /// Albedo, or emitted radiance for a light. Dielectrics are colorless and
-    /// carry white, so the shader can attenuate by this unconditionally.
+    /// Base color, or emitted radiance for a light.
     pub color: [f32; 3],
 
     /// One of the constants above.
     pub kind: u32,
 
-    /// Metal roughness, or dielectric index of refraction. Unused otherwise.
-    pub parameter: f32,
+    /// Microfacet roughness in `[0, 1]`.
+    pub roughness: f32,
+
+    /// Dielectric at zero, conductor at one.
+    pub metallic: f32,
+
+    /// Index of refraction.
+    pub ior: f32,
+
+    /// Opaque at zero, glass at one.
+    pub transmission: f32,
+
+    /// Coverage: the chance a ray is stopped by the surface at all. Also
+    /// copied onto every triangle, so a shadow ray can answer it without a
+    /// material lookup.
+    pub alpha: f32,
 
     _pad: [f32; 3],
 }
 
-const _: () = assert!(size_of::<GpuMaterial>() == 32);
+const _: () = assert!(size_of::<GpuMaterial>() == 48);
 
-impl From<&Material> for GpuMaterial {
-    fn from(material: &Material) -> Self {
-        const CLEAR: [f32; 3] = [1.0; 3];
-
-        let (kind, color, parameter) = match material {
-            Material::Lambertian { albedo } => (LAMBERTIAN, *albedo, 0.0),
-            Material::Metal { albedo, roughness } => (METAL, *albedo, *roughness),
-            Material::Dielectric { refraction_index } => (DIELECTRIC, CLEAR, *refraction_index),
-            Material::Glass {} => (DIELECTRIC, CLEAR, 1.5),
-            Material::Water {} => (DIELECTRIC, CLEAR, 1.33),
-            Material::Light { emit } => (LIGHT, *emit, 0.0),
-        };
-
+impl GpuMaterial {
+    fn new(kind: u32, color: [f32; 3], principled: Principled) -> GpuMaterial {
         GpuMaterial {
             color,
             kind,
-            parameter,
+            roughness: principled.roughness,
+            metallic: principled.metallic,
+            ior: principled.ior,
+            transmission: principled.transmission,
+            alpha: principled.alpha,
             _pad: [0.0; 3],
+        }
+    }
+
+    fn principled(principled: Principled) -> GpuMaterial {
+        GpuMaterial::new(PRINCIPLED, principled.base_color, principled)
+    }
+
+    /// Clear, colorless glass: nothing but the transmission lobe, perfectly
+    /// smooth.
+    fn dielectric(ior: f32) -> GpuMaterial {
+        GpuMaterial::principled(Principled {
+            base_color: [1.0; 3],
+            roughness: 0.0,
+            metallic: 0.0,
+            ior,
+            transmission: 1.0,
+            alpha: 1.0,
+        })
+    }
+}
+
+impl From<&Material> for GpuMaterial {
+    fn from(material: &Material) -> Self {
+        match *material {
+            Material::Principled(principled) => GpuMaterial::principled(principled),
+
+            // An index of one makes the dielectric Fresnel term zero at every
+            // angle, so there is no specular lobe left and this is the plain
+            // diffuse it always was.
+            Material::Lambertian { albedo } => GpuMaterial::principled(Principled {
+                base_color: albedo,
+                roughness: 1.0,
+                metallic: 0.0,
+                ior: 1.0,
+                transmission: 0.0,
+                alpha: 1.0,
+            }),
+
+            Material::Metal { albedo, roughness } => GpuMaterial::principled(Principled {
+                base_color: albedo,
+                roughness,
+                metallic: 1.0,
+                ..Principled::default()
+            }),
+
+            Material::Dielectric { refraction_index } => GpuMaterial::dielectric(refraction_index),
+            Material::Glass {} => GpuMaterial::dielectric(1.5),
+            Material::Water {} => GpuMaterial::dielectric(1.33),
+
+            Material::Light { emit } => GpuMaterial::new(LIGHT, emit, Principled::default()),
         }
     }
 }
@@ -63,28 +120,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn materials_flatten_to_what_the_shader_understands() {
-        let glass = GpuMaterial::from(&Material::Glass {});
-        let water = GpuMaterial::from(&Material::Water {});
-
-        assert_eq!(glass.kind, DIELECTRIC);
-        assert_eq!(glass.parameter, 1.5);
-        assert_eq!(water.kind, DIELECTRIC);
-        assert_eq!(water.parameter, 1.33);
-        assert_eq!(glass.color, [1.0; 3], "a dielectric should not tint");
+    fn a_principled_material_is_uploaded_as_written() {
+        let material = GpuMaterial::from(&Material::Principled(Principled {
+            base_color: [0.1, 0.2, 0.3],
+            roughness: 0.4,
+            metallic: 0.5,
+            ior: 1.6,
+            transmission: 0.7,
+            alpha: 0.8,
+        }));
 
         assert_eq!(
-            GpuMaterial::from(&Material::Metal {
-                albedo: [0.1, 0.2, 0.3],
-                roughness: 0.4,
-            }),
+            material,
             GpuMaterial {
                 color: [0.1, 0.2, 0.3],
-                kind: METAL,
-                parameter: 0.4,
+                kind: PRINCIPLED,
+                roughness: 0.4,
+                metallic: 0.5,
+                ior: 1.6,
+                transmission: 0.7,
+                alpha: 0.8,
                 _pad: [0.0; 3],
             }
         );
+    }
+
+    #[test]
+    fn a_lambertian_is_a_principled_surface_with_no_specular() {
+        let material = GpuMaterial::from(&Material::Lambertian {
+            albedo: [0.1, 0.2, 0.3],
+        });
+
+        assert_eq!(material.kind, PRINCIPLED);
+        assert_eq!(material.color, [0.1, 0.2, 0.3]);
+        assert_eq!(material.roughness, 1.0);
+        assert_eq!(material.metallic, 0.0);
+        assert_eq!(material.ior, 1.0, "no Fresnel reflection at any angle");
+        assert_eq!((material.transmission, material.alpha), (0.0, 1.0));
+    }
+
+    #[test]
+    fn a_metal_is_a_fully_metallic_principled_surface() {
+        let material = GpuMaterial::from(&Material::Metal {
+            albedo: [0.1, 0.2, 0.3],
+            roughness: 0.4,
+        });
+
+        assert_eq!(material.kind, PRINCIPLED);
+        assert_eq!(material.color, [0.1, 0.2, 0.3]);
+        assert_eq!(material.roughness, 0.4);
+        assert_eq!(material.metallic, 1.0);
+        assert_eq!((material.transmission, material.alpha), (0.0, 1.0));
+    }
+
+    #[test]
+    fn dielectrics_are_smooth_clear_principled_glass() {
+        for (material, ior) in [
+            (Material::Glass {}, 1.5),
+            (Material::Water {}, 1.33),
+            (
+                Material::Dielectric {
+                    refraction_index: 2.4,
+                },
+                2.4,
+            ),
+        ] {
+            assert_eq!(
+                GpuMaterial::from(&material),
+                GpuMaterial {
+                    color: [1.0; 3],
+                    kind: PRINCIPLED,
+                    roughness: 0.0,
+                    metallic: 0.0,
+                    ior,
+                    transmission: 1.0,
+                    alpha: 1.0,
+                    _pad: [0.0; 3],
+                },
+                "{material}"
+            );
+        }
     }
 
     /// A light is its emitted radiance and nothing more. Which face it emits
@@ -97,14 +212,8 @@ mod tests {
             emit: [1.0, 2.0, 3.0],
         });
 
-        assert_eq!(
-            light,
-            GpuMaterial {
-                color: [1.0, 2.0, 3.0],
-                kind: LIGHT,
-                parameter: 0.0,
-                _pad: [0.0; 3],
-            }
-        );
+        assert_eq!(light.kind, LIGHT);
+        assert_eq!(light.color, [1.0, 2.0, 3.0]);
+        assert_eq!(light.alpha, 1.0);
     }
 }

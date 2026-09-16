@@ -10,6 +10,8 @@ mod variance;
 
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod shader_tests;
 
 pub use aov::Aovs;
 pub use camera::GpuCamera;

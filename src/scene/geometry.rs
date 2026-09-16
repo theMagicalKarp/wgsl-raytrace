@@ -1,5 +1,6 @@
 use crate::config::Wavefront;
 use crate::math;
+use crate::scene::material::GpuMaterial;
 use crate::scene::transform::Model;
 use crate::scene::wavefront::Corner;
 use crate::scene::wavefront::corners;
@@ -10,6 +11,11 @@ use obj::raw::object::RawObj;
 use std::error::Error;
 
 /// A triangle as the shader reads it, with the model transform already applied.
+///
+/// A `vec3f` is 16-aligned, so each one leaves a scalar's worth of room behind
+/// it. Two of those carry something: the material index, and the material's
+/// alpha, which a shadow ray needs on every triangle it meets and would
+/// otherwise have to fetch the material for.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct GpuTriangle {
@@ -17,7 +23,8 @@ pub struct GpuTriangle {
     /// Index into [`Scene::materials`](crate::scene::Scene::materials).
     pub material: u32,
     pub v1: [f32; 3],
-    _pad1: f32,
+    /// The material's coverage, as [`GpuMaterial::alpha`].
+    pub alpha: f32,
     pub v2: [f32; 3],
     _pad2: f32,
     pub n0: [f32; 3],
@@ -30,7 +37,8 @@ pub struct GpuTriangle {
 
 const _: () = assert!(size_of::<GpuTriangle>() == 96);
 
-/// Appends `wavefront`'s triangles, in world space and tagged with `material`.
+/// Appends `wavefront`'s triangles, in world space and tagged with `material`
+/// and its alpha.
 ///
 /// Faces with more than three corners are fanned from their first corner, which
 /// is right for the convex faces an exporter emits. A corner without a normal
@@ -47,6 +55,7 @@ pub(super) fn append(
     out: &mut Vec<GpuTriangle>,
 ) -> Result<(), Box<dyn Error>> {
     let model = Model::new(&wavefront.transform);
+    let alpha = GpuMaterial::from(&wavefront.material).alpha;
     let before = out.len();
 
     // Indices are bounds-checked while parsing, so these lookups cannot fail.
@@ -78,7 +87,7 @@ pub(super) fn append(
                 v0: points[0],
                 material,
                 v1: points[1],
-                _pad1: 0.0,
+                alpha,
                 v2: points[2],
                 _pad2: 0.0,
                 n0: normals[0],
@@ -99,6 +108,8 @@ pub(super) fn append(
 
 #[cfg(test)]
 mod tests {
+    use crate::config::Material;
+    use crate::config::Principled;
     use crate::config::Transform;
     use crate::scene::testing::BLOCKS;
     use crate::scene::testing::QUAD;
@@ -132,6 +143,25 @@ mod tests {
             .expect_err("a file with no faces has nothing to render");
 
         assert!(error.to_string().contains("test.obj"), "{error}");
+    }
+
+    /// Shadow rays read coverage off the triangle rather than the material, so
+    /// every triangle has to carry its object's.
+    #[test]
+    fn every_triangle_carries_its_materials_alpha() {
+        let mut object = wavefront(None, vec![]);
+        object.material = Material::Principled(Principled {
+            alpha: 0.3,
+            ..Principled::default()
+        });
+        let cutout = triangles(QUAD, &object);
+
+        object.material = Material::Lambertian { albedo: [0.5; 3] };
+        let opaque = triangles(QUAD, &object);
+
+        assert_eq!(cutout.len(), 2);
+        assert!(cutout.iter().all(|triangle| triangle.alpha == 0.3));
+        assert!(opaque.iter().all(|triangle| triangle.alpha == 1.0));
     }
 
     #[test]

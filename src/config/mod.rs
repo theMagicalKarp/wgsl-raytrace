@@ -352,14 +352,68 @@ impl CameraOptions {
     }
 }
 
+/// A physically based surface in the spirit of Blender's Principled BSDF: a
+/// diffuse base under a dielectric specular coat, blended toward glass by
+/// `transmission` and toward a conductor by `metallic`.
+///
+/// Every field defaults to what Blender's node does, so `material =
+/// "principled"` alone is a grey, half-rough plastic.
+#[serde_inline_default]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Principled {
+    /// Diffuse albedo, and the reflectance at normal incidence once metallic.
+    #[serde_inline_default([0.8, 0.8, 0.8])]
+    pub base_color: [f32; 3],
+
+    /// Microfacet roughness in `[0, 1]`, squared into GGX's alpha.
+    #[serde_inline_default(0.5)]
+    pub roughness: f32,
+
+    /// Dielectric at zero, conductor at one, and a blend of the two between.
+    #[serde_inline_default(0.0)]
+    pub metallic: f32,
+
+    /// Index of refraction, which sets how strongly the dielectric part
+    /// reflects. One reflects nothing at any angle.
+    #[serde_inline_default(1.5)]
+    pub ior: f32,
+
+    /// Opaque at zero, glass at one: the share of the dielectric part that
+    /// refracts through the surface rather than scattering off its base.
+    #[serde_inline_default(0.0)]
+    pub transmission: f32,
+
+    /// Coverage: the chance a ray is stopped by the surface at all. The rest
+    /// pass straight through as though it were not there, which is a cutout
+    /// rather than a refraction.
+    #[serde_inline_default(1.0)]
+    pub alpha: f32,
+}
+
+impl Default for Principled {
+    fn default() -> Self {
+        Principled {
+            base_color: [0.8, 0.8, 0.8],
+            roughness: 0.5,
+            metallic: 0.0,
+            ior: 1.5,
+            transmission: 0.0,
+            alpha: 1.0,
+        }
+    }
+}
+
 /// The surface models the tracer knows how to scatter off of.
 ///
-/// This is deliberately smaller than the CPU tracer's set: the shader carries a
-/// single scalar per material, so anything needing a texture lookup (checkered,
-/// image, noise) is left out until there is somewhere to put it.
+/// Everything but a light is a [`Principled`] surface on the GPU. The other names are shorthand for one, kept because they read better in
+/// a scene than the handful of numbers they stand for.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(tag = "material", deny_unknown_fields)]
 pub enum Material {
+    #[serde(rename = "principled")]
+    Principled(Principled),
+
     #[serde(rename = "lambertian")]
     Lambertian { albedo: [f32; 3] },
 
@@ -382,6 +436,11 @@ pub enum Material {
 impl fmt::Display for Material {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Material::Principled(p) => write!(
+                f,
+                "principled{:?} roughness {} metallic {} ior {} transmission {} alpha {}",
+                p.base_color, p.roughness, p.metallic, p.ior, p.transmission, p.alpha,
+            ),
             Material::Lambertian { albedo } => write!(f, "lambertian{:?}", albedo),
             Material::Metal { albedo, roughness } => {
                 write!(f, "metal{:?} roughness {}", albedo, roughness)
@@ -392,6 +451,46 @@ impl fmt::Display for Material {
             Material::Glass {} => write!(f, "glass"),
             Material::Water {} => write!(f, "water"),
             Material::Light { emit } => write!(f, "light{:?}", emit),
+        }
+    }
+}
+
+impl Material {
+    /// Rejects the values a scene can spell but the BSDF cannot price: a
+    /// roughness or metallic outside `[0, 1]` has no microfacet meaning, an
+    /// index of refraction under one turns the Fresnel term inside out, and a
+    /// negative color is light taken out of nowhere. NaN fails every range.
+    fn validate(&self) -> Result<(), String> {
+        let unit = |name: &str, value: f32| match (0.0..=1.0).contains(&value) {
+            true => Ok(()),
+            false => Err(format!("{name} must be between 0 and 1, not {value}")),
+        };
+        let color = |name: &str, value: [f32; 3]| match value.iter().all(|c| *c >= 0.0) {
+            true => Ok(()),
+            false => Err(format!("{name} must be non-negative, not {value:?}")),
+        };
+        let ior = |name: &str, value: f32| match value >= 1.0 {
+            true => Ok(()),
+            false => Err(format!("{name} must be at least 1, not {value}")),
+        };
+
+        match self {
+            Material::Principled(p) => {
+                color("base_color", p.base_color)?;
+                unit("roughness", p.roughness)?;
+                unit("metallic", p.metallic)?;
+                unit("transmission", p.transmission)?;
+                unit("alpha", p.alpha)?;
+                ior("ior", p.ior)
+            }
+            Material::Lambertian { albedo } => color("albedo", *albedo),
+            Material::Metal { albedo, roughness } => {
+                color("albedo", *albedo)?;
+                unit("roughness", *roughness)
+            }
+            Material::Light { emit } => color("emit", *emit),
+            Material::Dielectric { refraction_index } => ior("refraction_index", *refraction_index),
+            Material::Glass {} | Material::Water {} => Ok(()),
         }
     }
 }
@@ -495,7 +594,7 @@ impl Config {
     /// the parse pure and puts a clear error in front of the user before any
     /// GPU work starts.
     pub fn validate(&mut self, config_dir: &Path) -> Result<(), Box<dyn Error>> {
-        for object in &mut self.objects {
+        for (index, object) in self.objects.iter_mut().enumerate() {
             let Object::Wavefront(wavefront) = object;
 
             wavefront.file = config_dir.join(&wavefront.file);
@@ -504,6 +603,11 @@ impl Config {
                     format!("Object file does not exist: {}", wavefront.file.display()).into(),
                 );
             }
+
+            wavefront
+                .material
+                .validate()
+                .map_err(|error| format!("Object {index} material: {error}"))?;
         }
 
         if let Some(file) = &mut self.environment.file {
@@ -927,6 +1031,140 @@ emit = [3.0, 3.0, 3.0]"#,
             .is_err(),
             "sidedness is not a thing a scene gets to ask about"
         );
+    }
+
+    fn with_material(material: &str) -> String {
+        MINIMAL.replace(
+            "material = \"lambertian\"\nalbedo = [0.42, 0.2, 0.7]",
+            material,
+        )
+    }
+
+    /// Every field left out takes Blender's default, so the bare name is a
+    /// complete material.
+    #[test]
+    fn a_principled_material_takes_blenders_defaults() {
+        let config: Config = toml::from_str(&with_material("material = \"principled\"")).unwrap();
+        let Object::Wavefront(wavefront) = &config.objects[0];
+
+        assert_eq!(
+            wavefront.material,
+            Material::Principled(Principled {
+                base_color: [0.8, 0.8, 0.8],
+                roughness: 0.5,
+                metallic: 0.0,
+                ior: 1.5,
+                transmission: 0.0,
+                alpha: 1.0,
+            })
+        );
+        assert_eq!(
+            wavefront.material,
+            Material::Principled(Principled::default())
+        );
+    }
+
+    #[test]
+    fn a_principled_material_reads_every_field() {
+        let source = with_material(
+            "material = \"principled\"\nbase_color = [0.1, 0.2, 0.3]\n\
+             roughness = 0.25\nmetallic = 1.0\nior = 1.33\ntransmission = 0.75\nalpha = 0.4",
+        );
+        let config: Config = toml::from_str(&source).unwrap();
+        let Object::Wavefront(wavefront) = &config.objects[0];
+
+        assert_eq!(
+            wavefront.material,
+            Material::Principled(Principled {
+                base_color: [0.1, 0.2, 0.3],
+                roughness: 0.25,
+                metallic: 1.0,
+                ior: 1.33,
+                transmission: 0.75,
+                alpha: 0.4,
+            })
+        );
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{}\nsheen = 1.0",
+                with_material("material = \"principled\"")
+                    .split("[[objects.transform]]")
+                    .next()
+                    .unwrap()
+            ))
+            .is_err(),
+            "a field the model does not have yet is named, not ignored"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_material_is_named_rather_than_rendered() {
+        for (material, field) in [
+            ("material = \"principled\"\nroughness = 1.5", "roughness"),
+            ("material = \"principled\"\nroughness = -0.1", "roughness"),
+            ("material = \"principled\"\nroughness = nan", "roughness"),
+            ("material = \"principled\"\nmetallic = 2.0", "metallic"),
+            (
+                "material = \"principled\"\ntransmission = 1.1",
+                "transmission",
+            ),
+            (
+                "material = \"principled\"\ntransmission = -0.5",
+                "transmission",
+            ),
+            ("material = \"principled\"\nalpha = 1.5", "alpha"),
+            ("material = \"principled\"\nalpha = -0.25", "alpha"),
+            ("material = \"principled\"\nalpha = nan", "alpha"),
+            ("material = \"principled\"\nior = 0.9", "ior"),
+            ("material = \"principled\"\nior = nan", "ior"),
+            (
+                "material = \"principled\"\nbase_color = [0.5, -0.1, 0.5]",
+                "base_color",
+            ),
+            (
+                "material = \"lambertian\"\nalbedo = [-1.0, 0.0, 0.0]",
+                "albedo",
+            ),
+            (
+                "material = \"metal\"\nalbedo = [0.5, 0.5, 0.5]\nroughness = 1.2",
+                "roughness",
+            ),
+            ("material = \"light\"\nemit = [1.0, -1.0, 1.0]", "emit"),
+            (
+                "material = \"dielectric\"\nrefraction_index = 0.0",
+                "refraction_index",
+            ),
+            (
+                "material = \"dielectric\"\nrefraction_index = -1.5",
+                "refraction_index",
+            ),
+            (
+                "material = \"dielectric\"\nrefraction_index = nan",
+                "refraction_index",
+            ),
+        ] {
+            let mut config: Config = toml::from_str(&with_material(material)).unwrap();
+            let error = config
+                .validate(Path::new("tests/golden"))
+                .expect_err(&format!("{material:?} should not be accepted"));
+
+            assert!(error.to_string().contains(field), "{material:?}: {error}");
+        }
+
+        for material in [
+            "material = \"principled\"",
+            "material = \"principled\"\nroughness = 0.0\nmetallic = 1.0\nior = 1.0",
+            "material = \"principled\"\nroughness = 1.0\nbase_color = [0.0, 0.0, 0.0]",
+            "material = \"principled\"\ntransmission = 1.0\nroughness = 0.0",
+            "material = \"principled\"\nalpha = 0.0",
+            "material = \"principled\"\nalpha = 1.0",
+            "material = \"dielectric\"\nrefraction_index = 1.0",
+        ] {
+            let mut config: Config = toml::from_str(&with_material(material)).unwrap();
+            config
+                .validate(Path::new("tests/golden"))
+                .unwrap_or_else(|error| panic!("{material:?} is legal: {error}"));
+        }
     }
 
     #[test]
