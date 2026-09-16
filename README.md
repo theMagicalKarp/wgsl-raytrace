@@ -172,9 +172,10 @@ into world space at load time.
 
 | `material` | Fields | Notes |
 | --- | --- | --- |
-| `lambertian` | `albedo = [r, g, b]` | Diffuse. Gets direct light sampling. |
-| `metal` | `albedo`, `roughness` | Higher roughness gives blurrier reflections. |
-| `dielectric` | `refraction_index` | Refracts, and reflects by Schlick's approximation. |
+| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `alpha` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `1.0`. `roughness`, `metallic`, `transmission` and `alpha` are in `[0, 1]`; `ior` is at least 1. |
+| `lambertian` | `albedo = [r, g, b]` | Shorthand for `principled` with `base_color = albedo`, `roughness = 1`, `metallic = 0`, `ior = 1`. Pure diffuse. |
+| `metal` | `albedo`, `roughness` | Shorthand for `principled` with `base_color = albedo`, `metallic = 1`. |
+| `dielectric` | `refraction_index` | Shorthand for `principled` with `base_color = [1, 1, 1]`, `roughness = 0`, `metallic = 0`, `ior = refraction_index`, `transmission = 1`. Clear glass. |
 | `glass` | — | Dielectric with IOR 1.5. |
 | `water` | — | Dielectric with IOR 1.33. |
 | `light` | `emit = [r, g, b]` | Emits from its front face only (the side its winding faces). Values above 1 are normal. |
@@ -202,11 +203,14 @@ flowchart LR
    - Casts a stratified, jittered primary ray. With a lens, the ray starts on
      the lens disk.
    - Walks the BVH to find the nearest hit.
-   - At diffuse surfaces, sends shadow rays to one sampled emitter and one
-     sampled sky direction (next event estimation). These are combined with
-     the BSDF sample using the power heuristic (MIS), so no light is counted
-     twice.
-   - Scatters by material, and applies Russian roulette after bounce 4.
+   - At surfaces with a non-mirror lobe (diffuse, or rough microfacet), sends
+     shadow rays to one sampled emitter and one sampled sky direction (next
+     event estimation). These are combined with the BSDF sample using the power
+     heuristic (MIS), so no light is counted twice.
+   - Samples the BSDF: picks one lobe (metal, specular, glass or diffuse), draws
+     a direction from it (GGX visible normals for the microfacet lobes), and
+     weighs it against every lobe's density. Applies Russian roulette after
+     bounce 4.
    - Drops non-finite samples, and applies outlier rejection if `k > 0`.
 3. **Accumulate.** Each sample adds to four per-pixel buffers:
    - `accum`: radiance sum and sample count.
@@ -323,6 +327,7 @@ mise run example melee --debug   # also write raw frame + AOVs to examples/melee
 | ![normals](examples/normals/render.png) `normals`: smooth vs. per-face normals | ![melee](examples/melee/render.png) `melee`: mixed materials, one emitter |
 | ![glass](examples/glass/render.png) `glass`: glass monkeys, two lights; the scene with the most fireflies | ![cubes](examples/cubes/render.png) `cubes`: a room of objects lit by one emitter |
 | ![stairs](examples/stairs/render.png) `stairs`: glass orbs and a staircase, two lights | ![tunnel](examples/tunnel/render.png) `tunnel`: coloured walls under an HDRI |
+| ![principled](examples/principled/render.png) `principled`: one row per parameter, back to front: base color, roughness, metallic, IOR, alpha | |
 
 ## Development
 

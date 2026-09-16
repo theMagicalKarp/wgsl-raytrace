@@ -109,8 +109,8 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::material::LAMBERTIAN;
     use crate::scene::material::LIGHT;
+    use crate::scene::material::PRINCIPLED;
     use crate::scene::testing::triangles;
     use crate::scene::testing::wavefront;
     use std::fs;
@@ -124,12 +124,12 @@ mod tests {
 
         let scene = Scene::load(&config).unwrap();
 
-        // Both blocks are lambertian; they stay separate materials because
-        // they ask for different albedos, and they keep the order the file
-        // lists them in.
+        // Both blocks are lambertian, which uploads as principled; they stay
+        // separate materials because they ask for different albedos, and they
+        // keep the order the file lists them in.
         assert_eq!(scene.materials.len(), 2);
-        assert_eq!(scene.materials[0].kind, LAMBERTIAN);
-        assert_eq!(scene.materials[1].kind, LAMBERTIAN);
+        assert_eq!(scene.materials[0].kind, PRINCIPLED);
+        assert_eq!(scene.materials[1].kind, PRINCIPLED);
         assert_eq!(scene.materials[0].color, [0.72, 0.72, 0.75]);
         assert_eq!(scene.materials[1].color, [0.3, 0.72, 0.3]);
 

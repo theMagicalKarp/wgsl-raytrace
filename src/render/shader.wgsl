@@ -20,11 +20,20 @@ const MAX_BVH_STACK: u32 = 32u;
 // and worth very little, and the survivors it is folded into cost nothing extra.
 const MIN_ROULETTE_BOUNCE: u32 = 4u;
 
+// Surfaces a path may pass through by their alpha before it is given up on, as
+// Cycles' `transparent_max_bounces`. Kept apart from `max_bounces` because a
+// pass-through scatters nothing: a stack of cutout leaves should not eat the
+// bounces the light behind it needs.
+const MAX_TRANSPARENT: u32 = 32u;
+
 // `Material.kind`, matching the constants in `scene/material.rs`.
-const LAMBERTIAN: u32 = 0u;
-const METAL: u32 = 1u;
-const DIELECTRIC: u32 = 2u;
-const LIGHT: u32 = 3u;
+const PRINCIPLED: u32 = 0u;
+const LIGHT: u32 = 1u;
+
+// GGX alpha below which a microfacet lobe is treated as a perfect mirror. Past
+// here the distribution is a spike whose density no longer fits in a float, and
+// the heuristic would be dividing one infinity by another.
+const DELTA_ALPHA: f32 = 1e-3;
 
 // Camera and frame settings, packed by `GpuCamera` on the host.
 struct Camera {
@@ -75,22 +84,30 @@ struct Camera {
     _pad2: u32,
 }
 
-// One surface, packed by `GpuMaterial`. `kind` selects what the other two mean:
-// 0 lambertian, 1 metal, 2 dielectric, 3 light.
+// One surface, packed by `GpuMaterial`. `kind` selects which fields are read: a
+// principled surface reads all of them, and a light only `color`, which is its
+// emitted radiance.
 struct Material {
     color: vec3f,
     kind: u32,
-    parameter: f32,
+    roughness: f32,
+    metallic: f32,
+    ior: f32,
+    transmission: f32,
+    // Coverage: the chance a ray is stopped by the surface at all.
+    alpha: f32,
 }
 
 // One triangle in world space, packed by `GpuTriangle`. A `vec3f` is 12 bytes
 // but 16-aligned, so a scalar placed right after one costs nothing — that is
-// where the material index rides.
+// where the material index rides, and the material's alpha after it.
 struct Triangle {
     v0: vec3f,
     material: u32,
     v1: vec3f,
-    _pad1: f32,
+    // A copy of the material's, so that a shadow ray can tell whether a
+    // triangle stops it without looking the material up.
+    alpha: f32,
     v2: vec3f,
     _pad2: f32,
     n0: vec3f,
@@ -427,7 +444,7 @@ fn intersect_triangle(ray: Ray, tri: Triangle) -> Intersection {
     var normal = normalize(tri.n0 * (1.0 - u - v) + tri.n1 * u + tri.n2 * v);
 
     // Turn the normal to meet the ray. Which side was struck is worth keeping:
-    // a dielectric needs it to know whether it is entering or leaving.
+    // glass needs it to know whether it is entering or leaving.
     let front_face = dot(ray.direction, normal) < 0.0;
     normal = select(-normal, normal, front_face);
 
@@ -576,6 +593,11 @@ fn intersect_scene(ray: Ray) -> Intersection {
 // along `direction`. The limit stops an epsilon short so that the emitter being
 // aimed at does not shadow itself.
 //
+// A surface with an alpha below one blocks with that chance, rolled once for
+// each such triangle the ray actually crosses — the same chance a scattered ray
+// in `trace_path` has of stopping on it, which is what keeps the two strategies
+// agreeing about how much light gets through.
+//
 // Its own walk rather than a flag on [`traverse`]. The two look alike, and the
 // difference is the point: this one carries a bound that never moves and no
 // candidate at all, where the other carries an `Intersection` it narrows as it
@@ -594,12 +616,33 @@ fn occluded(origin: vec3f, direction: vec3f, distance: f32) -> bool {
     var stack_depth = 0u;
     var index = 0u;
 
+    // Cutouts survived, against the same `MAX_TRANSPARENT` a scattered ray is
+    // held to.
+    var passes = 0u;
+
     loop {
         let node = bvh[index];
         if node.primitive_count > 0u {
             for (var i = 0u; i < node.primitive_count; i += 1u) {
-                if hits_triangle(ray, triangles[node.left_or_first + i], limit) {
-                    return true;
+                let tri = triangles[node.left_or_first + i];
+                // The roll comes after the geometric test, so the RNG is only
+                // touched when a cutout is actually in the way and an opaque
+                // scene draws exactly the stream it always did. Each triangle
+                // lives in one leaf and a leaf is visited at most once, so
+                // every blocker gets one independent roll.
+                if hits_triangle(ray, tri, limit) {
+                    if tri.alpha >= 1.0 || rand_f32() < tri.alpha {
+                        return true;
+                    }
+                    // `trace_path` gives up on a path that has come through
+                    // `MAX_TRANSPARENT` cutouts, and a path given up on brings
+                    // nothing back — so this gives up as blocked, and the two
+                    // strategies go on agreeing at the bound as well as under
+                    // it. It also caps what one shadow ray can draw.
+                    passes += 1u;
+                    if passes > MAX_TRANSPARENT {
+                        return true;
+                    }
                 }
             }
         } else {
@@ -636,82 +679,499 @@ fn occluded(origin: vec3f, direction: vec3f, distance: f32) -> bool {
     return false;
 }
 
-struct Scatter {
-    attenuation: vec3f,
-    ray: Ray,
-    // False ends the path here: the surface swallowed the ray rather than
-    // sending it somewhere.
-    bounced: bool,
+// A right-handed orthonormal frame around a unit normal, for working on a
+// surface as though it lay flat with its normal along +z.
+struct Frame {
+    t: vec3f,
+    b: vec3f,
+    n: vec3f,
 }
 
-// The probability a dielectric reflects rather than refracts, by Schlick's
-// approximation. Glass at a glancing angle turns into a mirror, and this is what
-// makes it do that.
-fn schlick_reflectance(cosine: f32, ratio: f32) -> f32 {
-    var r0 = (1.0 - ratio) / (1.0 + ratio);
-    r0 = r0 * r0;
-    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
-}
-
-// Where the ray goes next, and what the surface takes out of it on the way.
+// Duff et al., "Building an Orthonormal Basis, Revisited" (JCGT 2017).
 //
-// A light never reaches here — the path terminates on one — so this is the three
-// scattering models. All of them are sampled proportionally to their own lobe,
-// which is why the attenuation is the plain albedo rather than a BRDF over a
-// pdf.
-fn scatter(ray: Ray, hit: Intersection, material: Material) -> Scatter {
-    let normal = hit.normal;
+// Branchless and continuous everywhere except across the z = 0 plane, where the
+// sign flips — which is exactly where the older Frisvad construction divides by
+// zero at n = -z instead. `select` rather than `sign`, because `sign(0.0)` is
+// zero and would put that same division right back.
+fn orthonormal_basis(n: vec3f) -> Frame {
+    let s = select(-1.0, 1.0, n.z >= 0.0);
+    let a = -1.0 / (s + n.z);
+    let b = n.x * n.y * a;
 
-    if material.kind == METAL {
-        // A perfect mirror, roughened by nudging the reflected direction around
-        // inside a sphere whose radius is the roughness.
-        let reflected = reflect(ray.direction, normal)
-            + material.parameter * sample_sphere();
-        let direction = normalize(reflected);
-
-        // Enough roughness can push the bounce below the surface, where it would
-        // otherwise travel through the object it just left. Those rays are
-        // absorbed.
-        return Scatter(
-            material.color,
-            Ray(point_on_ray(ray, hit.t), direction),
-            dot(direction, normal) > 0.0,
-        );
-    }
-
-    if material.kind == DIELECTRIC {
-        // `parameter` is the index of refraction, quoted against the air the
-        // scene is otherwise made of; leaving the surface inverts it.
-        let ratio = select(material.parameter, 1.0 / material.parameter, hit.front_face);
-        let cosine = min(dot(-ray.direction, normal), 1.0);
-        let sine = sqrt(max(1.0 - cosine * cosine, 0.0));
-
-        // Past the critical angle there is no refracted direction at all, and
-        // below it Schlick decides how often light reflects anyway.
-        let must_reflect = ratio * sine > 1.0;
-        let direction = select(
-            refract(ray.direction, normal, ratio),
-            reflect(ray.direction, normal),
-            must_reflect || schlick_reflectance(cosine, ratio) > rand_f32(),
-        );
-
-        return Scatter(
-            material.color,
-            Ray(point_on_ray(ray, hit.t), normalize(direction)),
-            true,
-        );
-    }
-
-    // Lambertian: a cosine-weighted direction about the normal, drawn as the
-    // normal plus a point on the unit sphere. Shrinking that sphere a hair keeps
-    // the sum away from zero, so the result is always a direction.
-    let direction = normal + sample_sphere() * (1.0 - EPSILON);
-
-    return Scatter(
-        material.color,
-        Ray(point_on_ray(ray, hit.t), normalize(direction)),
-        true,
+    return Frame(
+        vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x),
+        vec3f(b, s + n.y * n.y * a, -n.y),
+        n,
     );
+}
+
+fn to_local(frame: Frame, v: vec3f) -> vec3f {
+    return vec3f(dot(v, frame.t), dot(v, frame.b), dot(v, frame.n));
+}
+
+fn to_world(frame: Frame, v: vec3f) -> vec3f {
+    return frame.t * v.x + frame.b * v.y + frame.n * v.z;
+}
+
+// One direction drawn from a surface's BSDF, and what the path needs to carry
+// on along it.
+struct BsdfSample {
+    // Unit direction the path continues along.
+    wi: vec3f,
+    // `f(wo, wi) * |n·wi| / pdf`: what throughput is multiplied by.
+    weight: vec3f,
+    // Solid-angle density of `wi`. Meaningless when `delta`.
+    pdf: f32,
+    // True when `wi` came from a lobe with no density (mirror, smooth glass,
+    // legacy metal). The next emitter hit keeps its full contribution, and no
+    // light sample was taken against this lobe.
+    delta: bool,
+    // False when the surface absorbed the ray.
+    valid: bool,
+}
+
+// A BSDF priced at a direction something other than the BSDF chose — a light
+// sample, most often.
+struct BsdfEval {
+    // `f(wo, wi) * |n·wi|`, i.e. already cosine-weighted.
+    value: vec3f,
+    // Solid-angle density `bsdf_sample` would have drawn `wi` with.
+    pdf: f32,
+}
+
+// GGX's alpha, from the roughness a scene is written in. Squared, as Blender
+// does, so that a sweep of roughness reads as an even sweep of blur; floored so
+// that a roughness of zero still names a distribution rather than a division by
+// zero. Anything under `DELTA_ALPHA` is sampled as a mirror anyway.
+fn ggx_alpha(roughness: f32) -> f32 {
+    return max(roughness * roughness, 1e-4);
+}
+
+// Whether the surface has any lobe a light sample could be weighed against.
+// Next event estimation is wasted on a surface without one: `bsdf_eval` would
+// price every light direction at zero.
+//
+// A principled surface always has one unless its microfacet lobes are mirrors
+// and there is no diffuse underneath them to speak of — which is clear glass,
+// and polished metal.
+fn has_smooth_lobe(material: Material) -> bool {
+    if material.kind != PRINCIPLED {
+        return false;
+    }
+
+    let rough = ggx_alpha(material.roughness) >= DELTA_ALPHA;
+    let diffuse = (1.0 - material.metallic) * (1.0 - material.transmission) * luminance(material.color);
+    return rough || diffuse > 0.0;
+}
+
+// GGX alpha above which a microfacet lobe blurs enough to count as a surface
+// for the denoiser rather than a reflection of one — Cycles' threshold, at a
+// roughness of about 0.27.
+const ROUGH_ALPHA: f32 = 0.075;
+
+// Whether a denoiser should file a path under this surface, or look through it
+// to whatever the path finds next. Cycles' rule: a lobe is non-specular if it is
+// diffuse or rough, and a surface is captured once those make up a quarter of
+// its weight.
+//
+// Metal, specular and glass share one roughness, so they are all rough or all
+// sharp together, and the weights of every lobe add to one.
+fn is_opaque(material: Material) -> bool {
+    if material.kind == LIGHT {
+        return true;
+    }
+
+    let rough = ggx_alpha(material.roughness) > ROUGH_ALPHA;
+    let diffuse = (1.0 - material.metallic) * (1.0 - material.transmission);
+    // Diffuse is always non-specular. When rough, metal, specular and glass are
+    // too, so every lobe counts.
+    let non_specular = select(diffuse, 1.0, rough);
+    return non_specular >= 0.25;
+}
+
+// The fraction of light a smooth dielectric boundary reflects, unpolarized and
+// exact rather than Schlick's fit. `eta` is the index on the far side over the
+// index on the near one, and `cosine` is measured on the near side.
+//
+// Glass at a glancing angle turns into a mirror, and this is what makes it do
+// that; past the critical angle on the way out it is one outright.
+//
+// An index of one is answered before any arithmetic. It is zero exactly, and it
+// has to be: the lambertian preset is a principled surface at that index, and a
+// reflectance that rounded to a hair above zero would hand its specular lobe a
+// share of the lobe selection — and a draw from the RNG — that it never had.
+fn fresnel_dielectric(cosine: f32, eta: f32) -> f32 {
+    if eta == 1.0 {
+        return 0.0;
+    }
+
+    let cos_i = clamp(cosine, 0.0, 1.0);
+    let sin2_t = (1.0 - cos_i * cos_i) / (eta * eta);
+    // Total internal reflection.
+    if sin2_t >= 1.0 {
+        return 1.0;
+    }
+    let cos_t = sqrt(1.0 - sin2_t);
+
+    let parallel = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+    let perpendicular = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+    return 0.5 * (parallel * parallel + perpendicular * perpendicular);
+}
+
+// A conductor's reflectance by Schlick's approximation, from its color at normal
+// incidence. Blender fits an F82 tint on top of this; it is close enough without.
+fn fresnel_schlick(f0: vec3f, cosine: f32) -> vec3f {
+    let m = clamp(1.0 - cosine, 0.0, 1.0);
+    let m2 = m * m;
+    return f0 + (vec3f(1.0) - f0) * (m2 * m2 * m);
+}
+
+// The GGX (Trowbridge-Reitz) distribution of microfacet normals, for a normal
+// `m` in the local frame above the surface.
+//
+// Written with `sin²` from the tangent components rather than as `1 - cos²`. At
+// the small alphas just above the mirror cutoff the whole distribution sits
+// within a milliradian of the pole, where `1 - cos²` has already rounded away
+// every digit that says where in it `m` is.
+fn ggx_d(m: vec3f, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let sin2 = m.x * m.x + m.y * m.y;
+    let t = sin2 + a2 * m.z * m.z;
+    return a2 / (PI * t * t);
+}
+
+// Smith's auxiliary function for GGX: how much of the microsurface facing `v`
+// is hidden behind other microfacets. `G1 = 1 / (1 + Λ)`.
+fn ggx_lambda(v: vec3f, alpha: f32) -> f32 {
+    let cos2 = max(v.z * v.z, 1e-12);
+    let tan2 = (v.x * v.x + v.y * v.y) / cos2;
+    return 0.5 * (sqrt(1.0 + alpha * alpha * tan2) - 1.0);
+}
+
+// A microfacet normal drawn in proportion to how much of it `wo` can see: Dupuy
+// and Benyoub's spherical-cap form of Heitz's visible normal sampling.
+//
+// Stretching the configuration by alpha turns the GGX ellipsoid into a unit
+// hemisphere, whose visible normals are a uniform cap of the sphere offset by
+// the view direction. Unstretching the result is the transform for a normal,
+// which is why alpha scales the tangent components rather than dividing them.
+fn sample_ggx_vndf(wo: vec3f, alpha: f32, u: vec2f) -> vec3f {
+    let stretched = normalize(vec3f(wo.xy * alpha, wo.z));
+
+    let phi = TWO_PI * u.x;
+    let z = (1.0 - u.y) * (1.0 + stretched.z) - stretched.z;
+    let sin_theta = sqrt(clamp(1.0 - z * z, 0.0, 1.0));
+    let h = vec3f(sin_theta * cos(phi), sin_theta * sin(phi), z) + stretched;
+
+    return normalize(vec3f(h.xy * alpha, max(h.z, 0.0)));
+}
+
+// How often `bsdf_sample` picks each of a principled surface's lobes, decided
+// from `wo` alone so that `bsdf_eval` can reproduce it for any `wi`.
+struct Lobes {
+    metal: f32,
+    specular: f32,
+    glass: f32,
+    diffuse: f32,
+}
+
+// The least share of the selection a lobe with any weight at all is given, as a
+// fraction of the total. A dim lobe picked in proportion to its weight is found
+// so rarely that every find is a firefly.
+const MIN_LOBE_SHARE: f32 = 0.05;
+
+// Each lobe's chance is roughly the light it sends back toward `wo`: the metal by
+// its Fresnel color, the specular coat by the dielectric reflectance, the glass
+// by its whole share of the surface — it reflects or transmits nearly all of
+// what reaches it — and the diffuse by what the coat lets through. All zero for
+// a surface that scatters nothing at all.
+//
+// The metal is weighed by its Fresnel term rather than its base color alone. A
+// black conductor still turns into a mirror at a glancing angle, and a lobe with
+// no chance of being sampled would lose that light outright.
+fn lobe_probabilities(material: Material, cos_o: f32) -> Lobes {
+    let dielectric = 1.0 - material.metallic;
+    let opaque = dielectric * (1.0 - material.transmission);
+    let fresnel = fresnel_dielectric(cos_o, material.ior);
+    let weights = vec4f(
+        material.metallic * luminance(fresnel_schlick(material.color, cos_o)),
+        opaque * fresnel,
+        dielectric * material.transmission,
+        opaque * (1.0 - fresnel) * luminance(material.color),
+    );
+
+    let total = weights.x + weights.y + weights.z + weights.w;
+    if total <= 0.0 {
+        return Lobes(0.0, 0.0, 0.0, 0.0);
+    }
+
+    // A lobe alone keeps a chance of exactly one: `w / w` does not round.
+    let floored = select(vec4f(0.0), max(weights, vec4f(MIN_LOBE_SHARE * total)), weights > vec4f(0.0));
+    let p = floored / (floored.x + floored.y + floored.z + floored.w);
+    return Lobes(p.x, p.y, p.z, p.w);
+}
+
+// The index of refraction across the surface in the direction the path is
+// travelling: what lies beyond it over what lies in front. Quoted against the
+// air the scene is otherwise made of, so leaving an object inverts it.
+fn relative_ior(material: Material, hit: Intersection) -> f32 {
+    return select(1.0 / material.ior, material.ior, hit.front_face);
+}
+
+// Whether the glass lobe has no density: a mirror, or an index of one, where
+// every refraction goes straight through undeviated whatever microfacet it
+// found.
+fn smooth_glass(alpha: f32, eta: f32) -> bool {
+    return alpha < DELTA_ALPHA || eta == 1.0;
+}
+
+// The value and density of a principled surface's non-delta lobes, for two
+// directions in its local frame. `value` is `f * |cos(wi)|`, and `eta` is
+// `relative_ior`.
+//
+// Blender's layering reduced to four lobes: a GGX conductor weighed by
+// `metallic`, and under `1 - metallic` a blend by `transmission` of GGX glass
+// against a GGX dielectric coat over a diffuse base that gets whatever the coat
+// lets through. Scaling the diffuse by `1 - F(wo)` is not reciprocal, which a
+// path traced only from the camera never notices.
+//
+// The opaque lobes always see air on both faces — a surface that does not
+// transmit has no inside to be in — so only the glass reads `eta`, and the rest
+// read the index as written.
+//
+// The density is the one-sample mixture: every non-delta lobe's density at `wi`,
+// weighed by how often that lobe is picked. That is what makes `value / pdf` the
+// right weight whichever lobe actually drew the direction.
+fn principled_eval(material: Material, lobes: Lobes, eta: f32, wo: vec3f, wi: vec3f) -> BsdfEval {
+    let cos_o = wo.z;
+    let cos_i = wi.z;
+    // `wo` is on the side the normal faces by construction. Exactly tangent is
+    // neither side, and has no density to give anything.
+    if cos_o <= 0.0 || cos_i == 0.0 {
+        return BsdfEval(vec3f(0.0), 0.0);
+    }
+
+    let dielectric = 1.0 - material.metallic;
+    let glass = dielectric * material.transmission;
+    let alpha = ggx_alpha(material.roughness);
+    let lambda_o = ggx_lambda(wo, alpha);
+
+    if cos_i < 0.0 {
+        // Through the surface, which only rough glass can price.
+        if smooth_glass(alpha, eta) || lobes.glass <= 0.0 {
+            return BsdfEval(vec3f(0.0), 0.0);
+        }
+        return rough_transmission(material, alpha, eta, lambda_o, wo, wi, glass, lobes.glass);
+    }
+
+    let opaque = dielectric * (1.0 - material.transmission);
+    let coat = 1.0 - fresnel_dielectric(cos_o, material.ior);
+    var value = material.color * (opaque * coat * cos_i / PI);
+    var pdf = lobes.diffuse * cos_i / PI;
+
+    if alpha >= DELTA_ALPHA {
+        // Both directions are above the surface, so the half vector is too.
+        let m = normalize(wo + wi);
+        let cos_m = dot(wo, m);
+
+        let d = ggx_d(m, alpha);
+        // Height-correlated masking and shadowing.
+        let g2 = 1.0 / (1.0 + lambda_o + ggx_lambda(wi, alpha));
+
+        // `D G2 F / (4 cos_o cos_i)` times `cos_i`, less the Fresnel term the
+        // three reflecting lobes differ by. Glass at an index of one reflects
+        // nothing, so it needs no guard of its own here.
+        let microfacet = d * g2 / (4.0 * cos_o);
+        let reflectance = fresnel_dielectric(cos_m, eta);
+        let fresnel = material.metallic * fresnel_schlick(material.color, cos_m)
+            + vec3f(opaque * fresnel_dielectric(cos_m, material.ior) + glass * reflectance);
+        value += fresnel * microfacet;
+
+        // The visible normal density `G1(wo) max(0, wo·m) D / cos_o`, through
+        // the reflection's Jacobian `1 / (4 wo·m)`. Glass only reflects the
+        // `F` of the time; the rest of its draws refract.
+        let reflected = d / ((1.0 + lambda_o) * 4.0 * cos_o);
+        pdf += (lobes.metal + lobes.specular + lobes.glass * reflectance) * reflected;
+    }
+
+    return BsdfEval(value, pdf);
+}
+
+// Rough glass's refraction lobe, after Walter et al. 2007 and pbrt-v4's
+// `DielectricBxDF`, for a `wi` below the surface. `glass` is the lobe's share
+// of the surface and `chance` how often it is picked.
+//
+// The microfacet that refracts `wo` into `wi` is the generalized half vector
+// `wo + eta wi`, turned to face the outside. Radiance crossing the boundary is
+// left unscaled by `1 / eta²`: every glass object here is closed, so what a path
+// gains going in it gives back coming out.
+fn rough_transmission(
+    material: Material,
+    alpha: f32,
+    eta: f32,
+    lambda_o: f32,
+    wo: vec3f,
+    wi: vec3f,
+    glass: f32,
+    chance: f32,
+) -> BsdfEval {
+    let half = normalize(wo + wi * eta);
+    let m = select(half, -half, half.z < 0.0);
+
+    // A facet `wo` cannot see, or one `wi` would have to reach from its front.
+    let cos_om = dot(wo, m);
+    let cos_im = dot(wi, m);
+    if cos_om <= 0.0 || cos_im >= 0.0 {
+        return BsdfEval(vec3f(0.0), 0.0);
+    }
+
+    let d = ggx_d(m, alpha);
+    let g2 = 1.0 / (1.0 + lambda_o + ggx_lambda(wi, alpha));
+    let transmitted = 1.0 - fresnel_dielectric(cos_om, eta);
+
+    // The refraction's Jacobian `|wi·m| / (wi·m + wo·m / eta)²`. The sum is
+    // `(2 wo·wi + eta + 1 / eta) / |wo + eta wi|`, which is only zero at an
+    // index of one — ruled out before this is reached.
+    let s = cos_im + cos_om / eta;
+    let jacobian = -cos_im / (s * s);
+
+    // `f |cos_i| = D G2 (1 - F) |wi·m| |wo·m| / (cos_o denom)`.
+    let value = material.color * (glass * d * g2 * transmitted * cos_om * jacobian / wo.z);
+    let visible = d * cos_om / ((1.0 + lambda_o) * wo.z);
+    return BsdfEval(value, chance * transmitted * visible * jacobian);
+}
+
+fn absorbed() -> BsdfSample {
+    return BsdfSample(vec3f(0.0), vec3f(0.0), 0.0, false, false);
+}
+
+fn delta_sample(wi: vec3f, weight: vec3f) -> BsdfSample {
+    return BsdfSample(normalize(wi), weight, 0.0, true, true);
+}
+
+// Where the path goes next, and what the surface takes out of it on the way.
+//
+// `wo` points away from the surface, back along the way the path came. A light
+// never reaches here — the path terminates on one.
+fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
+    let normal = hit.normal;
+    let frame = orthonormal_basis(normal);
+    let local_o = to_local(frame, wo);
+    let lobes = lobe_probabilities(material, local_o.z);
+    if local_o.z <= 0.0 || lobes.metal + lobes.specular + lobes.glass + lobes.diffuse <= 0.0 {
+        return absorbed();
+    }
+
+    // Which lobe draws the direction. A surface with only one possible lobe does
+    // not roll for it, which keeps the lambertian preset on the exact random
+    // stream it drew before it became a principled surface.
+    let possible = u32(lobes.metal > 0.0) + u32(lobes.specular > 0.0) + u32(lobes.glass > 0.0)
+        + u32(lobes.diffuse > 0.0);
+    var pick = 0.0;
+    if possible > 1u {
+        pick = rand_f32();
+    }
+
+    let alpha = ggx_alpha(material.roughness);
+    let eta = relative_ior(material, hit);
+    let cos_o = local_o.z;
+
+    // Whether the direction drawn is meant to go through the surface rather
+    // than back off it.
+    var direction: vec3f;
+    var through = false;
+    // The thresholds are summed in floats, and only the single-lobe case is
+    // exact — three shares that came from one division can total a hair under
+    // one. So each branch also takes the sliver past its end when no later
+    // lobe exists to claim it, rather than letting a draw in it fall through
+    // to a lobe this surface does not have and be priced as one it does.
+    let smooth_end = lobes.metal + lobes.specular;
+    let glass_end = smooth_end + lobes.glass;
+    if pick < smooth_end || (lobes.glass <= 0.0 && lobes.diffuse <= 0.0) {
+        if alpha < DELTA_ALPHA {
+            // A mirror. It has no density to weigh against the other lobes, so
+            // the weight is this lobe's own `f * cos / pdf` — its reflectance —
+            // over the chance it was picked.
+            var weight: vec3f;
+            if pick < lobes.metal {
+                weight = material.metallic * fresnel_schlick(material.color, cos_o) / lobes.metal;
+            } else {
+                let opaque = (1.0 - material.metallic) * (1.0 - material.transmission);
+                weight = vec3f(opaque * fresnel_dielectric(cos_o, material.ior) / lobes.specular);
+            }
+            return delta_sample(reflect(-wo, normal), weight);
+        }
+
+        let m = sample_ggx_vndf(local_o, alpha, vec2f(rand_f32(), rand_f32()));
+        direction = normalize(to_world(frame, reflect(-local_o, m)));
+    } else if pick < glass_end || lobes.diffuse <= 0.0 {
+        // Glass reflects the Fresnel fraction of the time and refracts the rest,
+        // so choosing between the two in that proportion leaves a weight of one
+        // for either, less the tint on what goes through.
+        let share = (1.0 - material.metallic) * material.transmission / lobes.glass;
+
+        if smooth_glass(alpha, eta) {
+            // Past the critical angle the reflectance is one and there is no
+            // refracted direction at all. The draw comes first so that it is
+            // taken either way, and the zero `refract` hands back at the edge of
+            // total internal reflection is caught even where rounding has left
+            // the reflectance a hair below one.
+            let refracted = refract(-wo, normal, 1.0 / eta);
+            if rand_f32() < fresnel_dielectric(cos_o, eta) || all(refracted == vec3f(0.0)) {
+                return delta_sample(reflect(-wo, normal), vec3f(share));
+            }
+            return delta_sample(refracted, material.color * share);
+        }
+
+        let m = sample_ggx_vndf(local_o, alpha, vec2f(rand_f32(), rand_f32()));
+        if rand_f32() < fresnel_dielectric(dot(local_o, m), eta) {
+            direction = normalize(to_world(frame, reflect(-local_o, m)));
+        } else {
+            direction = normalize(to_world(frame, refract(-local_o, m, 1.0 / eta)));
+            through = true;
+        }
+    } else {
+        // Diffuse: a cosine-weighted direction about the normal, drawn as the
+        // normal plus a point on the unit sphere. Shrinking that sphere a hair
+        // keeps the sum away from zero, so the result is always a direction.
+        direction = normalize(normal + sample_sphere() * (1.0 - EPSILON));
+    }
+
+    // A microfacet can reflect below the horizon, where the ray would travel
+    // into the object it just left, and a refraction off a grazing enough facet
+    // can come out on the side it went in from. Both are absorbed, and have to
+    // be here rather than left to the density: `principled_eval` prices a
+    // direction by the side it is on, and would price either one as the other
+    // lobe. Anything that came out of the arithmetic as a NaN fails the test
+    // on the density below, and is absorbed with them.
+    let local_i = to_local(frame, direction);
+    if (local_i.z < 0.0) != through {
+        return absorbed();
+    }
+    let eval = principled_eval(material, lobes, eta, local_o, local_i);
+    if !(eval.pdf > 0.0) {
+        return absorbed();
+    }
+
+    return BsdfSample(direction, eval.value / eval.pdf, eval.pdf, false, true);
+}
+
+// The value and density of the surface's non-delta lobes at `wi`, both pointing
+// away from the surface. A delta lobe has no density to evaluate: the chance a
+// direction chosen by anything else lands exactly on it is zero, so it prices
+// every direction at nothing.
+fn bsdf_eval(material: Material, hit: Intersection, wo: vec3f, wi: vec3f) -> BsdfEval {
+    if material.kind != PRINCIPLED {
+        return BsdfEval(vec3f(0.0), 0.0);
+    }
+
+    // A zero pdf is what tells a light sample in a direction the surface does
+    // not scatter into — behind an opaque one, most often — not to bother with
+    // a shadow ray.
+    let frame = orthonormal_basis(hit.normal);
+    let local_o = to_local(frame, wo);
+    let lobes = lobe_probabilities(material, local_o.z);
+    return principled_eval(material, lobes, relative_ior(material, hit), local_o, to_local(frame, wi));
 }
 
 // The ray through `pixel` for this sample: jittered inside the pixel so that
@@ -856,19 +1316,23 @@ fn light_density(emit: vec3f, distance: f32, cosine: f32) -> f32 {
 }
 
 // The density with which [`sample_light`] would have produced a direction, given
-// that following it landed on `hit`.
+// that following it landed on `hit`, `distance` from the vertex that chose it.
 //
 // Only the emitter a ray reaches first matters: anything behind it is occluded,
 // so a shadow ray aimed there returns nothing and that draw contributes zero.
-fn light_pdf(hit: Intersection, direction: vec3f) -> f32 {
+//
+// The distance is not `hit.t`. It is whenever the ray came straight from the
+// vertex, but a ray that passed through a cutout on the way was re-cast from
+// there, and its `t` measures only the last stretch.
+fn light_pdf(hit: Intersection, direction: vec3f, distance: f32) -> f32 {
     let tri = triangles[hit.triangle];
     let material = materials[hit.material];
     let cosine = emitted_cosine(tri, direction);
 
-    // Directions are unit, so `hit.t` is the distance to the emitter. An emitter
-    // arrived at from behind prices at zero here, which is the half of sidedness
-    // that is easy to forget and the half that keeps the heuristic consistent.
-    return light_density(material.color, hit.t, cosine);
+    // An emitter arrived at from behind prices at zero here, which is the half
+    // of sidedness that is easy to forget and the half that keeps the heuristic
+    // consistent.
+    return light_density(material.color, distance, cosine);
 }
 
 // The entry whose slice of the table a uniform draw lands in: the first whose
@@ -1110,19 +1574,26 @@ fn sample_sky() -> SkySample {
 // pixel keeps that dot until the average catches up. A shadow ray finds it every
 // time, and what it brings back varies only with visibility.
 //
-// Lambertian only. The other two models are sampled from lobes narrow enough
-// that a random direction already lands near the light — and neither has a
-// density this could weigh a light sample against, since both are sampled by
-// construction rather than from a distribution anyone wrote down.
+// Only worth calling on a surface with a smooth lobe (`has_smooth_lobe`). A
+// delta lobe is priced at zero by `bsdf_eval`, and scattering already finds the
+// light along it every time.
 //
 // The caller has to have checked that there is a light to sample: with none,
 // `sample_light` has nothing to pick from.
-fn direct_light(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
+fn direct_light(point: vec3f, hit: Intersection, material: Material, wo: vec3f) -> vec3f {
     let light = sample_light(point);
+    if !(light.pdf > 0.0) {
+        return vec3f(0.0);
+    }
 
-    // Behind the surface, or a degenerate emitter.
-    let cosine = dot(normal, light.direction);
-    if light.pdf <= 0.0 || cosine <= 0.0 {
+    // A zero pdf covers a light behind the surface as well as a lobe that could
+    // never have scattered this way, and either one saves the shadow ray.
+    //
+    // Written as the negation of the test that has to pass, the way
+    // `bsdf_sample` writes it, so that a NaN density is caught here and not
+    // carried into the heuristic — `pdf <= 0.0` is false for one.
+    let bsdf = bsdf_eval(material, hit, wo, light.direction);
+    if !(bsdf.pdf > 0.0) {
         return vec3f(0.0);
     }
 
@@ -1134,10 +1605,10 @@ fn direct_light(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
     // the heuristic splits the contribution between the two strategies. Near a
     // large emitter scattering is the better one and keeps most of it; for the
     // small bright light that made the fireflies, this sample keeps nearly all.
-    let weight = power_heuristic(light.pdf, cosine / PI);
+    let weight = power_heuristic(light.pdf, bsdf.pdf);
 
-    // The lambertian brdf is `albedo / PI`, and the estimator is `f * cos / pdf`.
-    return light.radiance * albedo * cosine * weight / (PI * light.pdf);
+    // The estimator is `f * cos / pdf`, and `bsdf.value` is already `f * cos`.
+    return light.radiance * bsdf.value * weight / light.pdf;
 }
 
 // The same thing for the sky, which is an emitter here as much as a triangle is.
@@ -1157,12 +1628,18 @@ fn direct_light(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
 // own two-way contest against scattering and neither one's weight has anything
 // to say about the other's. A surface under both pays for two shadow rays, which
 // is the honest price of sampling two things.
-fn direct_sky(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
+fn direct_sky(point: vec3f, hit: Intersection, material: Material, wo: vec3f) -> vec3f {
     let sky = sample_sky();
 
-    // Behind the surface, or a direction the distribution gives no weight to.
-    let cosine = dot(normal, sky.direction);
-    if sky.pdf <= 0.0 || cosine <= 0.0 {
+    // A direction the distribution gives no weight to.
+    if !(sky.pdf > 0.0) {
+        return vec3f(0.0);
+    }
+
+    // Or one the surface does not scatter into, behind it included. Negated
+    // like `direct_light`'s, and for the same reason: a NaN fails it.
+    let bsdf = bsdf_eval(material, hit, wo, sky.direction);
+    if !(bsdf.pdf > 0.0) {
         return vec3f(0.0);
     }
 
@@ -1173,9 +1650,9 @@ fn direct_sky(point: vec3f, normal: vec3f, albedo: vec3f) -> vec3f {
         return vec3f(0.0);
     }
 
-    let weight = power_heuristic(sky.pdf, cosine / PI);
+    let weight = power_heuristic(sky.pdf, bsdf.pdf);
 
-    return sky.radiance * albedo * cosine * weight / (PI * sky.pdf);
+    return sky.radiance * bsdf.value * weight / sky.pdf;
 }
 
 // Follows one path from the camera until it reaches a light, escapes the scene,
@@ -1196,6 +1673,15 @@ fn trace_path(primary: Ray) -> Path {
     // sum of the segments before it plus that.
     var traveled = 0.0;
 
+    // How far the ray has come since the vertex that chose its direction.
+    // Usually that is just `hit.t`; a pass-through re-casts the ray from the
+    // cutout, and the stretch before it has to be remembered to price an
+    // emitter from where the direction was actually drawn.
+    var segment = 0.0;
+
+    // Surfaces passed through by their alpha, against `MAX_TRANSPARENT`.
+    var passes = 0u;
+
     // How the current direction was chosen, which is what decides how much of an
     // emitter this ray is allowed to keep. A camera ray counts as specular:
     // nothing sampled it, so no other strategy could have found it and there is
@@ -1203,7 +1689,10 @@ fn trace_path(primary: Ray) -> Path {
     var scatter_pdf = 0.0;
     var specular = true;
 
-    for (var bounce = 0u; bounce <= camera.max_bounces; bounce += 1u) {
+    // A `while` and not a `for`, so that a pass-through can `continue` without
+    // spending a bounce.
+    var bounce = 0u;
+    while bounce <= camera.max_bounces {
         let hit = intersect_scene(ray);
         if hit.t < 0.0 {
             // Nothing was hit, so the path escapes and the sky lights it.
@@ -1225,6 +1714,26 @@ fn trace_path(primary: Ray) -> Path {
 
         let material = materials[hit.material];
 
+        // Coverage. With probability `1 - alpha` the surface is not there: the
+        // ray carries on from it undeviated, and nothing about the path
+        // changes — not the throughput, and not how its direction was chosen,
+        // so whatever it lands on next is weighed against the vertex that
+        // actually sampled it. It is not a feature either: the denoiser should
+        // see what the path stopped on.
+        //
+        // The roll is only taken below one, so an opaque scene keeps exactly
+        // the random stream it drew before alpha existed.
+        if material.alpha < 1.0 && rand_f32() >= material.alpha {
+            ray = Ray(point_on_ray(ray, hit.t), ray.direction);
+            segment += hit.t;
+            traveled += hit.t;
+            passes += 1u;
+            if passes > MAX_TRANSPARENT {
+                break;
+            }
+            continue;
+        }
+
         // The surface a denoiser gets to steer by, and it is deliberately not
         // the first one the ray met. Following melee's glass torus through to
         // the diffuse floor behind it hands over an edge that is really there;
@@ -1234,16 +1743,18 @@ fn trace_path(primary: Ray) -> Path {
         // So: the first opaque hit, and the first hit of any kind as a fallback
         // for a path that never finds one — a ray that leaves through the far
         // side of a dielectric and escapes still has to be filed under
-        // something. An emitter counts as a surface too and ends the search the
-        // same way a diffuse one does, which is why it is named here and why
+        // something. "Opaque" is `is_opaque`: diffuse or rough enough that what
+        // it reflects is a blur rather than a picture, so a polished metal is
+        // looked through the way glass is. An emitter counts as a surface too
+        // and ends the search the same way a diffuse one does, which is why
         // this sits ahead of the `LIGHT` branch below rather than after it: a
         // light seen through glass is as much a surface behind that glass as a
         // floor is. Nothing sets `captured` for it because that branch returns.
-        let opaque = material.kind == LAMBERTIAN || material.kind == LIGHT;
+        let opaque = is_opaque(material);
         if !captured && (bounce == 0u || opaque) {
             features = Features(hit.normal, traveled + hit.t, material.color, i32(hit.material));
         }
-        captured = captured || material.kind == LAMBERTIAN;
+        captured = captured || opaque;
 
         if material.kind == LIGHT {
             // An emitter is where a path ends: it is the only thing in the scene
@@ -1266,7 +1777,7 @@ fn trace_path(primary: Ray) -> Path {
 
             var weight = 1.0;
             if !specular {
-                weight = power_heuristic(scatter_pdf, light_pdf(hit, ray.direction));
+                weight = power_heuristic(scatter_pdf, light_pdf(hit, ray.direction, segment + hit.t));
             }
             return Path(radiance + throughput * material.color * weight, features);
         }
@@ -1275,29 +1786,31 @@ fn trace_path(primary: Ray) -> Path {
         // wanders off to find whatever else this surface can see. Both kinds of
         // emitter, where a scene has both: the triangles in the light table, and
         // the sky.
-        if material.kind == LAMBERTIAN {
-            let point = point_on_ray(ray, hit.t);
+        let point = point_on_ray(ray, hit.t);
+        let wo = -ray.direction;
+        if has_smooth_lobe(material) {
             if camera.light_count > 0u {
-                radiance += throughput * direct_light(point, hit.normal, material.color);
+                radiance += throughput * direct_light(point, hit, material, wo);
             }
             if camera.sky_width > 0u {
-                radiance += throughput * direct_sky(point, hit.normal, material.color);
+                radiance += throughput * direct_sky(point, hit, material, wo);
             }
         }
 
-        let scattered = scatter(ray, hit, material);
-        if !scattered.bounced {
+        let scattered = bsdf_sample(material, hit, wo);
+        if !scattered.valid {
             break;
         }
 
-        // A cosine-weighted direction was drawn at `cos / PI`; the other two
-        // models did not draw from anything an emitter can be weighed against.
-        specular = material.kind != LAMBERTIAN;
-        scatter_pdf = dot(scattered.ray.direction, hit.normal) / PI;
+        // A delta lobe drew from nothing an emitter can be weighed against, so
+        // whatever it finds next keeps everything.
+        specular = scattered.delta;
+        scatter_pdf = scattered.pdf;
 
-        throughput *= scattered.attenuation;
-        ray = scattered.ray;
+        throughput *= scattered.weight;
+        ray = Ray(point, scattered.wi);
         traveled += hit.t;
+        segment = 0.0;
 
         // Russian roulette. Past the first few bounces a path is killed with
         // probability `1 - survival` and the survivors are divided by
@@ -1308,8 +1821,8 @@ fn trace_path(primary: Ray) -> Path {
         // The brightest channel is the survival probability: a throughput of
         // 0.73 across the board survives 73% of the time, which turns melee's
         // 64-bounce paths into about eight. Anything at or above one always
-        // survives and is never scaled, which is what keeps a dielectric — the
-        // one material that attenuates by nothing — walking the full path it
+        // survives and is never scaled, which is what keeps clear white glass —
+        // smooth enough to attenuate by nothing — walking the full path it
         // needs to.
         let survival = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
         if bounce >= MIN_ROULETTE_BOUNCE {
@@ -1324,6 +1837,8 @@ fn trace_path(primary: Ray) -> Path {
             // still is not worth bouncing further.
             break;
         }
+
+        bounce += 1u;
     }
 
     // Out of bounces, or absorbed: whatever it had gathered is all it gets.

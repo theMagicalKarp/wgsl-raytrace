@@ -52,6 +52,7 @@ jobs:
           - glass
           - melee
           - normals
+          - principled
           - stairs
           - teapot
           - tunnel
@@ -74,7 +75,7 @@ jobs:
           ./target/release/wgsl-raytrace
           --config "examples/$CONFIG/render.toml"
           --output ./render/render.png
-          --samples 10
+          --samples 64
           --denoise
           --debug ./render
       - uses: actions/upload-artifact@v7.0.1
