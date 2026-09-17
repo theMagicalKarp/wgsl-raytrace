@@ -1,7 +1,6 @@
 use crate::math;
 use crate::scene::GpuMaterial;
 use crate::scene::GpuTriangle;
-use crate::scene::material::LIGHT;
 use bytemuck::Pod;
 use bytemuck::Zeroable;
 
@@ -38,13 +37,15 @@ fn area(triangle: &GpuTriangle) -> f32 {
 }
 
 /// The power an emissive triangle puts into the scene, and what the table is
-/// built in proportion to. Anything that does not emit weighs nothing.
+/// built in proportion to. Any material can emit, and one that does not weighs
+/// nothing.
+///
+/// Emission is scaled by alpha, as the shader's `emitted` is: a surface that is
+/// only there a fraction of the time only emits that fraction on average, and
+/// one at alpha zero is never there and never drawn.
 fn power(triangle: &GpuTriangle, materials: &[GpuMaterial]) -> f32 {
-    let material = materials[triangle.material as usize];
-    match material.kind == LIGHT {
-        true => area(triangle) * luminance(material.color),
-        false => 0.0,
-    }
+    let material = &materials[triangle.material as usize];
+    area(triangle) * luminance(material.emission) * material.alpha
 }
 
 /// Builds the sampling table over `triangles`, and returns it with the total
@@ -105,6 +106,7 @@ pub(super) fn build(triangles: &[GpuTriangle], materials: &[GpuMaterial]) -> (Ve
 mod tests {
     use super::*;
     use crate::config::Material;
+    use crate::config::Principled;
     use crate::scene::testing::QUAD;
     use crate::scene::testing::triangles as load_triangles;
     use crate::scene::testing::wavefront;
@@ -183,6 +185,61 @@ mod tests {
 
         let red = 0.2126 / (0.2126 + 0.7152);
         assert!((table[0].cdf - red).abs() < 1e-5, "{table:?}");
+    }
+
+    /// A light is only a principled surface with emission, and any other
+    /// principled surface with emission is weighed by exactly the same rule:
+    /// its color times its strength.
+    #[test]
+    fn any_emissive_principled_surface_is_an_emitter() {
+        let (mut triangles, _) = quad(Material::Light { emit: [1.0; 3] });
+        let materials = vec![
+            GpuMaterial::from(&Material::Light { emit: [2.0; 3] }),
+            GpuMaterial::from(&Material::Principled(Principled {
+                emission_color: [0.5; 3],
+                emission_strength: 12.0,
+                ..Principled::default()
+            })),
+        ];
+        triangles[1].material = 1;
+
+        let (table, total) = build(&triangles, &materials);
+
+        assert_eq!(table.len(), 2, "{table:?}");
+        // Half a unit each, at luminances of two and six.
+        assert!((table[0].cdf - 0.25).abs() < 1e-5, "{table:?}");
+        assert!((total - 4.0).abs() < 1e-5, "{total}");
+    }
+
+    /// A partly transparent emitter is only there `alpha` of the time, so it
+    /// is weighed at `alpha` of its emission, and at alpha zero not at all.
+    #[test]
+    fn a_partly_transparent_emitter_weighs_its_alpha() {
+        let glow = |alpha| Principled {
+            emission_color: [1.0; 3],
+            emission_strength: 4.0,
+            alpha,
+            ..Principled::default()
+        };
+
+        let (triangles, materials) = quad(Material::Principled(glow(0.25)));
+        let (table, total) = build(&triangles, &materials);
+        assert_eq!(table.len(), 2, "{table:?}");
+        // Two half-unit triangles at a luminance of four, a quarter there.
+        assert!((total - 1.0).abs() < 1e-5, "{total}");
+
+        let (triangles, materials) = quad(Material::Principled(glow(0.0)));
+        assert_eq!(build(&triangles, &materials), (Vec::new(), 0.0));
+    }
+
+    #[test]
+    fn a_principled_surface_with_no_strength_does_not_emit() {
+        let (triangles, materials) = quad(Material::Principled(Principled {
+            emission_color: [5.0; 3],
+            ..Principled::default()
+        }));
+
+        assert_eq!(build(&triangles, &materials), (Vec::new(), 0.0));
     }
 
     #[test]

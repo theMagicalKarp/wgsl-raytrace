@@ -389,6 +389,16 @@ pub struct Principled {
     /// rather than a refraction.
     #[serde_inline_default(1.0)]
     pub alpha: f32,
+
+    /// The color of the light the surface gives off, scaled by
+    /// `emission_strength`. Emitted from the front face only.
+    #[serde_inline_default([1.0, 1.0, 1.0])]
+    pub emission_color: [f32; 3],
+
+    /// Radiance emitted, as a multiple of `emission_color`. Zero, the default,
+    /// emits nothing.
+    #[serde_inline_default(0.0)]
+    pub emission_strength: f32,
 }
 
 impl Default for Principled {
@@ -400,14 +410,17 @@ impl Default for Principled {
             ior: 1.5,
             transmission: 0.0,
             alpha: 1.0,
+            emission_color: [1.0, 1.0, 1.0],
+            emission_strength: 0.0,
         }
     }
 }
 
 /// The surface models the tracer knows how to scatter off of.
 ///
-/// Everything but a light is a [`Principled`] surface on the GPU. The other names are shorthand for one, kept because they read better in
-/// a scene than the handful of numbers they stand for.
+/// Everything is a [`Principled`] surface on the GPU. The other names are
+/// shorthand for one, kept because they read better in a scene than the handful
+/// of numbers they stand for.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(tag = "material", deny_unknown_fields)]
 pub enum Material {
@@ -438,8 +451,16 @@ impl fmt::Display for Material {
         match self {
             Material::Principled(p) => write!(
                 f,
-                "principled{:?} roughness {} metallic {} ior {} transmission {} alpha {}",
-                p.base_color, p.roughness, p.metallic, p.ior, p.transmission, p.alpha,
+                "principled{:?} roughness {} metallic {} ior {} transmission {} alpha {} \
+                 emission{:?} strength {}",
+                p.base_color,
+                p.roughness,
+                p.metallic,
+                p.ior,
+                p.transmission,
+                p.alpha,
+                p.emission_color,
+                p.emission_strength,
             ),
             Material::Lambertian { albedo } => write!(f, "lambertian{:?}", albedo),
             Material::Metal { albedo, roughness } => {
@@ -459,15 +480,26 @@ impl Material {
     /// Rejects the values a scene can spell but the BSDF cannot price: a
     /// roughness or metallic outside `[0, 1]` has no microfacet meaning, an
     /// index of refraction under one turns the Fresnel term inside out, and a
-    /// negative color is light taken out of nowhere. NaN fails every range.
+    /// negative color is light taken out of nowhere. NaN fails every range, and
+    /// an infinite color or strength is rejected too: TOML spells `inf`, and
+    /// the product `0 * inf` would hand the shader a NaN it accumulates forever.
     fn validate(&self) -> Result<(), String> {
         let unit = |name: &str, value: f32| match (0.0..=1.0).contains(&value) {
             true => Ok(()),
             false => Err(format!("{name} must be between 0 and 1, not {value}")),
         };
-        let color = |name: &str, value: [f32; 3]| match value.iter().all(|c| *c >= 0.0) {
+        let color =
+            |name: &str, value: [f32; 3]| match value.iter().all(|c| c.is_finite() && *c >= 0.0) {
+                true => Ok(()),
+                false => Err(format!(
+                    "{name} must be finite and non-negative, not {value:?}"
+                )),
+            };
+        let non_negative = |name: &str, value: f32| match value.is_finite() && value >= 0.0 {
             true => Ok(()),
-            false => Err(format!("{name} must be non-negative, not {value:?}")),
+            false => Err(format!(
+                "{name} must be finite and non-negative, not {value}"
+            )),
         };
         let ior = |name: &str, value: f32| match value >= 1.0 {
             true => Ok(()),
@@ -481,6 +513,8 @@ impl Material {
                 unit("metallic", p.metallic)?;
                 unit("transmission", p.transmission)?;
                 unit("alpha", p.alpha)?;
+                color("emission_color", p.emission_color)?;
+                non_negative("emission_strength", p.emission_strength)?;
                 ior("ior", p.ior)
             }
             Material::Lambertian { albedo } => color("albedo", *albedo),
@@ -1056,6 +1090,8 @@ emit = [3.0, 3.0, 3.0]"#,
                 ior: 1.5,
                 transmission: 0.0,
                 alpha: 1.0,
+                emission_color: [1.0, 1.0, 1.0],
+                emission_strength: 0.0,
             })
         );
         assert_eq!(
@@ -1068,7 +1104,8 @@ emit = [3.0, 3.0, 3.0]"#,
     fn a_principled_material_reads_every_field() {
         let source = with_material(
             "material = \"principled\"\nbase_color = [0.1, 0.2, 0.3]\n\
-             roughness = 0.25\nmetallic = 1.0\nior = 1.33\ntransmission = 0.75\nalpha = 0.4",
+             roughness = 0.25\nmetallic = 1.0\nior = 1.33\ntransmission = 0.75\nalpha = 0.4\n\
+             emission_color = [0.5, 0.6, 0.7]\nemission_strength = 2.5",
         );
         let config: Config = toml::from_str(&source).unwrap();
         let Object::Wavefront(wavefront) = &config.objects[0];
@@ -1082,6 +1119,8 @@ emit = [3.0, 3.0, 3.0]"#,
                 ior: 1.33,
                 transmission: 0.75,
                 alpha: 0.4,
+                emission_color: [0.5, 0.6, 0.7],
+                emission_strength: 2.5,
             })
         );
         assert!(
@@ -1117,6 +1156,27 @@ emit = [3.0, 3.0, 3.0]"#,
             ("material = \"principled\"\nalpha = nan", "alpha"),
             ("material = \"principled\"\nior = 0.9", "ior"),
             ("material = \"principled\"\nior = nan", "ior"),
+            (
+                "material = \"principled\"\nemission_color = [1.0, -1.0, 1.0]",
+                "emission_color",
+            ),
+            (
+                "material = \"principled\"\nemission_strength = -2.0",
+                "emission_strength",
+            ),
+            (
+                "material = \"principled\"\nemission_strength = nan",
+                "emission_strength",
+            ),
+            (
+                "material = \"principled\"\nemission_strength = inf",
+                "emission_strength",
+            ),
+            (
+                "material = \"principled\"\nemission_color = [1.0, inf, 1.0]",
+                "emission_color",
+            ),
+            ("material = \"light\"\nemit = [inf, 1.0, 1.0]", "emit"),
             (
                 "material = \"principled\"\nbase_color = [0.5, -0.1, 0.5]",
                 "base_color",

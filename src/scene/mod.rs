@@ -109,7 +109,6 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::material::LIGHT;
     use crate::scene::material::PRINCIPLED;
     use crate::scene::testing::triangles;
     use crate::scene::testing::wavefront;
@@ -192,7 +191,7 @@ mod tests {
         let emissive = scene
             .triangles
             .iter()
-            .filter(|t| scene.materials[t.material as usize].kind == LIGHT)
+            .filter(|t| scene.materials[t.material as usize].emission != [0.0; 3])
             .count();
         assert!(emissive > 0, "melee's light should have survived the load");
         assert_eq!(scene.lights.len(), emissive);
@@ -202,7 +201,10 @@ mod tests {
         // the config listed the objects in, and they ascend to exactly one.
         for entry in &scene.lights {
             let triangle = scene.triangles[entry.triangle as usize];
-            assert_eq!(scene.materials[triangle.material as usize].kind, LIGHT);
+            assert_ne!(
+                scene.materials[triangle.material as usize].emission,
+                [0.0; 3]
+            );
         }
         assert!(scene.lights.windows(2).all(|p| p[0].cdf <= p[1].cdf));
         assert_eq!(scene.lights.last().unwrap().cdf, 1.0);

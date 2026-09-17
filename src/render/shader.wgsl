@@ -28,7 +28,6 @@ const MAX_TRANSPARENT: u32 = 32u;
 
 // `Material.kind`, matching the constants in `scene/material.rs`.
 const PRINCIPLED: u32 = 0u;
-const LIGHT: u32 = 1u;
 
 // GGX alpha below which a microfacet lobe is treated as a perfect mirror. Past
 // here the distribution is a spike whose density no longer fits in a float, and
@@ -84,9 +83,9 @@ struct Camera {
     _pad2: u32,
 }
 
-// One surface, packed by `GpuMaterial`. `kind` selects which fields are read: a
-// principled surface reads all of them, and a light only `color`, which is its
-// emitted radiance.
+// One surface, packed by `GpuMaterial`. `kind` selects which fields are read,
+// and a principled surface — the only kind there is — reads all of them. A
+// light is one too: black, at an index of one, and emissive.
 struct Material {
     color: vec3f,
     kind: u32,
@@ -96,6 +95,9 @@ struct Material {
     transmission: f32,
     // Coverage: the chance a ray is stopped by the surface at all.
     alpha: f32,
+    // Radiance given off the front face, decided by the geometric normal. Zero
+    // for a surface that does not emit.
+    emission: vec3f,
 }
 
 // One triangle in world space, packed by `GpuTriangle`. A `vec3f` is 12 bytes
@@ -397,6 +399,18 @@ struct Features {
 struct Path {
     radiance: vec3f,
     features: Features,
+}
+
+// The colour a surface is filed under. A surface that scatters nothing has no
+// reflectance to speak of, and dividing its radiance by that would divide by the
+// filter's floor; its emission's hue, brightest channel at one, is the colour it
+// is seen as instead.
+fn feature_albedo(material: Material) -> vec3f {
+    let brightest = max(material.emission.r, max(material.emission.g, material.emission.b));
+    if scatters(material) || brightest <= 0.0 {
+        return material.color;
+    }
+    return material.emission / brightest;
 }
 
 fn no_features() -> Features {
@@ -747,15 +761,37 @@ fn ggx_alpha(roughness: f32) -> f32 {
     return max(roughness * roughness, 1e-4);
 }
 
+// Whether any of the surface's lobes has weight at any angle, which is whether a
+// path that reaches it can go anywhere afterwards. The angle-free form of
+// `lobe_probabilities`' weights: a metal's Fresnel color is never zero at a
+// glancing angle, and the dielectric reflectance is zero at every angle exactly
+// when the index is one.
+//
+// A light is the surface that fails this — black, at an index of one, and
+// neither metal nor glass — and so is any other perfect absorber.
+fn scatters(material: Material) -> bool {
+    if material.kind != PRINCIPLED {
+        return false;
+    }
+
+    let dielectric = 1.0 - material.metallic;
+    let opaque = dielectric * (1.0 - material.transmission);
+    return material.metallic > 0.0
+        || dielectric * material.transmission > 0.0
+        || (opaque > 0.0 && (material.ior != 1.0 || luminance(material.color) > 0.0));
+}
+
 // Whether the surface has any lobe a light sample could be weighed against.
 // Next event estimation is wasted on a surface without one: `bsdf_eval` would
 // price every light direction at zero.
 //
 // A principled surface always has one unless its microfacet lobes are mirrors
 // and there is no diffuse underneath them to speak of — which is clear glass,
-// and polished metal.
+// and polished metal — or it has no lobes worth the name at all. The roughness
+// of a surface that scatters nothing says nothing: a light is as rough as the
+// default, and a shadow ray from one would be wasted on every hit.
 fn has_smooth_lobe(material: Material) -> bool {
-    if material.kind != PRINCIPLED {
+    if !scatters(material) {
         return false;
     }
 
@@ -777,7 +813,9 @@ const ROUGH_ALPHA: f32 = 0.075;
 // Metal, specular and glass share one roughness, so they are all rough or all
 // sharp together, and the weights of every lobe add to one.
 fn is_opaque(material: Material) -> bool {
-    if material.kind == LIGHT {
+    // A surface that scatters nothing is where every path to reach it ends, so
+    // there is nothing behind it to look through to. A light is one.
+    if !scatters(material) {
         return true;
     }
 
@@ -1284,6 +1322,17 @@ fn emitted_cosine(tri: Triangle, direction: vec3f) -> f32 {
     return max(facing, 0.0);
 }
 
+// What an emitter gives off on average, which is what light sampling has to
+// price and return. A surface with an alpha below one is only there that
+// fraction of the time: a scattered ray rolls for it and collects the full
+// emission when it stays, `alpha` of it on average, and a shadow ray stops short
+// of the surface it aims at without rolling. Scaling here is what makes the two
+// strategies estimate the same thing, and it matches `power` in light.rs, which
+// the table and `camera.light_power` are built from.
+fn emitted(material: Material) -> vec3f {
+    return material.emission * material.alpha;
+}
+
 // The density with which [`sample_light`] draws a direction, per unit solid
 // angle, given the emitter it lands on and how that emitter is turned.
 //
@@ -1332,7 +1381,7 @@ fn light_pdf(hit: Intersection, direction: vec3f, distance: f32) -> f32 {
     // An emitter arrived at from behind prices at zero here, which is the half
     // of sidedness that is easy to forget and the half that keeps the heuristic
     // consistent.
-    return light_density(material.color, distance, cosine);
+    return light_density(emitted(material), distance, cosine);
 }
 
 // The entry whose slice of the table a uniform draw lands in: the first whose
@@ -1405,13 +1454,13 @@ fn sample_light(origin: vec3f) -> LightSample {
 
     var pdf = 0.0;
     if distance > 0.0 {
-        pdf = light_density(material.color, distance, cosine);
+        pdf = light_density(emitted(material), distance, cosine);
     }
 
     // An emitter with its back turned leaves `pdf` at zero, and
     // `direct_light` ends the draw on that before the shadow ray is cast — so
     // this is a traversal saving as much as it is a knob.
-    return LightSample(direction, distance, material.color, pdf);
+    return LightSample(direction, distance, emitted(material), pdf);
 }
 
 // The row of the sky's distribution a uniform draw lands in: the first whose
@@ -1745,41 +1794,43 @@ fn trace_path(primary: Ray) -> Path {
         // side of a dielectric and escapes still has to be filed under
         // something. "Opaque" is `is_opaque`: diffuse or rough enough that what
         // it reflects is a blur rather than a picture, so a polished metal is
-        // looked through the way glass is. An emitter counts as a surface too
-        // and ends the search the same way a diffuse one does, which is why
-        // this sits ahead of the `LIGHT` branch below rather than after it: a
-        // light seen through glass is as much a surface behind that glass as a
-        // floor is. Nothing sets `captured` for it because that branch returns.
+        // looked through the way glass is. A light counts as a surface too and
+        // ends the search the same way a diffuse one does: a light seen through
+        // glass is as much a surface behind that glass as a floor is.
         let opaque = is_opaque(material);
         if !captured && (bounce == 0u || opaque) {
-            features = Features(hit.normal, traveled + hit.t, material.color, i32(hit.material));
+            features = Features(hit.normal, traveled + hit.t, feature_albedo(material), i32(hit.material));
         }
         captured = captured || opaque;
 
-        if material.kind == LIGHT {
-            // An emitter is where a path ends: it is the only thing in the scene
-            // that adds rather than attenuates.
-            //
-            // The previous vertex already sampled this emitter directly, so
-            // taking all of what the scattered ray found would count it twice.
-            // The heuristic hands over only the share this strategy earned, and
-            // `direct_light` took the rest. A specular bounce, or the camera,
-            // had no direct sample to double, and keeps everything.
-            // An emitter struck on its back emits nothing. Decided by the
-            // geometric normal and never by `hit.front_face`, which is derived
-            // from the interpolated vertex normal: on a smooth-shaded mesh the
-            // two part company near a silhouette, and `sample_light` draws its
-            // points on the geometric surface.
+        // Emission, from any surface that has some, and only off its front.
+        //
+        // The previous vertex already sampled this emitter directly, so taking
+        // all of what the scattered ray found would count it twice. The
+        // heuristic hands over only the share this strategy earned, and
+        // `direct_light` took the rest. A specular bounce, or the camera, had no
+        // direct sample to double, and keeps everything.
+        //
+        // An emitter struck on its back emits nothing. Decided by the geometric
+        // normal and never by `hit.front_face`, which is derived from the
+        // interpolated vertex normal: on a smooth-shaded mesh the two part
+        // company near a silhouette, and `sample_light` draws its points on the
+        // geometric surface.
+        if any(material.emission > vec3f(0.0)) {
             let front = dot(geometric_normal(triangles[hit.triangle]), ray.direction) < 0.0;
-            if !front {
-                return Path(radiance, features);
+            if front {
+                var weight = 1.0;
+                if !specular {
+                    weight = power_heuristic(scatter_pdf, light_pdf(hit, ray.direction, segment + hit.t));
+                }
+                radiance += throughput * material.emission * weight;
             }
+        }
 
-            var weight = 1.0;
-            if !specular {
-                weight = power_heuristic(scatter_pdf, light_pdf(hit, ray.direction, segment + hit.t));
-            }
-            return Path(radiance + throughput * material.color * weight, features);
+        // A surface with no lobe to scatter by is where the path ends — a light,
+        // most often — and before any shadow ray is spent on it.
+        if !scatters(material) {
+            break;
         }
 
         // Light arriving straight from an emitter, gathered before the path

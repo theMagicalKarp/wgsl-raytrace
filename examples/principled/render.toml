@@ -3,9 +3,9 @@ aspect_ratio = "widescreen"
 image_width = 1200
 samples = 5000
 max_bounces = 64
-fov = 11
+fov = 12
 look_from = [0.0, 32.5, -71]
-look_at = [0.0, 0.0, -1.5]
+look_at = [0.0, 0.0, 0.25]
 vup = [0.0, 1.0, 0.0]
 
 [environment]
@@ -14,7 +14,7 @@ rotation = -60
 
 [[objects]]
 shape = "wavefront"
-file = "scene2.obj"
+file = "scene.obj"
 group = "label-2"
 material = "principled"
 base_color = [0.05, 0.05, 0.05]
@@ -22,7 +22,7 @@ roughness = 0.75
 
 [[objects]]
 shape = "wavefront"
-file = "scene2.obj"
+file = "scene.obj"
 group = "label-3"
 material = "principled"
 base_color = [0.05, 0.05, 0.05]
@@ -30,7 +30,7 @@ roughness = 0.75
 
 [[objects]]
 shape = "wavefront"
-file = "scene2.obj"
+file = "scene.obj"
 group = "label-4"
 material = "principled"
 base_color = [0.05, 0.05, 0.05]
@@ -38,8 +38,16 @@ roughness = 0.75
 
 [[objects]]
 shape = "wavefront"
-file = "scene2.obj"
+file = "scene.obj"
 group = "label-5"
+material = "principled"
+base_color = [0.05, 0.05, 0.05]
+roughness = 0.75
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "label-6"
 material = "principled"
 base_color = [0.05, 0.05, 0.05]
 roughness = 0.75
@@ -281,3 +289,54 @@ material = "principled"
 base_color = [1.0, 1.0, 1.0]
 roughness = 0.5
 alpha = 1.0
+
+# Emission
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "6-1"
+material = "principled"
+base_color = [0.8, 0.8, 0.8]
+roughness = 0.5
+emission_color = [1.0, 0.3, 0.05]
+emission_strength = 0.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "6-2"
+material = "principled"
+base_color = [0.8, 0.8, 0.8]
+roughness = 0.5
+emission_color = [1.0, 0.3, 0.05]
+emission_strength = 0.5
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "6-3"
+material = "principled"
+base_color = [0.8, 0.8, 0.8]
+roughness = 0.5
+emission_color = [1.0, 0.3, 0.05]
+emission_strength = 1.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "6-4"
+material = "principled"
+base_color = [0.8, 0.8, 0.8]
+roughness = 0.5
+emission_color = [1.0, 0.3, 0.05]
+emission_strength = 2.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "6-5"
+material = "principled"
+base_color = [0.8, 0.8, 0.8]
+roughness = 0.5
+emission_color = [1.0, 0.3, 0.05]
+emission_strength = 4.0
