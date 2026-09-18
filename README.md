@@ -172,13 +172,40 @@ into world space at load time.
 
 | `material` | Fields | Notes |
 | --- | --- | --- |
-| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `alpha`, `emission_color = [r, g, b]`, `emission_strength` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). The surface emits `emission_color × emission_strength` from its front face only (the side its winding faces), on top of whatever it reflects, and is sampled as a light. All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `1.0`, `[1, 1, 1]`, `0.0`. `roughness`, `metallic`, `transmission` and `alpha` are in `[0, 1]`; `ior` is at least 1; emission is non-negative. |
+| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `alpha`, `emission_color = [r, g, b]`, `emission_strength`, `subsurface_weight`, `subsurface_radius = [r, g, b]`, `subsurface_scale`, `subsurface_anisotropy` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). The surface emits `emission_color × emission_strength` from its front face only (the side its winding faces), on top of whatever it reflects, and is sampled as a light. `subsurface_weight` replaces that much of the diffuse base with a random walk under the surface (see below). All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `1.0`, `[1, 1, 1]`, `0.0`, `0.0`, `[1, 0.2, 0.1]`, `0.05`, `0.0`. `roughness`, `metallic`, `transmission`, `alpha` and `subsurface_weight` are in `[0, 1]`; `subsurface_anisotropy` is in `[-1, 1]`; `ior` is at least 1; emission, the radius and the scale are non-negative. |
 | `lambertian` | `albedo = [r, g, b]` | Shorthand for `principled` with `base_color = albedo`, `roughness = 1`, `metallic = 0`, `ior = 1`. Pure diffuse. |
 | `metal` | `albedo`, `roughness` | Shorthand for `principled` with `base_color = albedo`, `metallic = 1`. |
 | `dielectric` | `refraction_index` | Shorthand for `principled` with `base_color = [1, 1, 1]`, `roughness = 0`, `metallic = 0`, `ior = refraction_index`, `transmission = 1`. Clear glass. |
 | `glass` | — | Dielectric with IOR 1.5. |
 | `water` | — | Dielectric with IOR 1.33. |
 | `light` | `emit = [r, g, b]` | Shorthand for `principled` with `base_color = [0, 0, 0]`, `ior = 1`, `emission_color = emit`, `emission_strength = 1`: emits from its front face and reflects nothing. Values above 1 are normal. |
+
+#### Subsurface scattering
+
+`subsurface_weight` above zero turns that much of the diffuse base into light
+that goes *into* the surface instead of bouncing off it — skin, wax, marble,
+milk. It is a volumetric random walk, the same one Cycles runs by default, and
+not a diffusion profile: the path really does step around inside the object
+until it finds a way out, through the real geometry, so a thin edge glows and a
+thick middle does not without either being written down anywhere.
+
+- `subsurface_radius × subsurface_scale` is the mean free path per channel, in
+  world units — how far light of that channel travels inside before it
+  scatters. Blender's default `[1, 0.2, 0.1]` lets red travel ten times as far
+  as blue, which is what makes skin red at its edges. At a scale of zero the
+  walk has nowhere to go and the surface is the plain diffuse it replaced.
+- `base_color` is the colour the surface has to end up, not the medium's own:
+  the shader inverts it (Chiang et al. 2016) to find what the walk has to
+  scatter with, because a medium loses a great deal over the dozens of
+  scattering events one path takes.
+- `subsurface_anisotropy` leans each of those events: back the way it came at
+  -1, every direction alike at 0, straight on at 1.
+
+Two limits worth knowing. The mesh has to be **closed** — a path that dives into
+an open surface walks away under it and never comes back, so an open mesh loses
+what goes in (it never gains any). And a walk is given 256 steps, so a mean free
+path far smaller than the object is biased dark; the fix is a larger
+`subsurface_scale`, which is also faster.
 
 ## Render pipeline
 
@@ -210,10 +237,15 @@ flowchart LR
      shadow rays to one sampled emitter and one sampled sky direction (next
      event estimation). These are combined with the BSDF sample using the power
      heuristic (MIS), so no light is counted twice.
-   - Samples the BSDF: picks one lobe (metal, specular, glass or diffuse), draws
-     a direction from it (GGX visible normals for the microfacet lobes), and
-     weighs it against every lobe's density. Applies Russian roulette after
-     bounce 4.
+   - Samples the BSDF: picks one lobe (metal, specular, glass, diffuse or
+     subsurface), draws a direction from it (GGX visible normals for the
+     microfacet lobes), and weighs it against every lobe's density. Applies
+     Russian roulette after bounce 4.
+   - On the subsurface lobe the direction points *into* the surface: the path
+     walks the medium until it reaches the boundary again, and the exit point —
+     a white Lambertian facing out — becomes the vertex that sends the shadow
+     rays and chooses the next direction. The entry sends none: what it would
+     reflect depends on where the walk comes out.
    - Drops non-finite samples, and applies outlier rejection if `k > 0`.
 3. **Accumulate.** Each sample adds to four per-pixel buffers:
    - `accum`: radiance sum and sample count.
@@ -330,7 +362,8 @@ mise run example melee --debug   # also write raw frame + AOVs to examples/melee
 | ![normals](examples/normals/render.png) `normals`: smooth vs. per-face normals | ![melee](examples/melee/render.png) `melee`: mixed materials, one emitter |
 | ![glass](examples/glass/render.png) `glass`: glass monkeys, two lights; the scene with the most fireflies | ![cubes](examples/cubes/render.png) `cubes`: a room of objects lit by one emitter |
 | ![stairs](examples/stairs/render.png) `stairs`: glass orbs and a staircase, two lights | ![tunnel](examples/tunnel/render.png) `tunnel`: coloured walls under an HDRI |
-| ![principled](examples/principled/render.png) `principled`: one row per parameter, back to front: emission, base color, roughness, metallic, IOR, alpha | |
+| ![principled](examples/principled/render.png) `principled`: one row per parameter, back to front: emission, base color, roughness, metallic, IOR, alpha | ![subsurface](examples/subsurface/render.png) `subsurface`: backlit spheres, one row each for weight, scale and radius |
+| ![blob](examples/blob/render.png) `blob`: a waxy subsurface blob in a grey room, lit by one overhead emitter | |
 
 ## Development
 

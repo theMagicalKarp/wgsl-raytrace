@@ -95,9 +95,19 @@ struct Material {
     transmission: f32,
     // Coverage: the chance a ray is stopped by the surface at all.
     alpha: f32,
+    // How much of the diffuse base is a random walk through the inside of the
+    // surface instead. Zero for a surface light does not go into.
+    subsurface_weight: f32,
+    // Henyey-Greenstein asymmetry for that walk: straight back at -1, every
+    // direction alike at zero, straight on at 1.
+    subsurface_anisotropy: f32,
     // Radiance given off the front face, decided by the geometric normal. Zero
     // for a surface that does not emit.
     emission: vec3f,
+    // Mean free path inside the surface per channel, in world units. The host
+    // has already multiplied the scene's radius by its scale, and has zeroed
+    // `subsurface_weight` when every channel came out at nothing.
+    subsurface_radius: vec3f,
 }
 
 // One triangle in world space, packed by `GpuTriangle`. A `vec3f` is 12 bytes
@@ -740,6 +750,12 @@ struct BsdfSample {
     // legacy metal). The next emitter hit keeps its full contribution, and no
     // light sample was taken against this lobe.
     delta: bool,
+    // True when `wi` points *into* the surface because the subsurface lobe was
+    // picked. `wi` is then not where the path carries on but where it dives in:
+    // `subsurface_walk` takes it from here, and the path comes back out
+    // somewhere else on the same object. `pdf` and `delta` say nothing in that
+    // case — the exit vertex draws its own direction and sets both.
+    subsurface: bool,
     // False when the surface absorbed the ray.
     valid: bool,
 }
@@ -769,6 +785,9 @@ fn ggx_alpha(roughness: f32) -> f32 {
 //
 // A light is the surface that fails this — black, at an index of one, and
 // neither metal nor glass — and so is any other perfect absorber.
+// Subsurface needs no term of its own anywhere below: it takes its share out of
+// the diffuse slot, so `opaque` and the base colour already speak for both, and
+// a surface that scatters under its skin is one that scatters.
 fn scatters(material: Material) -> bool {
     if material.kind != PRINCIPLED {
         return false;
@@ -796,7 +815,18 @@ fn has_smooth_lobe(material: Material) -> bool {
     }
 
     let rough = ggx_alpha(material.roughness) >= DELTA_ALPHA;
-    let diffuse = (1.0 - material.metallic) * (1.0 - material.transmission) * luminance(material.color);
+    // What the coat lets through, less the share of it that dives under the
+    // surface: subsurface is not a lobe a light sample can be weighed against
+    // here. `principled_eval` prices it at nothing and gives it no density —
+    // the walk's exit aims its own shadow ray, and that vertex is where the
+    // light it finds is weighed. Counting it here would send a shadow ray from
+    // a surface with a mirror coat and nothing left to reflect with, and the
+    // answer would be zero every time.
+    //
+    // The factor is exactly one where there is no subsurface, so a scene
+    // without any keeps the shadow rays — and the random stream — it had.
+    let diffuse = (1.0 - material.metallic) * (1.0 - material.transmission)
+        * (1.0 - material.subsurface_weight) * luminance(material.color);
     return rough || diffuse > 0.0;
 }
 
@@ -812,6 +842,11 @@ const ROUGH_ALPHA: f32 = 0.075;
 //
 // Metal, specular and glass share one roughness, so they are all rough or all
 // sharp together, and the weights of every lobe add to one.
+//
+// Subsurface counts as diffuse, and it is already counted: `diffuse` below is
+// the whole of what the coat lets through, which is the two lobes together. A
+// skin or a marble is a surface a denoiser should file a path under, not a
+// window to look through.
 fn is_opaque(material: Material) -> bool {
     // A surface that scatters nothing is where every path to reach it ends, so
     // there is nothing behind it to look through to. A light is one.
@@ -911,6 +946,7 @@ struct Lobes {
     specular: f32,
     glass: f32,
     diffuse: f32,
+    subsurface: f32,
 }
 
 // The least share of the selection a lobe with any weight at all is given, as a
@@ -927,26 +963,38 @@ const MIN_LOBE_SHARE: f32 = 0.05;
 // The metal is weighed by its Fresnel term rather than its base color alone. A
 // black conductor still turns into a mirror at a glancing angle, and a lobe with
 // no chance of being sampled would lose that light outright.
+//
+// Subsurface takes its share out of the diffuse slot rather than beside it:
+// both sit under the same coat, and `subsurface_weight` says how much of what
+// the coat lets through goes *into* the surface instead of bouncing off its
+// base. At a weight of zero every term below is the one it was before
+// subsurface existed, down to the last bit — `w * 1.0` and `+ 0.0` do not
+// round — which is what keeps every scene that has none on the random stream it
+// already drew.
 fn lobe_probabilities(material: Material, cos_o: f32) -> Lobes {
     let dielectric = 1.0 - material.metallic;
     let opaque = dielectric * (1.0 - material.transmission);
     let fresnel = fresnel_dielectric(cos_o, material.ior);
+    let base = opaque * (1.0 - fresnel) * luminance(material.color);
     let weights = vec4f(
         material.metallic * luminance(fresnel_schlick(material.color, cos_o)),
         opaque * fresnel,
         dielectric * material.transmission,
-        opaque * (1.0 - fresnel) * luminance(material.color),
+        base * (1.0 - material.subsurface_weight),
     );
+    let subsurface = base * material.subsurface_weight;
 
-    let total = weights.x + weights.y + weights.z + weights.w;
+    let total = weights.x + weights.y + weights.z + weights.w + subsurface;
     if total <= 0.0 {
-        return Lobes(0.0, 0.0, 0.0, 0.0);
+        return Lobes(0.0, 0.0, 0.0, 0.0, 0.0);
     }
 
     // A lobe alone keeps a chance of exactly one: `w / w` does not round.
     let floored = select(vec4f(0.0), max(weights, vec4f(MIN_LOBE_SHARE * total)), weights > vec4f(0.0));
-    let p = floored / (floored.x + floored.y + floored.z + floored.w);
-    return Lobes(p.x, p.y, p.z, p.w);
+    let floored_subsurface = select(0.0, max(subsurface, MIN_LOBE_SHARE * total), subsurface > 0.0);
+    let sum = floored.x + floored.y + floored.z + floored.w + floored_subsurface;
+    let p = floored / sum;
+    return Lobes(p.x, p.y, p.z, p.w, floored_subsurface / sum);
 }
 
 // The index of refraction across the surface in the direction the path is
@@ -1004,7 +1052,14 @@ fn principled_eval(material: Material, lobes: Lobes, eta: f32, wo: vec3f, wi: ve
 
     let opaque = dielectric * (1.0 - material.transmission);
     let coat = 1.0 - fresnel_dielectric(cos_o, material.ior);
-    var value = material.color * (opaque * coat * cos_i / PI);
+    // What the coat lets through, less the share of it that goes into the
+    // surface rather than off its base. The subsurface lobe itself is priced at
+    // nothing here and has no density: what it sends back depends on where the
+    // walk inside comes out, which is not a function of `wi` at this point at
+    // all. Next event estimation at the entry therefore only prices the lobes
+    // that reflect, and the walk's exit vertex aims its own shadow ray.
+    let diffuse = opaque * coat * (1.0 - material.subsurface_weight);
+    var value = material.color * (diffuse * cos_i / PI);
     var pdf = lobes.diffuse * cos_i / PI;
 
     if alpha >= DELTA_ALPHA {
@@ -1080,23 +1135,28 @@ fn rough_transmission(
 }
 
 fn absorbed() -> BsdfSample {
-    return BsdfSample(vec3f(0.0), vec3f(0.0), 0.0, false, false);
+    return BsdfSample(vec3f(0.0), vec3f(0.0), 0.0, false, false, false);
 }
 
 fn delta_sample(wi: vec3f, weight: vec3f) -> BsdfSample {
-    return BsdfSample(normalize(wi), weight, 0.0, true, true);
+    return BsdfSample(normalize(wi), weight, 0.0, true, false, true);
 }
 
 // Where the path goes next, and what the surface takes out of it on the way.
 //
 // `wo` points away from the surface, back along the way the path came. A light
 // never reaches here — the path terminates on one.
+//
+// The subsurface lobe is the one that does not answer the question: it hands
+// back a direction pointing into the surface and leaves it to
+// [`subsurface_walk`] to find where the path comes back out.
 fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
     let normal = hit.normal;
     let frame = orthonormal_basis(normal);
     let local_o = to_local(frame, wo);
     let lobes = lobe_probabilities(material, local_o.z);
-    if local_o.z <= 0.0 || lobes.metal + lobes.specular + lobes.glass + lobes.diffuse <= 0.0 {
+    if local_o.z <= 0.0
+        || lobes.metal + lobes.specular + lobes.glass + lobes.diffuse + lobes.subsurface <= 0.0 {
         return absorbed();
     }
 
@@ -1104,7 +1164,7 @@ fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
     // not roll for it, which keeps the lambertian preset on the exact random
     // stream it drew before it became a principled surface.
     let possible = u32(lobes.metal > 0.0) + u32(lobes.specular > 0.0) + u32(lobes.glass > 0.0)
-        + u32(lobes.diffuse > 0.0);
+        + u32(lobes.diffuse > 0.0) + u32(lobes.subsurface > 0.0);
     var pick = 0.0;
     if possible > 1u {
         pick = rand_f32();
@@ -1125,7 +1185,9 @@ fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
     // to a lobe this surface does not have and be priced as one it does.
     let smooth_end = lobes.metal + lobes.specular;
     let glass_end = smooth_end + lobes.glass;
-    if pick < smooth_end || (lobes.glass <= 0.0 && lobes.diffuse <= 0.0) {
+    let diffuse_end = glass_end + lobes.diffuse;
+    if pick < smooth_end
+        || (lobes.glass <= 0.0 && lobes.diffuse <= 0.0 && lobes.subsurface <= 0.0) {
         if alpha < DELTA_ALPHA {
             // A mirror. It has no density to weigh against the other lobes, so
             // the weight is this lobe's own `f * cos / pdf` — its reflectance —
@@ -1142,7 +1204,7 @@ fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
 
         let m = sample_ggx_vndf(local_o, alpha, vec2f(rand_f32(), rand_f32()));
         direction = normalize(to_world(frame, reflect(-local_o, m)));
-    } else if pick < glass_end || lobes.diffuse <= 0.0 {
+    } else if pick < glass_end || (lobes.diffuse <= 0.0 && lobes.subsurface <= 0.0) {
         // Glass reflects the Fresnel fraction of the time and refracts the rest,
         // so choosing between the two in that proportion leaves a weight of one
         // for either, less the tint on what goes through.
@@ -1168,11 +1230,26 @@ fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
             direction = normalize(to_world(frame, refract(-local_o, m, 1.0 / eta)));
             through = true;
         }
-    } else {
+    } else if pick < diffuse_end || lobes.subsurface <= 0.0 {
         // Diffuse: a cosine-weighted direction about the normal, drawn as the
         // normal plus a point on the unit sphere. Shrinking that sphere a hair
         // keeps the sum away from zero, so the result is always a direction.
         direction = normalize(normal + sample_sphere() * (1.0 - EPSILON));
+    } else {
+        // Subsurface: the same cosine-weighted draw, mirrored to point into the
+        // surface. This is not where the path continues — it is where it enters
+        // the medium, and `trace_path` walks it from here.
+        //
+        // The entry is a diffuse transmission through the boundary, whose
+        // `f cos / pdf` is one at every angle for a cosine draw, so the weight
+        // is the lobe's share of the surface over the chance it was picked and
+        // nothing else. The colour is not in it: the walk inside carries that,
+        // as the albedo it scatters with.
+        let inward = -normalize(normal + sample_sphere() * (1.0 - EPSILON));
+        let opaque = (1.0 - material.metallic) * (1.0 - material.transmission);
+        let coat = 1.0 - fresnel_dielectric(cos_o, material.ior);
+        let share = opaque * coat * material.subsurface_weight / lobes.subsurface;
+        return BsdfSample(inward, vec3f(share), 0.0, false, true, true);
     }
 
     // A microfacet can reflect below the horizon, where the ray would travel
@@ -1191,7 +1268,7 @@ fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
         return absorbed();
     }
 
-    return BsdfSample(direction, eval.value / eval.pdf, eval.pdf, false, true);
+    return BsdfSample(direction, eval.value / eval.pdf, eval.pdf, false, false, true);
 }
 
 // The value and density of the surface's non-delta lobes at `wi`, both pointing
@@ -1210,6 +1287,263 @@ fn bsdf_eval(material: Material, hit: Intersection, wo: vec3f, wi: vec3f) -> Bsd
     let local_o = to_local(frame, wo);
     let lobes = lobe_probabilities(material, local_o.z);
     return principled_eval(material, lobes, relative_ior(material, hit), local_o, to_local(frame, wi));
+}
+
+// Steps one walk inside a surface is allowed before it is given up on, as
+// Cycles' random walk. Roulette below kills nearly every walk long before this,
+// and a walk still going after two hundred and fifty-six scattering events is
+// deep inside something opaque and carrying almost nothing.
+const MAX_SUBSURFACE_STEPS: u32 = 256u;
+
+// The shortest mean free path a walk is run with, in world units. The host has
+// already zeroed the weight when every channel came out at nothing; this is for
+// the channel that is at nothing on its own, where `1 / radius` would be an
+// infinity and every transmittance in the walk after it a NaN.
+const MIN_SUBSURFACE_RADIUS: f32 = 1e-6;
+
+// How far off either end the asymmetry is held. At exactly one the phase
+// function is a spike with no density to draw from, and its inverse cdf divides
+// zero by zero at one end of the draw.
+const MAX_ANISOTROPY: f32 = 0.999;
+
+// The single-scattering albedo a random walk has to scatter with for the
+// surface to come out the colour it was written as.
+//
+// Those two are nowhere near the same number. Light inside a medium scatters
+// dozens of times before it finds its way back out, and every one of them takes
+// its bite: a medium of 0.8 presents a diffuse albedo well under half that, and
+// a surface written at 0.8 needs a medium of about 0.99 to match it. This is
+// Chiang, Kutz and Burley's fit to that relation, inverted, so that a scene
+// writes the colour it wants to see and not the one the physics needs.
+//
+// Clamped on the way in: `base_color` is only held to being non-negative, and
+// the fit turns back on itself above one.
+fn subsurface_albedo(base: vec3f) -> vec3f {
+    let a = clamp(base, vec3f(0.0), vec3f(1.0));
+    let x = 4.09712 + 4.20863 * a - sqrt(9.59217 + 41.6808 * a + 17.7126 * a * a);
+    return 1.0 - x * x;
+}
+
+// Henyey-Greenstein's phase function as a density over the sphere, for the
+// cosine between the way light was travelling and the way it goes next. `g`
+// leans it: back the way it came at -1, every direction alike at zero, straight
+// on at 1.
+//
+// The walk itself never calls this. It draws from the phase function and is
+// weighed by it, and the two cancel to one — which is the whole reason
+// [`sample_henyey_greenstein`] needs no weight. What this is for is saying so:
+// the sampler is checked against this density, and this density against the
+// analytic one, so a sampler that drew the right shape leaning the wrong way
+// would have nothing to hide behind.
+fn henyey_greenstein(cosine: f32, g: f32) -> f32 {
+    // `1 + g² - 2g cos`, written so that neither term can cancel the other. At
+    // a strong lean and a small angle the two halves of that expression agree to
+    // four digits, and the handful left is what the density is about to be
+    // raised to the power of -3/2 of. Both rearrangements below are exact, and
+    // each one is a sum of two non-negative terms over the half of the range it
+    // is used on.
+    let denominator = max(select(
+        (1.0 + g) * (1.0 + g) - 2.0 * g * (1.0 + cosine),
+        (1.0 - g) * (1.0 - g) + 2.0 * g * (1.0 - cosine),
+        g >= 0.0,
+    ), 1e-12);
+    return (1.0 - g * g) / (2.0 * TWO_PI * denominator * sqrt(denominator));
+}
+
+// A direction drawn in proportion to that density, for a walk currently
+// travelling along `direction`.
+fn sample_henyey_greenstein(direction: vec3f, g: f32) -> vec3f {
+    let u = rand_f32();
+
+    // The isotropic case is not a limit of the formula below — it is zero over
+    // zero — so it is written out. Near enough to zero the two agree to well
+    // inside a float anyway.
+    var cosine = 1.0 - 2.0 * u;
+    if abs(g) > 1e-3 {
+        // The phase function's cdf, inverted. Runs from -1 at u = 0 to 1 at
+        // u = 1 whichever way `g` leans, so the draw is monotone either way and
+        // the clamp only catches rounding at the two ends.
+        let s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u);
+        cosine = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+    }
+
+    let sine = sqrt(max(1.0 - cosine * cosine, 0.0));
+    let phi = TWO_PI * rand_f32();
+    let frame = orthonormal_basis(direction);
+    return normalize(to_world(frame, vec3f(sine * cos(phi), sine * sin(phi), cosine)));
+}
+
+// The density a free flight of `t` was drawn with, per unit distance: every
+// channel's exponential, weighed by how often that channel is the one the
+// distance is drawn against. Pricing every draw by the whole mixture rather
+// than by the one channel that produced it is what keeps the three channels
+// converging on a single colour instead of on three fields of noise.
+fn subsurface_density(sigma_t: vec3f, chance: vec3f, t: f32) -> f32 {
+    return dot(chance, sigma_t * exp(-sigma_t * t));
+}
+
+// The chance a flight drawn that way reaches `t` without scattering at all,
+// which is the same mixture's tail and what a boundary inside the flight is
+// priced by.
+fn subsurface_survival(sigma_t: vec3f, chance: vec3f, t: f32) -> f32 {
+    return dot(chance, exp(-sigma_t * t));
+}
+
+// Where a walk through the inside of a surface came back out, and what the
+// medium took out of the path on the way.
+struct Walk {
+    // The exit point, on the object the path went in through.
+    point: vec3f,
+    // The surface normal there, pointing out of the object.
+    normal: vec3f,
+    // The triangle it came out through, so the exit vertex is as complete an
+    // `Intersection` as any other.
+    triangle: u32,
+    // What the path is multiplied by for having made the trip.
+    weight: vec3f,
+    // False when the path never came back out: absorbed, rouletted away, or
+    // still inside after `MAX_SUBSURFACE_STEPS`.
+    valid: bool,
+}
+
+fn no_walk() -> Walk {
+    return Walk(vec3f(0.0), vec3f(0.0), 0u, vec3f(0.0), false);
+}
+
+// A volumetric random walk through the inside of `object`, entered at `entry`
+// travelling along `direction`, which points into the surface.
+//
+// This is the whole of subsurface scattering here, and it is deliberately not a
+// diffusion profile: the path really does walk around inside the object, step
+// by step, until it finds a boundary. Nothing about it is approximate except
+// the medium it walks through, and it costs nothing the renderer did not
+// already have — `traverse` is the same one the camera rays use, and the
+// geometry it finds is the real geometry, so a thin ear glows and a thick cheek
+// does not without either being written down anywhere.
+//
+// A step draws a free flight against one channel's extinction and prices it
+// against all three, so the colours converge together rather than into three
+// separate fields of noise. A boundary inside the flight ends the walk; nothing
+// in the way means a scattering event, and the walk turns by the phase function
+// and goes again.
+//
+// The medium belongs to one object, which is what `object` is for. Another
+// object's surface crossing the same space is not a boundary of this one, and
+// the walk slides past it rather than coming out through it. Alpha is ignored
+// throughout: a cutout is a property of a surface seen from outside, and there
+// is no outside in here.
+//
+// `object` is a material index, and it names an object only because the host
+// writes one material per object and never shares one between two — `Scene::load`
+// pushes an entry per `[[objects]]` block and hands that same index to the
+// triangles. Deduplicating identical materials would quietly make two objects
+// one medium, and a walk would come out through the wrong geometry with nothing
+// to say it had. `every_object_has_its_own_material` holds the host to it.
+fn subsurface_walk(material: Material, entry: vec3f, direction: vec3f, object: u32) -> Walk {
+    let radius = max(material.subsurface_radius, vec3f(MIN_SUBSURFACE_RADIUS));
+    let sigma_t = 1.0 / radius;
+    let sigma_s = subsurface_albedo(material.color) * sigma_t;
+    let g = clamp(material.subsurface_anisotropy, -MAX_ANISOTROPY, MAX_ANISOTROPY);
+
+    var position = entry;
+    var heading = direction;
+    var weight = vec3f(1.0);
+
+    for (var step = 0u; step < MAX_SUBSURFACE_STEPS; step += 1u) {
+        // Which channel's mean free path this step is drawn against, in
+        // proportion to what the path is still carrying: red travels furthest
+        // through skin, and by the time a walk is deep inside one it is the
+        // only channel left worth spending a step on. The densities below are
+        // the whole mixture rather than the one channel, so every channel is
+        // priced by every draw whichever one produced it.
+        var chance = vec3f(1.0 / 3.0);
+        let carried = weight.r + weight.g + weight.b;
+        if carried > 0.0 {
+            chance = weight / carried;
+        }
+
+        let draw = rand_f32();
+        var extinction = sigma_t.b;
+        if draw < chance.r {
+            extinction = sigma_t.r;
+        } else if draw < chance.r + chance.g {
+            extinction = sigma_t.g;
+        }
+
+        // Free flight: an exponential in that channel's extinction.
+        let distance = -log(1.0 - rand_f32()) / extinction;
+        let ray = Ray(position, heading);
+        let hit = traverse(ray, distance);
+
+        if hit.t > 0.0 {
+            // A boundary inside the flight. The path is priced by the chance it
+            // got this far without scattering, which is the mixture's tail.
+            let survived = subsurface_survival(sigma_t, chance, hit.t);
+            if !(survived > 0.0) {
+                return no_walk();
+            }
+            weight *= exp(-sigma_t * hit.t) / survived;
+
+            if hit.material != object {
+                // Something else's surface, crossing the medium. Not a boundary
+                // of this object, so the path slides up to it and carries on
+                // the same way. The flight is redrawn from there, which an
+                // exponential is free to do: it has no memory of how far the
+                // path had already come.
+                position = point_on_ray(ray, hit.t + EPSILON);
+                continue;
+            }
+
+            // `traverse` turns the normal to meet the ray, and this ray is on
+            // its way out, so what comes back points into the medium.
+            return Walk(point_on_ray(ray, hit.t), -hit.normal, hit.triangle, weight, true);
+        }
+
+        // Nothing in the way, so the flight ends in a scattering event.
+        let density = subsurface_density(sigma_t, chance, distance);
+        if !(density > 0.0) {
+            return no_walk();
+        }
+        weight *= sigma_s * exp(-sigma_t * distance) / density;
+
+        position = point_on_ray(ray, distance);
+        heading = sample_henyey_greenstein(heading, g);
+
+        // Roulette, on the rule `trace_path` uses on its own bounces: what the
+        // walk carries is unchanged in expectation, and a walk the medium has
+        // absorbed down to nothing stops spending traversals on itself.
+        let survival = min(max(weight.r, max(weight.g, weight.b)), 1.0);
+        if !(survival > 0.0) || rand_f32() >= survival {
+            return no_walk();
+        }
+        weight /= survival;
+    }
+
+    return no_walk();
+}
+
+// The surface a walk comes back out through: white, perfectly diffuse, and at
+// an index of one so it has no specular coat of its own. The coat is priced
+// once, on the way in, and what the medium took out of the path is already in
+// the walk's weight — there is nothing left here to tint or to reflect.
+//
+// A literal `Material` and not a special case, so that `direct_light`,
+// `direct_sky` and `bsdf_sample` all work on the exit exactly as they do on any
+// other diffuse surface.
+fn exit_surface() -> Material {
+    return Material(
+        vec3f(1.0),
+        PRINCIPLED,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        vec3f(0.0),
+        vec3f(0.0),
+    );
 }
 
 // The ray through `pixel` for this sample: jittered inside the pixel so that
@@ -1833,22 +2167,61 @@ fn trace_path(primary: Ray) -> Path {
             break;
         }
 
-        // Light arriving straight from an emitter, gathered before the path
-        // wanders off to find whatever else this surface can see. Both kinds of
-        // emitter, where a scene has both: the triangles in the light table, and
-        // the sky.
-        let point = point_on_ray(ray, hit.t);
-        let wo = -ray.direction;
-        if has_smooth_lobe(material) {
-            if camera.light_count > 0u {
-                radiance += throughput * direct_light(point, hit, material, wo);
-            }
-            if camera.sky_width > 0u {
-                radiance += throughput * direct_sky(point, hit, material, wo);
-            }
-        }
+        // Where the path gathers light and chooses where to go next. Usually
+        // that is the surface just hit; a subsurface entry moves it to the far
+        // end of a walk through the inside of the object, where a white
+        // Lambertian facing out takes over. The vertex is replaced rather than
+        // added to, so everything below reads the same four names either way.
+        var surface = material;
+        var vertex = hit;
+        var origin = point_on_ray(ray, hit.t);
+        var outgoing = -ray.direction;
 
-        let scattered = bsdf_sample(material, hit, wo);
+        var scattered = absorbed();
+        // Two vertices at most: the one that was hit, and the exit of the one
+        // walk it may dive into. The exit is a white Lambertian and cannot pick
+        // a subsurface lobe, so the second pass always ends the loop on its
+        // own; the bound is here so that it is a bound and not a hope.
+        for (var vertices = 0u; vertices < 2u; vertices += 1u) {
+            // Light arriving straight from an emitter, gathered before the path
+            // wanders off to find whatever else this surface can see. Both kinds
+            // of emitter, where a scene has both: the triangles in the light
+            // table, and the sky.
+            if has_smooth_lobe(surface) {
+                if camera.light_count > 0u {
+                    radiance += throughput * direct_light(origin, vertex, surface, outgoing);
+                }
+                if camera.sky_width > 0u {
+                    radiance += throughput * direct_sky(origin, vertex, surface, outgoing);
+                }
+            }
+
+            scattered = bsdf_sample(surface, vertex, outgoing);
+            if !scattered.valid || !scattered.subsurface {
+                break;
+            }
+
+            // Into the surface. The entry's own weight is collected here rather
+            // than below, because what is below belongs to the exit's sample
+            // and this one is about to be replaced by it.
+            let walk = subsurface_walk(surface, origin, scattered.wi, vertex.material);
+            if !walk.valid {
+                scattered = absorbed();
+                break;
+            }
+            throughput *= scattered.weight * walk.weight;
+
+            surface = exit_surface();
+            // `t` is never read off a vertex, and the material index is kept so
+            // that the exit is still filed under the object it came out of.
+            vertex = Intersection(walk.normal, 0.0, vertex.material, true, walk.triangle);
+            origin = walk.point;
+            // The exit is a diffuse transmission: what leaves does not depend on
+            // which way the walk happened to arrive, and a surface at an index
+            // of one has no coat for the direction to matter to. Straight out is
+            // the one choice that is above the hemisphere at every exit.
+            outgoing = walk.normal;
+        }
         if !scattered.valid {
             break;
         }
@@ -1859,7 +2232,7 @@ fn trace_path(primary: Ray) -> Path {
         scatter_pdf = scattered.pdf;
 
         throughput *= scattered.weight;
-        ray = Ray(point, scattered.wi);
+        ray = Ray(origin, scattered.wi);
         traveled += hit.t;
         segment = 0.0;
 

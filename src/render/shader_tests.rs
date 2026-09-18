@@ -425,7 +425,9 @@ fn test(input: Input, index: u32) -> Output {
     rng_state = jenkins_hash(index + 1u);
 
     // The lambertian preset, as `GpuMaterial::from` writes it.
-    let material = Material(input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0, vec3f(0.0));
+    let material = Material(
+        input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, vec3f(0.0), vec3f(0.0),
+    );
     let hit = Intersection(input.normal, 1.0, 0u, true, 0u);
     let sample = bsdf_sample(material, hit, input.wo);
     let eval = bsdf_eval(material, hit, input.wo, sample.wi);
@@ -589,6 +591,9 @@ fn test(input: Input, index: u32) -> Output {
         input.params.z,
         input.params.w,
         1.0,
+        0.0,
+        0.0,
+        vec3f(0.0),
         vec3f(0.0),
     );
     let hit = Intersection(input.normal, 1.0, 0u, input.front_face != 0u, 0u);
@@ -1706,4 +1711,662 @@ fn a_surface_that_emits_and_reflects_is_the_sum_of_both_in_a_white_furnace() {
             "middle {mean} with light sampling {lights}, expected 0.75"
         );
     }
+}
+
+const SUBSURFACE: &str = r#"
+struct Input {
+    // The surface's base color, which is the colour the walk has to present.
+    color: vec3f,
+    // Extinction per channel, for the free-flight densities.
+    sigma_t: vec3f,
+    // How often each channel is the one a flight is drawn against.
+    chance: vec3f,
+    // The direction a walk is travelling when it scatters.
+    heading: vec3f,
+    // x: the asymmetry, y: a distance to price a flight at, z: subsurface
+    // weight, w: roughness. The index is one throughout: the coat is not what
+    // any of this is about, and at one there is none.
+    params: vec4f,
+}
+
+struct Output {
+    // `subsurface_albedo` of the base color.
+    albedo: vec3f,
+    // A direction drawn from the phase function about `heading`, and that
+    // direction's density.
+    scattered: vec3f,
+    // The direction `bsdf_sample` drew from a surface at this weight, with the
+    // normal along +z, and the weight it carries.
+    entry: vec3f,
+    weight: vec3f,
+    // x: the phase function at `scattered`, y: the free-flight density at
+    // `params.y`, z: the chance a flight reaches it, w: what `bsdf_eval` prices
+    // a mirrored direction at, which is the diffuse lobe the subsurface left
+    // behind.
+    densities: vec4f,
+    // What the surface's lobes add up to. x: whether the sample dived into the
+    // surface, y: whether it was valid, z: whether it was delta, w: whether
+    // next event estimation has anything here to weigh a light against.
+    sample: vec4f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    rng_state = jenkins_hash(index + 1u);
+
+    let g = input.params.x;
+    let scattered = sample_henyey_greenstein(input.heading, g);
+
+    let material = Material(
+        input.color,
+        PRINCIPLED,
+        input.params.w,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        input.params.z,
+        g,
+        vec3f(0.0),
+        vec3f(0.1, 0.1, 0.1),
+    );
+    let normal = vec3f(0.0, 0.0, 1.0);
+    let hit = Intersection(normal, 1.0, 0u, true, 0u);
+    let sample = bsdf_sample(material, hit, normal);
+    let reflected = bsdf_eval(material, hit, normal, normalize(vec3f(0.3, 0.4, 1.0)));
+
+    return Output(
+        subsurface_albedo(input.color),
+        scattered,
+        sample.wi,
+        sample.weight,
+        vec4f(
+            henyey_greenstein(dot(input.heading, scattered), g),
+            subsurface_density(input.sigma_t, input.chance, input.params.y),
+            subsurface_survival(input.sigma_t, input.chance, input.params.y),
+            luminance(reflected.value),
+        ),
+        vec4f(
+            f32(sample.subsurface),
+            f32(sample.valid),
+            f32(sample.delta),
+            f32(has_smooth_lobe(material)),
+        ),
+    );
+}
+"#;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct SubsurfaceInput {
+    color: Vec3,
+    sigma_t: Vec3,
+    chance: Vec3,
+    heading: Vec3,
+    params: [f32; 4],
+}
+
+impl SubsurfaceInput {
+    /// Everything but the fields a test is about, so each one below only has to
+    /// name what it varies. A weight of one, at an index of one, leaves the
+    /// subsurface lobe as the only one the surface has; the roughness is the
+    /// default's, so the surface would still be worth a shadow ray if it had a
+    /// coat to reflect with.
+    fn new() -> Self {
+        SubsurfaceInput {
+            color: Vec3::new(0.5, 0.5, 0.5),
+            sigma_t: Vec3::new(1.0, 4.0, 10.0),
+            chance: Vec3::new(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+            heading: Vec3::new(0.0, 0.0, 1.0),
+            params: [0.0, 0.5, 1.0, 1.0],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct SubsurfaceOutput {
+    albedo: Vec3,
+    scattered: Vec3,
+    entry: Vec3,
+    weight: Vec3,
+    densities: [f32; 4],
+    sample: [f32; 4],
+}
+
+fn subsurface(inputs: &[SubsurfaceInput]) -> Option<Vec<SubsurfaceOutput>> {
+    run(SUBSURFACE, inputs)
+}
+
+/// The single-scattering albedo a walk has to use is never below the colour it
+/// has to present and never above one, it rises with that colour, and it pins
+/// both ends: black stays black, and white has to scatter without absorbing at
+/// all or the walk would never get back out of a white furnace.
+#[test]
+fn the_albedo_inversion_climbs_from_black_to_white() {
+    let steps = 64;
+    let inputs: Vec<SubsurfaceInput> = (0..=steps)
+        .map(|i| {
+            let a = i as f32 / steps as f32;
+            SubsurfaceInput {
+                color: Vec3::new(a, a, a),
+                ..SubsurfaceInput::new()
+            }
+        })
+        .collect();
+    let Some(outputs) = subsurface(&inputs) else {
+        return;
+    };
+
+    let mut previous = -1.0;
+    for (input, output) in inputs.iter().zip(&outputs) {
+        let target = input.color.x;
+        let alpha = output.albedo.x;
+        assert_eq!(
+            (alpha, alpha),
+            (output.albedo.y, output.albedo.z),
+            "a grey surface inverts to a grey medium: {target}"
+        );
+        assert!(
+            (0.0..=1.0).contains(&alpha),
+            "{target} inverted to {alpha}, which is not a scattering albedo"
+        );
+        assert!(
+            alpha >= target - TOLERANCE,
+            "{target} inverted to {alpha}: a medium is never darker than the \
+             surface it has to present, because every scattering event absorbs"
+        );
+        assert!(
+            alpha > previous,
+            "{target} inverted to {alpha}, below the step before it"
+        );
+        previous = alpha;
+    }
+
+    assert!(outputs[0].albedo.x.abs() < TOLERANCE, "black stays black");
+    assert!(
+        (outputs[steps].albedo.x - 1.0).abs() < 1e-4,
+        "white has to scatter without absorbing: {}",
+        outputs[steps].albedo.x,
+    );
+}
+
+/// The colour is inverted channel by channel, so a tinted surface's medium is
+/// tinted the same way round.
+#[test]
+fn the_albedo_inversion_is_per_channel() {
+    let inputs = [SubsurfaceInput {
+        color: Vec3::new(0.2, 0.5, 0.9),
+        ..SubsurfaceInput::new()
+    }];
+    let Some(outputs) = subsurface(&inputs) else {
+        return;
+    };
+
+    let albedo = outputs[0].albedo;
+    assert!(albedo.x < albedo.y && albedo.y < albedo.z, "{albedo:?}");
+    assert!(albedo.x > 0.2 && albedo.z < 1.0, "{albedo:?}");
+}
+
+/// Henyey-Greenstein, in `cos θ` rather than per unit solid angle: the density
+/// the shader's returns is this over `2π`.
+fn reference_phase(cosine: f64, g: f64) -> f64 {
+    let denominator = 1.0 + g * g - 2.0 * g * cosine;
+    0.5 * (1.0 - g * g) / (denominator * denominator.sqrt())
+}
+
+/// Its cumulative distribution, which the sampler's inverse cdf is the inverse
+/// of. Derived rather than fitted: the integral of the density above.
+fn reference_phase_cdf(cosine: f64, g: f64) -> f64 {
+    if g.abs() < 1e-9 {
+        return 0.5 * (cosine + 1.0);
+    }
+    let denominator = (1.0 + g * g - 2.0 * g * cosine).sqrt();
+    (1.0 - g * g) / (2.0 * g) * (1.0 / denominator - 1.0 / (1.0 + g))
+}
+
+/// How closely the shader's density can be expected to match the reference,
+/// relative to it.
+///
+/// The density goes as `d^(-3/2)` for `d = 1 + g² - 2g cos`, and at a strong
+/// lean and a small angle `d` is a ten-thousandth of the terms it came out of.
+/// The cosine it is built from is a dot product of two f32 directions and is
+/// only known to an ulp or two — which, at that `d`, is most of it. So what the
+/// two sides can agree to here is set by how badly `d` is conditioned and not by
+/// the arithmetic after it, and a flat tolerance would either be meaningless
+/// near isotropic or fail near the ends.
+fn phase_tolerance(cosine: f64, g: f64) -> f64 {
+    let ulp = 4.0 * f64::from(f32::EPSILON);
+    let d = 1.0 + g * g - 2.0 * g * cosine;
+    1e-5 + 1.5 * ulp * (1.0 + g * g + 2.0 * g.abs()) / d
+}
+
+/// The asymmetries worth checking: isotropic, both leans, and near enough to
+/// either end that the sampler's formula is dividing small numbers by small
+/// ones.
+fn asymmetries() -> Vec<f32> {
+    vec![0.0, 0.0005, -0.0005, 0.3, -0.3, 0.8, -0.8, 0.99, -0.99]
+}
+
+/// What the shader says a scattered direction's density is, and what the
+/// density actually is, are the same function — and the sampler draws in
+/// proportion to it, which is checked against the analytic cdf it inverts.
+#[test]
+fn the_phase_function_samples_in_proportion_to_its_density() {
+    let draws = 4096;
+    let heading = Vec3::new(0.3, -0.5, 0.8).normalized();
+    let mut inputs = Vec::new();
+    for g in asymmetries() {
+        for _ in 0..draws {
+            inputs.push(SubsurfaceInput {
+                heading,
+                params: [g, 0.5, 1.0, 1.0],
+                ..SubsurfaceInput::new()
+            });
+        }
+    }
+    let Some(outputs) = subsurface(&inputs) else {
+        return;
+    };
+
+    for (g, batch) in asymmetries().iter().zip(outputs.chunks_exact(draws)) {
+        let g = *g as f64;
+        let mut cosines = Vec::with_capacity(draws);
+        for output in batch {
+            let direction = output.scattered;
+            assert!(
+                (direction.dot(direction) - 1.0).abs() < 1e-4,
+                "g = {g}: {direction:?} is not a direction",
+            );
+
+            let cosine = heading.dot(direction) as f64;
+            let reference = reference_phase(cosine, g) / std::f64::consts::TAU;
+            let evaluated = output.densities[0] as f64;
+            assert!(
+                (evaluated - reference).abs() <= phase_tolerance(cosine, g) * reference,
+                "g = {g}, cos {cosine}: the shader prices it at {evaluated}, not {reference}",
+            );
+            cosines.push(cosine);
+        }
+
+        // The empirical cdf against the analytic one, which is the only way to
+        // catch a sampler that draws the right shape leaning the wrong way.
+        cosines.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut worst = 0.0f64;
+        for (i, cosine) in cosines.iter().enumerate() {
+            let empirical = (i + 1) as f64 / draws as f64;
+            worst = worst.max((empirical - reference_phase_cdf(*cosine, g)).abs());
+        }
+        // Kolmogorov-Smirnov at a vanishing false-failure rate: 2.5 / √n is
+        // past the 99.999th percentile of the statistic.
+        assert!(
+            worst < 2.5 / (draws as f64).sqrt(),
+            "g = {g}: the drawn directions are {worst} off the distribution they are priced by",
+        );
+
+        // Which way the phase function leans is exactly `g`, by definition.
+        let mean = cosines.iter().sum::<f64>() / draws as f64;
+        assert!(
+            (mean - g).abs() < 4.0 / (draws as f64).sqrt(),
+            "g = {g}: the mean cosine came out at {mean}",
+        );
+    }
+}
+
+/// The free-flight density is a density: it integrates to one over every
+/// distance the walk could draw, whichever channels it is mixed from. The
+/// survival is its tail, so it starts at one and falls to nothing.
+#[test]
+fn the_free_flight_density_integrates_to_one() {
+    // Trapezoid over `t`, fine enough for the sharpest exponential here (the
+    // shortest mean free path is a tenth) and long enough for the longest.
+    let steps = 20_000;
+    let far = 200.0f32;
+    let cases = [
+        (
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+        ),
+        (
+            Vec3::new(1.0, 4.0, 10.0),
+            Vec3::new(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+        ),
+        (Vec3::new(1.0, 4.0, 10.0), Vec3::new(0.7, 0.2, 0.1)),
+        // A channel absorbed down to nothing is never drawn against, and its
+        // exponential drops out of the mixture with it.
+        (Vec3::new(0.5, 2.0, 10.0), Vec3::new(0.0, 0.5, 0.5)),
+    ];
+
+    let mut inputs = Vec::new();
+    for (sigma_t, chance) in cases {
+        for step in 0..=steps {
+            inputs.push(SubsurfaceInput {
+                sigma_t,
+                chance,
+                params: [0.0, far * step as f32 / steps as f32, 1.0, 1.0],
+                ..SubsurfaceInput::new()
+            });
+        }
+    }
+    let Some(outputs) = subsurface(&inputs) else {
+        return;
+    };
+
+    let width = (far / steps as f32) as f64;
+    for ((sigma_t, chance), batch) in cases.iter().zip(outputs.chunks_exact(steps + 1)) {
+        let integral: f64 = batch
+            .windows(2)
+            .map(|pair| 0.5 * (pair[0].densities[1] as f64 + pair[1].densities[1] as f64) * width)
+            .sum();
+        assert!(
+            (integral - 1.0).abs() < 1e-3,
+            "{sigma_t:?} at {chance:?} integrates to {integral}",
+        );
+
+        assert!(
+            (batch[0].densities[2] - 1.0).abs() < TOLERANCE,
+            "nothing has scattered by zero: {}",
+            batch[0].densities[2],
+        );
+        assert!(
+            batch[steps].densities[2] < 1e-6,
+            "everything has scattered by {far}: {}",
+            batch[steps].densities[2],
+        );
+        for pair in batch.windows(2) {
+            assert!(
+                pair[1].densities[2] <= pair[0].densities[2],
+                "the chance of getting further only falls",
+            );
+        }
+    }
+}
+
+/// The subsurface lobe is the one that does not answer where the path goes: it
+/// hands back a direction pointing into the surface, flagged so that
+/// `trace_path` walks it rather than casting it, and its weight carries no
+/// colour — the walk inside is what tints the path.
+#[test]
+fn the_subsurface_lobe_dives_into_the_surface() {
+    let draws = 2048;
+    let inputs: Vec<SubsurfaceInput> = (0..draws).map(|_| SubsurfaceInput::new()).collect();
+    let Some(outputs) = subsurface(&inputs) else {
+        return;
+    };
+
+    let mut mean_cosine = 0.0;
+    for output in &outputs {
+        assert_eq!(
+            (output.sample[1], output.sample[0], output.sample[2]),
+            (1.0, 1.0, 0.0),
+            "a weight of one leaves nothing but the subsurface lobe, and it is \
+             neither absorbed nor a delta: {output:?}",
+        );
+        assert!(
+            output.entry.z < 0.0,
+            "the entry goes into the surface: {:?}",
+            output.entry,
+        );
+        assert_eq!(
+            (output.weight.x, output.weight.y, output.weight.z),
+            (1.0, 1.0, 1.0),
+            "the entry is untinted: the medium carries the colour",
+        );
+        mean_cosine += -output.entry.z;
+
+        assert_eq!(
+            output.densities[3], 0.0,
+            "a weight of one leaves no diffuse lobe to reflect with",
+        );
+    }
+
+    // Cosine-weighted about the inward normal, whose mean cosine is 2/3.
+    mean_cosine /= draws as f32;
+    assert!(
+        (mean_cosine - 2.0 / 3.0).abs() < 0.02,
+        "the entry is cosine-weighted, mean cosine {mean_cosine}",
+    );
+}
+
+/// Subsurface takes its share out of the diffuse lobe rather than beside it, so
+/// what is left to reflect off the base is the rest of it. At half weight the
+/// surface reflects half of what it would opaque, and the entry's weight rises
+/// to match the share of the draws it is now picked on.
+#[test]
+fn the_subsurface_lobe_takes_its_share_out_of_the_diffuse_one() {
+    let weights = [0.0f32, 0.25, 0.5, 0.75, 1.0];
+    let draws = 512;
+    let mut inputs = Vec::new();
+    for weight in weights {
+        for _ in 0..draws {
+            inputs.push(SubsurfaceInput {
+                params: [0.0, 0.5, weight, 1.0],
+                ..SubsurfaceInput::new()
+            });
+        }
+    }
+    let Some(outputs) = subsurface(&inputs) else {
+        return;
+    };
+
+    let opaque = outputs[0].densities[3];
+    assert!(
+        opaque > 0.0,
+        "the diffuse lobe reflects something at weight 0"
+    );
+
+    for (weight, batch) in weights.iter().zip(outputs.chunks_exact(draws)) {
+        let reflected = batch[0].densities[3];
+        assert!(
+            (reflected - opaque * (1.0 - weight)).abs() < TOLERANCE * opaque.max(1.0),
+            "at weight {weight} the surface still reflects {reflected} of {opaque}",
+        );
+
+        // Every draw that dives in is worth the lobe's whole share of the
+        // surface, so the average over all of them is that share — whatever
+        // fraction of the draws the lobe was actually picked on.
+        let entered: Vec<&SubsurfaceOutput> = batch
+            .iter()
+            .filter(|output| output.sample[0] == 1.0)
+            .collect();
+        assert_eq!(
+            entered.is_empty(),
+            *weight == 0.0,
+            "at weight {weight} the lobe should {} be reachable",
+            match *weight == 0.0 {
+                true => "not",
+                false => "",
+            },
+        );
+
+        let mean = entered
+            .iter()
+            .map(|output| output.weight.x as f64)
+            .sum::<f64>()
+            / batch.len() as f64;
+        assert!(
+            (mean - *weight as f64).abs() < 0.05,
+            "at weight {weight} the lobe carries {mean} of the surface",
+        );
+    }
+}
+
+/// Next event estimation is weighed against the lobes that reflect, and the
+/// subsurface lobe is not one of them: `principled_eval` prices it at nothing
+/// and gives it no density, because what it sends back depends on where the
+/// walk inside comes out and not on the direction a shadow ray was aimed in.
+/// The walk's exit aims its own.
+///
+/// So a surface whose base is entirely under the skin has nothing here to weigh
+/// a light against, and a shadow ray from it would come back zero every time.
+/// Only the coat can still earn one — under a rough coat there is a lobe, under
+/// a mirror there is not — and at any weight below one the diffuse the
+/// subsurface left behind earns one on its own.
+#[test]
+fn a_surface_with_nothing_but_subsurface_is_not_worth_a_shadow_ray() {
+    // Rough enough that the microfacet lobes are a lobe, and sharp enough that
+    // they are a mirror. At an index of one neither reflects anything, but the
+    // roughness is what `has_smooth_lobe` reads.
+    let cases = [(1.0f32, 1.0f32), (1.0, 0.0), (0.5, 0.0), (0.0, 0.0)];
+    let inputs: Vec<SubsurfaceInput> = cases
+        .iter()
+        .map(|(weight, roughness)| SubsurfaceInput {
+            params: [0.0, 0.5, *weight, *roughness],
+            ..SubsurfaceInput::new()
+        })
+        .collect();
+    let Some(outputs) = subsurface(&inputs) else {
+        return;
+    };
+
+    let worth: Vec<bool> = outputs.iter().map(|o| o.sample[3] == 1.0).collect();
+    assert_eq!(
+        worth,
+        [true, false, true, true],
+        "only the surface that is all subsurface under a mirror coat has \
+         nothing to weigh a light against: {cases:?}",
+    );
+
+    // And what it has to weigh is what it has left to reflect with, so the two
+    // answers agree: a lobe worth a shadow ray is one that prices a direction
+    // above zero.
+    for ((weight, roughness), output) in cases.iter().zip(&outputs) {
+        if *roughness == 0.0 {
+            assert_eq!(
+                output.sample[3] == 1.0,
+                output.densities[3] > 0.0,
+                "at weight {weight} under a mirror coat the surface reflects \
+                 {} and is priced at {}",
+                output.densities[3],
+                output.sample[3],
+            );
+        }
+    }
+}
+
+/// A surface whose diffuse base is entirely a walk through the inside of it, as
+/// the lines of a scene file. At an index of one there is no specular coat over
+/// it, so everything the surface sends back has been under it.
+fn subsurface_material(color: [f32; 3], radius: f32) -> String {
+    let [r, g, b] = color;
+    format!(
+        "material = \"principled\"\nbase_color = [{r}, {g}, {b}]\nior = 1.0\n\
+         subsurface_weight = 1.0\nsubsurface_radius = [1.0, 1.0, 1.0]\n\
+         subsurface_scale = {radius}"
+    )
+}
+
+/// A white furnace, from under the skin: a closed white sphere whose every path
+/// goes into the surface, wanders about inside it and comes back out. A medium
+/// that scatters without absorbing sends all of it back, so the sphere cannot be
+/// told apart from the sky behind it.
+///
+/// This is the whole of the walk held to account at once — the albedo inversion,
+/// the free-flight densities, the channel mixture, the exit — because every one
+/// of them would show up here as a sphere that is darker or brighter than the
+/// sky, and none of them shows up in a unit test of its own.
+#[test]
+fn a_white_subsurface_sphere_disappears_in_a_white_furnace() {
+    // Well under the sphere's radius of one, so a path really does scatter its
+    // way across rather than crossing in a step or two.
+    for radius in [0.5, 0.2] {
+        let Some((width, pixels)) = furnace(&subsurface_material([1.0; 3], radius)) else {
+            return;
+        };
+
+        for pixel in middle(width, &pixels, 6) {
+            for channel in pixel {
+                assert!(
+                    (channel - 1.0).abs() < 0.02,
+                    "at a radius of {radius} the sphere came back {channel}, not 1",
+                );
+            }
+        }
+    }
+}
+
+/// Tinted, it is darker — every scattering event inside takes its bite, and a
+/// path takes dozens of them — and never brighter. Which is the half that
+/// matters: the albedo inversion is a fit, and a fit that overshot would make a
+/// surface glow.
+#[test]
+fn a_tinted_subsurface_sphere_darkens_but_never_brightens() {
+    let mut previous = 0.0;
+    for albedo in [0.2f32, 0.5, 0.8, 1.0] {
+        let Some((width, pixels)) = furnace(&subsurface_material([albedo; 3], 0.3)) else {
+            return;
+        };
+
+        let centre = middle(width, &pixels, 6);
+        let mean = centre.iter().flatten().sum::<f32>() / (centre.len() * 3) as f32;
+        assert!(
+            mean <= 1.0 + 0.02,
+            "an albedo of {albedo} came back at {mean}, brighter than the sky",
+        );
+        assert!(
+            mean > previous,
+            "an albedo of {albedo} came back at {mean}, no brighter than the darker one before it",
+        );
+        previous = mean;
+    }
+}
+
+/// The surface a walk comes back out through has to be the one it went in
+/// through, and an open mesh has none: a path that dives into a plane walks
+/// away from it forever and never comes back. So the plane loses what it lets
+/// in — it is the price of a random walk over a diffusion profile, and the
+/// scene format has no way to say "closed" — but it never gains any, which is
+/// the failure that would matter.
+#[test]
+fn an_open_mesh_loses_what_goes_under_it_and_gains_nothing() {
+    // Looking straight down at the plane from `normals.obj`, a single quad with
+    // nothing on the far side of it, under a uniform white sky.
+    let source = |material: &str| {
+        format!(
+            r#"
+[camera]
+aspect_ratio = "square"
+image_width = 16
+samples = 128
+max_bounces = 8
+fov = 40
+look_from = [0.0, 6.0, 0.0]
+look_at = [0.0, 0.0, 0.0]
+vup = [0.0, 0.0, 1.0]
+
+[environment]
+color = [1.0, 1.0, 1.0]
+
+[[objects]]
+shape = "wavefront"
+file = "normals.obj"
+group = "Plane"
+{material}
+"#
+        )
+    };
+
+    let mean = |material: &str| {
+        render_scene(&source(material), |_| {}).map(|(width, pixels)| {
+            let centre = middle(width, &pixels, 4);
+            centre.iter().flatten().sum::<f32>() / (centre.len() * 3) as f32
+        })
+    };
+
+    let Some(opaque) = mean("material = \"lambertian\"\nalbedo = [1.0, 1.0, 1.0]") else {
+        return;
+    };
+    let under = mean(&subsurface_material([1.0; 3], 0.3)).unwrap();
+
+    assert!(
+        (opaque - 1.0).abs() < 0.02,
+        "the same plane as a white lambertian is the furnace itself: {opaque}",
+    );
+    assert!(
+        under < opaque,
+        "an open mesh cannot send back what walked away under it: {under} against {opaque}",
+    );
+    assert!(
+        under >= 0.0,
+        "and it cannot send back less than nothing: {under}"
+    );
 }

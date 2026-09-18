@@ -1,0 +1,205 @@
+# Subsurface scattering: light that goes into a surface, wanders about inside it
+# and comes back out somewhere else. Lit almost entirely from behind, which is
+# where it shows — everything here is opaque from the front.
+#
+# Row 1 (far):  `subsurface_weight`, none to all, at a scale deep enough that all
+#               of it is a sphere the light comes through.
+# Row 2:        `subsurface_scale`, the world units the radius is quoted in, so
+#               how far into the surface light gets before it turns around.
+# Row 3 (near): `subsurface_radius`, which channel travels furthest — what tints
+#               the light coming out the far side rather than the surface it
+#               went in through.
+
+[camera]
+aspect_ratio = "widescreen"
+image_width = 1200
+samples = 4000
+max_bounces = 48
+fov = 26
+look_from = [0.0, 16.0, 34.0]
+look_at = [0.0, 2.5, 0.0]
+vup = [0.0, 1.0, 0.0]
+
+# Just enough to keep the near sides off black. Everything that reads as
+# subsurface in this frame came through the wall behind.
+[environment]
+color = [0.12, 0.125, 0.14]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Floor"
+material = "principled"
+base_color = [0.25, 0.24, 0.23]
+roughness = 0.6
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Backlight"
+material = "light"
+emit = [4.0, 3.8, 3.6]
+
+# Weight: how much of the diffuse base goes under the surface instead of
+# bouncing off it. Zero is the opaque surface it always was.
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "1-1"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 0.0
+subsurface_scale = 2.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "1-2"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 0.25
+subsurface_scale = 2.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "1-3"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 0.5
+subsurface_scale = 2.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "1-4"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 0.75
+subsurface_scale = 2.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "1-5"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_scale = 2.0
+
+# Scale: how far light gets in. At zero it never leaves the surface it
+# entered, which is the diffuse lobe it replaced.
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "2-1"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_scale = 0.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "2-2"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_scale = 0.25
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "2-3"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_scale = 0.75
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "2-4"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_scale = 2.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "2-5"
+material = "principled"
+base_color = [0.85, 0.55, 0.45]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_scale = 5.0
+
+# Radius: how far each channel gets, per unit of scale. Blender's default
+# is the third of these, and it is what makes skin red at its edges.
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "3-1"
+material = "principled"
+base_color = [0.8, 0.8, 0.8]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_radius = [1.0, 1.0, 1.0]
+subsurface_scale = 1.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "3-2"
+material = "principled"
+base_color = [0.8, 0.72, 0.6]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_radius = [1.0, 0.5, 0.35]
+subsurface_scale = 1.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "3-3"
+material = "principled"
+base_color = [0.85, 0.6, 0.5]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_radius = [1.0, 0.2, 0.1]
+subsurface_scale = 1.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "3-4"
+material = "principled"
+base_color = [0.45, 0.7, 0.45]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_radius = [0.2, 1.0, 0.3]
+subsurface_scale = 1.0
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "3-5"
+material = "principled"
+base_color = [0.4, 0.5, 0.85]
+roughness = 0.35
+subsurface_weight = 1.0
+subsurface_radius = [0.1, 0.3, 1.0]
+subsurface_scale = 1.0

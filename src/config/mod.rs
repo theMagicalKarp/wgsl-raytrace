@@ -399,6 +399,31 @@ pub struct Principled {
     /// emits nothing.
     #[serde_inline_default(0.0)]
     pub emission_strength: f32,
+
+    /// How much of the diffuse base is replaced by light that goes *into* the
+    /// surface, scatters about inside it and leaves somewhere else. Zero, the
+    /// default, is an ordinary opaque surface; one is skin, wax or marble.
+    #[serde_inline_default(0.0)]
+    pub subsurface_weight: f32,
+
+    /// How far light of each channel travels inside the surface between
+    /// scattering events, in multiples of `subsurface_scale`. Blender's default
+    /// lets red travel five times as far as green and ten times as far as blue,
+    /// which is what makes thin skin glow red at its edges.
+    #[serde_inline_default([1.0, 0.2, 0.1])]
+    pub subsurface_radius: [f32; 3],
+
+    /// The world units `subsurface_radius` is quoted in. The two are only ever
+    /// multiplied; they are separate so a scene can keep a material's colour
+    /// and change how deep it is.
+    #[serde_inline_default(0.05)]
+    pub subsurface_scale: f32,
+
+    /// Which way light keeps going when it scatters inside the surface, as
+    /// Henyey-Greenstein's asymmetry in `[-1, 1]`: straight back at -1, every
+    /// direction alike at zero, straight on at 1.
+    #[serde_inline_default(0.0)]
+    pub subsurface_anisotropy: f32,
 }
 
 impl Default for Principled {
@@ -412,6 +437,10 @@ impl Default for Principled {
             alpha: 1.0,
             emission_color: [1.0, 1.0, 1.0],
             emission_strength: 0.0,
+            subsurface_weight: 0.0,
+            subsurface_radius: [1.0, 0.2, 0.1],
+            subsurface_scale: 0.05,
+            subsurface_anisotropy: 0.0,
         }
     }
 }
@@ -452,7 +481,7 @@ impl fmt::Display for Material {
             Material::Principled(p) => write!(
                 f,
                 "principled{:?} roughness {} metallic {} ior {} transmission {} alpha {} \
-                 emission{:?} strength {}",
+                 emission{:?} strength {} subsurface {} radius{:?} scale {} anisotropy {}",
                 p.base_color,
                 p.roughness,
                 p.metallic,
@@ -461,6 +490,10 @@ impl fmt::Display for Material {
                 p.alpha,
                 p.emission_color,
                 p.emission_strength,
+                p.subsurface_weight,
+                p.subsurface_radius,
+                p.subsurface_scale,
+                p.subsurface_anisotropy,
             ),
             Material::Lambertian { albedo } => write!(f, "lambertian{:?}", albedo),
             Material::Metal { albedo, roughness } => {
@@ -483,6 +516,12 @@ impl Material {
     /// negative color is light taken out of nowhere. NaN fails every range, and
     /// an infinite color or strength is rejected too: TOML spells `inf`, and
     /// the product `0 * inf` would hand the shader a NaN it accumulates forever.
+    ///
+    /// A subsurface anisotropy is the one field that may be negative: it says
+    /// which way light carries on when it scatters, and backward is a direction
+    /// like any other. Both ends of its range are allowed, as Blender allows
+    /// them; the shader holds the phase function a hair off either one, where it
+    /// would otherwise be a spike with no density to sample.
     fn validate(&self) -> Result<(), String> {
         let unit = |name: &str, value: f32| match (0.0..=1.0).contains(&value) {
             true => Ok(()),
@@ -501,6 +540,10 @@ impl Material {
                 "{name} must be finite and non-negative, not {value}"
             )),
         };
+        let asymmetry = |name: &str, value: f32| match (-1.0..=1.0).contains(&value) {
+            true => Ok(()),
+            false => Err(format!("{name} must be between -1 and 1, not {value}")),
+        };
         let ior = |name: &str, value: f32| match value >= 1.0 {
             true => Ok(()),
             false => Err(format!("{name} must be at least 1, not {value}")),
@@ -515,6 +558,10 @@ impl Material {
                 unit("alpha", p.alpha)?;
                 color("emission_color", p.emission_color)?;
                 non_negative("emission_strength", p.emission_strength)?;
+                unit("subsurface_weight", p.subsurface_weight)?;
+                color("subsurface_radius", p.subsurface_radius)?;
+                non_negative("subsurface_scale", p.subsurface_scale)?;
+                asymmetry("subsurface_anisotropy", p.subsurface_anisotropy)?;
                 ior("ior", p.ior)
             }
             Material::Lambertian { albedo } => color("albedo", *albedo),
@@ -1092,6 +1139,10 @@ emit = [3.0, 3.0, 3.0]"#,
                 alpha: 1.0,
                 emission_color: [1.0, 1.0, 1.0],
                 emission_strength: 0.0,
+                subsurface_weight: 0.0,
+                subsurface_radius: [1.0, 0.2, 0.1],
+                subsurface_scale: 0.05,
+                subsurface_anisotropy: 0.0,
             })
         );
         assert_eq!(
@@ -1105,7 +1156,9 @@ emit = [3.0, 3.0, 3.0]"#,
         let source = with_material(
             "material = \"principled\"\nbase_color = [0.1, 0.2, 0.3]\n\
              roughness = 0.25\nmetallic = 1.0\nior = 1.33\ntransmission = 0.75\nalpha = 0.4\n\
-             emission_color = [0.5, 0.6, 0.7]\nemission_strength = 2.5",
+             emission_color = [0.5, 0.6, 0.7]\nemission_strength = 2.5\n\
+             subsurface_weight = 0.6\nsubsurface_radius = [0.9, 0.3, 0.15]\n\
+             subsurface_scale = 0.2\nsubsurface_anisotropy = -0.4",
         );
         let config: Config = toml::from_str(&source).unwrap();
         let Object::Wavefront(wavefront) = &config.objects[0];
@@ -1121,6 +1174,10 @@ emit = [3.0, 3.0, 3.0]"#,
                 alpha: 0.4,
                 emission_color: [0.5, 0.6, 0.7],
                 emission_strength: 2.5,
+                subsurface_weight: 0.6,
+                subsurface_radius: [0.9, 0.3, 0.15],
+                subsurface_scale: 0.2,
+                subsurface_anisotropy: -0.4,
             })
         );
         assert!(
@@ -1175,6 +1232,38 @@ emit = [3.0, 3.0, 3.0]"#,
             (
                 "material = \"principled\"\nemission_color = [1.0, inf, 1.0]",
                 "emission_color",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_weight = 1.5",
+                "subsurface_weight",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_weight = -0.1",
+                "subsurface_weight",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_radius = [1.0, -0.2, 0.1]",
+                "subsurface_radius",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_scale = -1.0",
+                "subsurface_scale",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_scale = inf",
+                "subsurface_scale",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_anisotropy = 1.5",
+                "subsurface_anisotropy",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_anisotropy = -1.5",
+                "subsurface_anisotropy",
+            ),
+            (
+                "material = \"principled\"\nsubsurface_anisotropy = nan",
+                "subsurface_anisotropy",
             ),
             ("material = \"light\"\nemit = [inf, 1.0, 1.0]", "emit"),
             (
