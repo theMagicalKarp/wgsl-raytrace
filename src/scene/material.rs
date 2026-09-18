@@ -5,24 +5,23 @@ use bytemuck::Zeroable;
 
 /// The surface models, as the shader's branches will see them.
 ///
-/// Lambertian, metal and the dielectrics are absent on purpose: they are
-/// principled surfaces with a few fields pinned. All of them are flattened on
-/// the way in, so the shader never learns that the scene format has names for
-/// them.
+/// Lambertian, metal, the dielectrics and lights are absent on purpose: they
+/// are principled surfaces with a few fields pinned. All of them are flattened
+/// on the way in, so the shader never learns that the scene format has names
+/// for them.
 pub(crate) const PRINCIPLED: u32 = 0;
-pub(crate) const LIGHT: u32 = 1;
 
 /// A material as the shader reads it.
 ///
-/// The same fields for every kind, so the buffer stays a flat array. A light
-/// reads only `color`.
+/// The same fields for every kind, so the buffer stays a flat array.
 ///
-/// WGSL pads a struct to its largest alignment, which is the `vec3f`'s sixteen,
-/// so the five scalars after `kind` round up to a trailing twelve bytes.
+/// WGSL aligns a `vec3f` to sixteen bytes, so `emission` starts on the
+/// boundary after `alpha`, and the struct as a whole rounds up to 64. The fields
+/// ahead of it keep the offsets they had before it existed.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct GpuMaterial {
-    /// Base color, or emitted radiance for a light.
+    /// Base color.
     pub color: [f32; 3],
 
     /// One of the constants above.
@@ -45,27 +44,33 @@ pub struct GpuMaterial {
     /// material lookup.
     pub alpha: f32,
 
-    _pad: [f32; 3],
+    _pad0: [f32; 3],
+
+    /// Radiance given off the front face: the scene's color times its
+    /// strength, multiplied out here so the shader reads one number.
+    pub emission: [f32; 3],
+
+    _pad1: f32,
 }
 
-const _: () = assert!(size_of::<GpuMaterial>() == 48);
+const _: () = assert!(size_of::<GpuMaterial>() == 64);
 
 impl GpuMaterial {
-    fn new(kind: u32, color: [f32; 3], principled: Principled) -> GpuMaterial {
+    fn principled(principled: Principled) -> GpuMaterial {
         GpuMaterial {
-            color,
-            kind,
+            color: principled.base_color,
+            kind: PRINCIPLED,
             roughness: principled.roughness,
             metallic: principled.metallic,
             ior: principled.ior,
             transmission: principled.transmission,
             alpha: principled.alpha,
-            _pad: [0.0; 3],
+            _pad0: [0.0; 3],
+            emission: principled
+                .emission_color
+                .map(|channel| channel * principled.emission_strength),
+            _pad1: 0.0,
         }
-    }
-
-    fn principled(principled: Principled) -> GpuMaterial {
-        GpuMaterial::new(PRINCIPLED, principled.base_color, principled)
     }
 
     /// Clear, colorless glass: nothing but the transmission lobe, perfectly
@@ -77,7 +82,7 @@ impl GpuMaterial {
             metallic: 0.0,
             ior,
             transmission: 1.0,
-            alpha: 1.0,
+            ..Principled::default()
         })
     }
 }
@@ -95,8 +100,7 @@ impl From<&Material> for GpuMaterial {
                 roughness: 1.0,
                 metallic: 0.0,
                 ior: 1.0,
-                transmission: 0.0,
-                alpha: 1.0,
+                ..Principled::default()
             }),
 
             Material::Metal { albedo, roughness } => GpuMaterial::principled(Principled {
@@ -110,7 +114,18 @@ impl From<&Material> for GpuMaterial {
             Material::Glass {} => GpuMaterial::dielectric(1.5),
             Material::Water {} => GpuMaterial::dielectric(1.33),
 
-            Material::Light { emit } => GpuMaterial::new(LIGHT, emit, Principled::default()),
+            // Black, and at an index of one so that there is no specular coat
+            // either: a surface that scatters nothing, and gives off `emit`.
+            // Written as a strength of one on the color rather than the other
+            // way around, so the radiance is `emit` exactly and not a rounding
+            // of it.
+            Material::Light { emit } => GpuMaterial::principled(Principled {
+                base_color: [0.0; 3],
+                ior: 1.0,
+                emission_color: emit,
+                emission_strength: 1.0,
+                ..Principled::default()
+            }),
         }
     }
 }
@@ -128,6 +143,8 @@ mod tests {
             ior: 1.6,
             transmission: 0.7,
             alpha: 0.8,
+            emission_color: [0.5, 1.0, 2.0],
+            emission_strength: 3.0,
         }));
 
         assert_eq!(
@@ -140,7 +157,9 @@ mod tests {
                 ior: 1.6,
                 transmission: 0.7,
                 alpha: 0.8,
-                _pad: [0.0; 3],
+                _pad0: [0.0; 3],
+                emission: [1.5, 3.0, 6.0],
+                _pad1: 0.0,
             }
         );
     }
@@ -157,6 +176,7 @@ mod tests {
         assert_eq!(material.metallic, 0.0);
         assert_eq!(material.ior, 1.0, "no Fresnel reflection at any angle");
         assert_eq!((material.transmission, material.alpha), (0.0, 1.0));
+        assert_eq!(material.emission, [0.0; 3]);
     }
 
     #[test]
@@ -195,25 +215,40 @@ mod tests {
                     ior,
                     transmission: 1.0,
                     alpha: 1.0,
-                    _pad: [0.0; 3],
+                    _pad0: [0.0; 3],
+                    emission: [0.0; 3],
+                    _pad1: 0.0,
                 },
                 "{material}"
             );
         }
     }
 
-    /// A light is its emitted radiance and nothing more. Which face it emits
-    /// from is not a per-material question any more — the shader answers it the
-    /// one way, from the triangle's winding — so nothing about sidedness has to
-    /// survive the trip into the buffer.
+    /// A light is a principled surface that scatters nothing: black, with no
+    /// metal, glass or specular coat to reflect with, and its emitted radiance
+    /// carried through unchanged. Which face it emits from is not a
+    /// per-material question — the shader answers it the one way, from the
+    /// triangle's winding — so nothing about sidedness has to survive the trip
+    /// into the buffer.
     #[test]
-    fn a_light_carries_its_emission_and_nothing_else() {
+    fn a_light_is_a_principled_surface_that_only_emits() {
         let light = GpuMaterial::from(&Material::Light {
             emit: [1.0, 2.0, 3.0],
         });
 
-        assert_eq!(light.kind, LIGHT);
-        assert_eq!(light.color, [1.0, 2.0, 3.0]);
+        assert_eq!(light.kind, PRINCIPLED);
+        assert_eq!(light.emission, [1.0, 2.0, 3.0]);
+        assert_eq!(light.color, [0.0; 3]);
+        assert_eq!(light.metallic, 0.0);
+        assert_eq!(light.transmission, 0.0);
+        assert_eq!(light.ior, 1.0, "no Fresnel reflection at any angle");
         assert_eq!(light.alpha, 1.0);
+    }
+
+    #[test]
+    fn a_principled_surface_emits_nothing_by_default() {
+        let material = GpuMaterial::from(&Material::Principled(Principled::default()));
+
+        assert_eq!(material.emission, [0.0; 3]);
     }
 }

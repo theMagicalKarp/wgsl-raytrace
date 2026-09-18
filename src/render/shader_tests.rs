@@ -425,7 +425,7 @@ fn test(input: Input, index: u32) -> Output {
     rng_state = jenkins_hash(index + 1u);
 
     // The lambertian preset, as `GpuMaterial::from` writes it.
-    let material = Material(input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0);
+    let material = Material(input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0, vec3f(0.0));
     let hit = Intersection(input.normal, 1.0, 0u, true, 0u);
     let sample = bsdf_sample(material, hit, input.wo);
     let eval = bsdf_eval(material, hit, input.wo, sample.wi);
@@ -589,6 +589,7 @@ fn test(input: Input, index: u32) -> Output {
         input.params.z,
         input.params.w,
         1.0,
+        vec3f(0.0),
     );
     let hit = Intersection(input.normal, 1.0, 0u, input.front_face != 0u, 0u);
     let sample = bsdf_sample(material, hit, input.wo);
@@ -1196,11 +1197,16 @@ fn render_scene(
 /// sky, as `(width, pixels)`. `material` is the sphere's material, as the
 /// lines of a scene file.
 fn furnace(material: &str) -> Option<(usize, Vec<[f32; 3]>)> {
+    render_scene(&furnace_source(material), |_| {})
+}
+
+/// The scene file [`furnace`] renders.
+fn furnace_source(material: &str) -> String {
     // The smooth sphere from the normals scene: radius one about (-2, 2, 0),
     // filling most of the frame. Nothing else, so every path either escapes
     // straight to the sky or scatters off the sphere and then escapes — once
     // for a conductor, and as many times as it takes to get back out of glass.
-    let source = format!(
+    format!(
         r#"
 [camera]
 aspect_ratio = "square"
@@ -1220,8 +1226,7 @@ file = "normals.obj"
 group = "Smooth"
 {material}
 "#
-    );
-    render_scene(&source, |_| {})
+    )
 }
 
 /// The pixels within `radius` of the middle of the frame, which all land on
@@ -1430,6 +1435,16 @@ fn a_path_gives_up_after_too_many_cutouts() {
 ///
 /// The mean radiance of the middle of the frame.
 fn shadow(alpha: Option<f32>, lights: bool, layers: usize) -> Option<f32> {
+    lit_floor(
+        "material = \"light\"\nemit = [40.0, 40.0, 40.0]",
+        alpha,
+        lights,
+        layers,
+    )
+}
+
+/// [`shadow`], with `emitter` as the emitter's material.
+fn lit_floor(emitter: &str, alpha: Option<f32>, lights: bool, layers: usize) -> Option<f32> {
     let blocker = match alpha {
         Some(alpha) => (0..layers)
             .map(|layer| {
@@ -1481,8 +1496,7 @@ albedo = [0.5, 0.5, 0.5]
 shape = "wavefront"
 file = "normals.obj"
 group = "Plane"
-material = "light"
-emit = [40.0, 40.0, 40.0]
+{emitter}
 
 [[objects.transform]]
 type = "scale"
@@ -1590,4 +1604,106 @@ fn a_shadow_ray_gives_up_after_too_many_cutouts() {
         over_sampled < 1e-3 * unshadowed,
         "so does the shadow ray: {context}"
     );
+}
+
+/// A principled surface that emits `strength` times white and reflects half of
+/// what reaches it diffusely, as the lines of a scene file.
+fn glowing(strength: f32) -> String {
+    format!(
+        "material = \"principled\"\nbase_color = [0.5, 0.5, 0.5]\nroughness = 1.0\nior = 1.0\n\
+         emission_strength = {strength}"
+    )
+}
+
+/// An emitter that also scatters is found the same by both strategies: next
+/// event estimation weighs its emission against the scattered rays that land on
+/// it, and neither may keep the other's share. It lights the floor as a light of
+/// the same radiance does, give or take what it reflects of the floor's light
+/// back down again.
+#[test]
+fn light_sampling_and_scattering_agree_on_a_surface_that_emits_and_reflects() {
+    let Some(sampled) = lit_floor(&glowing(40.0), None, true, 1) else {
+        return;
+    };
+    let Some(scattered) = lit_floor(&glowing(40.0), None, false, 1) else {
+        return;
+    };
+    let Some(light) = shadow(None, true, 1) else {
+        return;
+    };
+
+    let context =
+        format!("light sampling {sampled}, scattering {scattered}, the light preset {light}");
+    assert!(sampled > 0.1, "the floor should be lit: {context}");
+    assert!(
+        (scattered - sampled).abs() < 0.06 * sampled,
+        "scattering: {context}"
+    );
+    assert!(
+        sampled >= light * 0.98 && sampled < light * 1.05,
+        "the reflection off the emitter adds a little, and never takes: {context}"
+    );
+}
+
+/// A partly transparent emitter is only there `alpha` of the time, so it
+/// lights the floor at `alpha` of what it would opaque — whether next event
+/// estimation finds it or scattering does. Light sampling used to return its
+/// full emission without rolling for it, and the heuristic weighed that against
+/// scattering as though the two agreed.
+#[test]
+fn light_sampling_and_scattering_agree_on_a_partly_transparent_emitter() {
+    let emitter = |alpha: f32| {
+        format!(
+            "material = \"principled\"\nbase_color = [0.0, 0.0, 0.0]\nroughness = 1.0\n\
+             ior = 1.0\nemission_strength = 40.0\nalpha = {alpha}"
+        )
+    };
+    let Some(opaque) = lit_floor(&emitter(1.0), None, true, 1) else {
+        return;
+    };
+    let Some(sampled) = lit_floor(&emitter(0.25), None, true, 1) else {
+        return;
+    };
+    let Some(scattered) = lit_floor(&emitter(0.25), None, false, 1) else {
+        return;
+    };
+
+    let context = format!(
+        "opaque {opaque}, alpha 0.25 with light sampling {sampled} and without {scattered}"
+    );
+    assert!(opaque > 0.1, "the floor should be lit: {context}");
+    assert!(
+        (sampled - 0.25 * opaque).abs() < 0.03 * 0.25 * opaque,
+        "light sampling: {context}"
+    );
+    assert!(
+        (scattered - sampled).abs() < 0.06 * sampled,
+        "scattering: {context}"
+    );
+}
+
+/// In a white furnace, a surface that emits and reflects is its emission plus
+/// what it reflects of the sky. A diffuse sphere at an albedo of one half sees
+/// only the sky from every point, so it reflects one half of it, and emitting a
+/// quarter on top of that lands it on three quarters — however the emission is
+/// found.
+#[test]
+fn a_surface_that_emits_and_reflects_is_the_sum_of_both_in_a_white_furnace() {
+    for lights in [true, false] {
+        let Some((width, pixels)) = render_scene(&furnace_source(&glowing(0.25)), |scene| {
+            if !lights {
+                scene.lights.clear();
+                scene.light_power = 0.0;
+            }
+        }) else {
+            return;
+        };
+
+        let centre = middle(width, &pixels, 2);
+        let mean = centre.iter().flatten().sum::<f32>() / (centre.len() * 3) as f32;
+        assert!(
+            (mean - 0.75).abs() < 0.02,
+            "middle {mean} with light sampling {lights}, expected 0.75"
+        );
+    }
 }
