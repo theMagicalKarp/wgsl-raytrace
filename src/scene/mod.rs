@@ -154,6 +154,58 @@ mod tests {
         assert!(scene.triangles.len() < whole_file.len());
     }
 
+    /// One material per object, however alike two objects are. The shader
+    /// leans on this: a subsurface walk asks whether the boundary it reached
+    /// belongs to the object it started inside by comparing material indices,
+    /// so a material shared between two objects would make them one medium and
+    /// let a walk come out through the wrong geometry. Deduplicating identical
+    /// materials is the obvious saving to reach for, and this is what it would
+    /// cost.
+    #[test]
+    fn every_object_has_its_own_material() {
+        // The same block twice over, down to the group and the albedo: nothing
+        // about the two objects differs but the order they are listed in.
+        let block = r#"
+[[objects]]
+shape = "wavefront"
+file = "teapot.obj"
+group = "Teapot"
+material = "lambertian"
+albedo = [0.3, 0.72, 0.3]
+"#;
+        let source = format!(
+            r#"
+[camera]
+aspect_ratio = "square"
+image_width = 32
+samples = 1
+max_bounces = 4
+fov = 30
+look_from = [0.0, 2.0, 10.0]
+look_at = [0.0, 2.0, 0.0]
+vup = [0.0, 1.0, 0.0]
+{block}{block}"#
+        );
+        let mut config: Config = toml::from_str(&source).unwrap();
+        config.validate(Path::new("examples/teapot")).unwrap();
+
+        let scene = Scene::load(&config).unwrap();
+
+        assert_eq!(scene.materials.len(), 2);
+        assert_eq!(
+            scene.materials[0], scene.materials[1],
+            "the two blocks ask for the same surface"
+        );
+
+        // And are still told apart by the triangles, which is the part the walk
+        // reads. Every triangle belongs to one of them, and neither is empty.
+        let first = scene.triangles.iter().filter(|t| t.material == 0).count();
+        let second = scene.triangles.iter().filter(|t| t.material == 1).count();
+        assert_eq!(first, second);
+        assert_eq!(first + second, scene.triangles.len());
+        assert!(first > 0, "both copies of the mesh should have loaded");
+    }
+
     #[test]
     fn the_hierarchy_accounts_for_every_triangle() {
         // The shader only ever reaches a triangle through a leaf, so one left

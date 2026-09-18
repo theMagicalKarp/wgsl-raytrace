@@ -47,12 +47,14 @@ jobs:
     strategy:
       matrix:
         config:
+          - blob
           - cubes
           - field
           - glass
           - melee
           - normals
           - principled
+          - subsurface
           - stairs
           - teapot
           - tunnel
