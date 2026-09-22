@@ -46,6 +46,21 @@ fn test_main(@builtin(global_invocation_id) id: vec3u) {
 /// renders honour. `I` and `O` have to lay out exactly as `Input` and `Output`
 /// do, which is checked before anything is dispatched.
 fn run<I: Pod, O: Pod>(source: &str, inputs: &[I]) -> Option<Vec<O>> {
+    run_over_scene(source, inputs, &[])
+}
+
+/// The same, with some of group 1 bound behind it.
+///
+/// A function that reads the scene — the input programs, the shading
+/// attributes — needs the buffer it reads from, and the pipeline's layout is
+/// reflected from the entry point, so group 1 holds exactly the bindings the
+/// function under test actually reaches and `scene` has to name those and no
+/// others. Pass `(binding, bytes)` for each.
+fn run_over_scene<I: Pod, O: Pod>(
+    source: &str,
+    inputs: &[I],
+    scene: &[(u32, Vec<u8>)],
+) -> Option<Vec<O>> {
     if env::var_os("WGSL_RAYTRACE_SKIP_GPU_TESTS").is_some() {
         return None;
     }
@@ -54,7 +69,7 @@ fn run<I: Pod, O: Pod>(source: &str, inputs: &[I]) -> Option<Vec<O>> {
     let module = format!("{}\n{source}\n{ENTRY}", include_str!("shader.wgsl"));
     check_layout::<I, O>(&module);
 
-    Some(pollster::block_on(dispatch(&module, inputs)).expect(
+    Some(pollster::block_on(dispatch(&module, inputs, scene)).expect(
         "the test shader should run — set WGSL_RAYTRACE_SKIP_GPU_TESTS=1 \
          on a machine with no working adapter",
     ))
@@ -88,6 +103,7 @@ fn check_layout<I, O>(module: &str) {
 async fn dispatch<I: Pod, O: Pod>(
     module: &str,
     inputs: &[I],
+    scene: &[(u32, Vec<u8>)],
 ) -> Result<Vec<O>, Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
@@ -148,6 +164,35 @@ async fn dispatch<I: Pod, O: Pod>(
         ],
     });
 
+    // Group 1's buffers, when the function under test reads any. They outlive
+    // the bind group below, which is why they are collected first.
+    let scene_buffers: Vec<wgpu::Buffer> = scene
+        .iter()
+        .map(|(_, bytes)| {
+            device.create_buffer_init(&BufferInitDescriptor {
+                label: Some("test scene"),
+                contents: bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        })
+        .collect();
+    let scene_entries: Vec<wgpu::BindGroupEntry> = scene
+        .iter()
+        .zip(&scene_buffers)
+        .map(|((binding, _), buffer)| wgpu::BindGroupEntry {
+            binding: *binding,
+            resource: buffer.as_entire_binding(),
+        })
+        .collect();
+    let scene_bindings = match scene.is_empty() {
+        true => None,
+        false => Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("test scene"),
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &scene_entries,
+        })),
+    };
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("shader tests"),
     });
@@ -158,6 +203,9 @@ async fn dispatch<I: Pod, O: Pod>(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bindings, &[]);
+        if let Some(scene_bindings) = &scene_bindings {
+            pass.set_bind_group(1, scene_bindings, &[]);
+        }
         pass.dispatch_workgroups((count as u32).div_ceil(WORKGROUP), 1, 1);
     }
     encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, size);
@@ -426,9 +474,10 @@ fn test(input: Input, index: u32) -> Output {
 
     // The lambertian preset, as `GpuMaterial::from` writes it.
     let material = Material(
-        input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, vec3f(0.0), vec3f(0.0),
+        input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, NO_PROGRAM, vec3f(0.0),
+        vec3f(0.0),
     );
-    let hit = Intersection(input.normal, 1.0, 0u, true, 0u);
+    let hit = Intersection(input.normal, 1.0, 0u, true, 0u, vec2f(0.0));
     let sample = bsdf_sample(material, hit, input.wo);
     let eval = bsdf_eval(material, hit, input.wo, sample.wi);
 
@@ -593,10 +642,11 @@ fn test(input: Input, index: u32) -> Output {
         1.0,
         0.0,
         0.0,
+        NO_PROGRAM,
         vec3f(0.0),
         vec3f(0.0),
     );
-    let hit = Intersection(input.normal, 1.0, 0u, input.front_face != 0u, 0u);
+    let hit = Intersection(input.normal, 1.0, 0u, input.front_face != 0u, 0u, vec2f(0.0));
     let sample = bsdf_sample(material, hit, input.wo);
     let sampled = bsdf_eval(material, hit, input.wo, sample.wi);
     let given = bsdf_eval(material, hit, input.wo, input.wi);
@@ -1766,11 +1816,12 @@ fn test(input: Input, index: u32) -> Output {
         1.0,
         input.params.z,
         g,
+        NO_PROGRAM,
         vec3f(0.0),
         vec3f(0.1, 0.1, 0.1),
     );
     let normal = vec3f(0.0, 0.0, 1.0);
-    let hit = Intersection(normal, 1.0, 0u, true, 0u);
+    let hit = Intersection(normal, 1.0, 0u, true, 0u, vec2f(0.0));
     let sample = bsdf_sample(material, hit, normal);
     let reflected = bsdf_eval(material, hit, normal, normalize(vec3f(0.3, 0.4, 1.0)));
 
@@ -2368,5 +2419,306 @@ group = "Plane"
     assert!(
         under >= 0.0,
         "and it cannot send back less than nothing: {under}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Material inputs
+// ---------------------------------------------------------------------------
+
+/// One evaluation: where, and which program.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ProgramInput {
+    uv: [f32; 2],
+    offset: u32,
+    _pad: u32,
+    object: Vec3,
+    world: Vec3,
+}
+
+/// The evaluator's answer, held against the host's.
+///
+/// Every tree the tests compile is run at every one of these points, so an op
+/// that happens to be right at the origin and wrong two units along has
+/// nowhere to hide. The last two are deliberately outside the unit square:
+/// a texture coordinate can be anything the `.obj` wrote, and a world position
+/// certainly is.
+fn evaluation_points() -> Vec<(crate::scene::program::Coordinates, ProgramInput)> {
+    [
+        ([0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+        ([0.25, 0.75], [1.0, -2.0, 3.0], [4.0, 5.0, -6.0]),
+        ([1.0, 1.0], [-0.5, 0.5, 0.25], [0.1, 0.2, 0.3]),
+        ([2.5, -1.5], [7.0, -7.0, 0.0], [-3.0, 12.0, 0.5]),
+    ]
+    .into_iter()
+    .map(|(uv, object, world)| {
+        (
+            crate::scene::program::Coordinates { uv, object, world },
+            ProgramInput {
+                uv,
+                offset: 0,
+                _pad: 0,
+                object: Vec3::new(object[0], object[1], object[2]),
+                world: Vec3::new(world[0], world[1], world[2]),
+            },
+        )
+    })
+    .collect()
+}
+
+/// Every op, compiled into one buffer and run against the reference evaluator
+/// at a handful of points.
+///
+/// The reference is a second implementation on purpose (see
+/// `scene::program::evaluate`). What a compiled format gets wrong is not
+/// usually the arithmetic — it is the compiler and the decoder agreeing with
+/// each other about an encoding the scene never asked for, and only an
+/// evaluator that never sees the words can catch that.
+#[test]
+fn the_program_evaluator_agrees_with_the_reference() {
+    use crate::config::Operand;
+    use crate::scene::Programs;
+
+    let trees: Vec<(&str, &str)> = vec![
+        ("a scalar constant", "0.25"),
+        ("a color constant", "[0.1, 0.2, 0.3]"),
+        ("uv", "uv"),
+        ("uv.g", "uv.g"),
+        // The general channel op: the same word, taken off something that is
+        // not a coordinate. This is the shape a patterned `emission_strength`
+        // is folded into.
+        ("a channel off a call", "remap(uv, [0.0, 4.0]).r"),
+        ("a channel off a colour", "[0.1, 0.2, 0.3].b"),
+        ("object", "object"),
+        ("object.y", "object.y"),
+        ("world.z", "world.z"),
+        ("invert", "invert(uv)"),
+        ("remap over the unit range", "remap(uv.r, [0.1, 0.9])"),
+        (
+            "remap that clamps at both ends",
+            "remap(world.x, [-1.0, 1.0], [0.0, 1.0])",
+        ),
+        ("a descending remap", "remap(uv.r, [0.0, 2.0], [1.0, 0.0])"),
+        ("mix", "mix([0.9, 0.1, 0.2], 0.4, uv.r)"),
+        ("multiply", "multiply([0.9, 0.1, 0.2], 0.4, uv.g)"),
+        ("add", "add([0.9, 0.1, 0.2], 0.4, uv.r)"),
+        (
+            "overlay across the half-way line",
+            "overlay([0.9, 0.1, 0.5], [0.2, 0.7, 0.5], 1.0)",
+        ),
+        ("a factor the shader has to clamp", "mix(0.0, 1.0, world.x)"),
+        (
+            "a nest of all of them",
+            "remap(multiply(invert(uv), object, remap(world.y, [0.0, 12.0], [0.0, 1.0])), \
+             [-2.0, 2.0], [0.25, 0.75])",
+        ),
+    ];
+
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        field: Operand,
+    }
+
+    let mut programs = Programs::default();
+    let compiled: Vec<(&str, Operand, u32)> = trees
+        .iter()
+        .map(|(name, source)| {
+            let operand = toml::from_str::<Holder>(&format!("field = {source:?}"))
+                .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+                .field;
+            let offset = programs
+                .compile_one(&operand)
+                .unwrap_or_else(|error| panic!("{name} should compile: {error}"));
+            (*name, operand, offset)
+        })
+        .collect();
+
+    let points = evaluation_points();
+    let inputs: Vec<ProgramInput> = compiled
+        .iter()
+        .flat_map(|(_, _, offset)| {
+            points.iter().map(move |(_, input)| ProgramInput {
+                offset: *offset,
+                ..*input
+            })
+        })
+        .collect();
+
+    let source = r#"
+struct Input {
+    uv: vec2f,
+    offset: u32,
+    _pad: u32,
+    object: vec3f,
+    world: vec3f,
+}
+
+struct Output {
+    value: vec4f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    return Output(evaluate_input(input.offset, Coordinates(input.uv, input.object, input.world)));
+}
+"#;
+    let words: Vec<u8> = cast_slice(programs.words()).to_vec();
+    let Some(outputs): Option<Vec<[f32; 4]>> = run_over_scene(source, &inputs, &[(10, words)])
+    else {
+        return;
+    };
+
+    let mut output = outputs.iter();
+    for (name, operand, _) in &compiled {
+        for (at, _) in &points {
+            let actual = output.next().expect("one output per evaluation");
+            let expected = crate::scene::program::evaluate(operand, *at);
+
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() < 1e-5,
+                    "{name} at {at:?}: got {actual:?}, the reference says {expected:?}",
+                );
+            }
+        }
+    }
+}
+
+/// Texture coordinates across a triangle, against the interpolation written out
+/// by hand. The three corners have to come back exactly, because a pattern that
+/// is a texel off at a seam is a pattern with a seam.
+#[test]
+fn a_texture_coordinate_is_interpolated_across_its_triangle() {
+    use crate::scene::GpuAttributes;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Input {
+        bary: [f32; 2],
+        triangle: u32,
+        _pad: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Output {
+        uv: [f32; 2],
+        _pad: [f32; 2],
+    }
+
+    // The two triangles a unit quad fans into, with the corner coordinates
+    // `scene::geometry` would have given them.
+    let faces = [
+        GpuAttributes {
+            uv0: [0.0, 0.0],
+            uv1: [1.0, 0.0],
+            uv2: [1.0, 1.0],
+        },
+        GpuAttributes {
+            uv0: [0.0, 0.0],
+            uv1: [1.0, 1.0],
+            uv2: [0.0, 1.0],
+        },
+    ];
+
+    let mut inputs = Vec::new();
+    let mut expected = Vec::new();
+    for (triangle, face) in faces.iter().enumerate() {
+        for bary in [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0 / 3.0, 1.0 / 3.0],
+            [0.25, 0.5],
+        ] {
+            inputs.push(Input {
+                bary,
+                triangle: triangle as u32,
+                _pad: 0,
+            });
+
+            let w = 1.0 - bary[0] - bary[1];
+            expected.push([
+                face.uv0[0] * w + face.uv1[0] * bary[0] + face.uv2[0] * bary[1],
+                face.uv0[1] * w + face.uv1[1] * bary[0] + face.uv2[1] * bary[1],
+            ]);
+        }
+    }
+
+    let source = r#"
+struct Input {
+    bary: vec2f,
+    triangle: u32,
+    _pad: u32,
+}
+
+struct Output {
+    uv: vec2f,
+    _pad: vec2f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    return Output(triangle_uv(input.triangle, input.bary), vec2f(0.0));
+}
+"#;
+    let attributes: Vec<u8> = cast_slice(&faces).to_vec();
+    let Some(outputs): Option<Vec<Output>> = run_over_scene(source, &inputs, &[(8, attributes)])
+    else {
+        return;
+    };
+
+    for ((actual, expected), input) in outputs.iter().zip(&expected).zip(&inputs) {
+        for axis in 0..2 {
+            assert!(
+                (actual.uv[axis] - expected[axis]).abs() < 1e-6,
+                "triangle {} at {:?}: got {:?}, expected {expected:?}",
+                input.triangle,
+                input.bary,
+                actual.uv,
+            );
+        }
+    }
+}
+
+/// An emitter whose radiance comes from a pattern has to light the floor by the
+/// same amount whichever strategy finds it.
+///
+/// This is the one thing a bound can get wrong. The light table weighs the
+/// emitter by an upper bound, and `light_pdf` prices a direction by the same
+/// bound, so the two strategies still agree — but only as long as the radiance
+/// light sampling hands back is what the surface emits at the point it drew.
+/// Return the bound there instead and the floor comes out brighter with next
+/// event estimation on than off, by exactly the slack in the bound.
+#[test]
+fn light_sampling_and_scattering_agree_on_a_patterned_emitter() {
+    // The emitter is the blocker-sized quad `lit_floor` hangs overhead, its
+    // emission ramped across object x. The bound is 40 and the mean over the
+    // quad is half of it, so a bound handed back as radiance would double the
+    // floor's brightness and this test would see it.
+    let patterned = r#"material = "principled"
+base_color = [0.0, 0.0, 0.0]
+ior = 1.0
+emission_color = "remap(object.x, [-4.0, 4.0], [0.0, 1.0])"
+emission_strength = 40.0"#;
+
+    let Some(sampled) = lit_floor(patterned, None, true, 1) else {
+        return;
+    };
+    let Some(scattered) = lit_floor(patterned, None, false, 1) else {
+        return;
+    };
+    let Some(flat) = lit_floor(&glowing(40.0), None, true, 1) else {
+        return;
+    };
+
+    let context = format!("light sampling {sampled}, scattering {scattered}, flat 40 is {flat}");
+    assert!(sampled > 0.01, "the floor should be lit: {context}");
+    assert!(
+        (scattered - sampled).abs() < 0.08 * sampled,
+        "the two strategies should agree: {context}"
+    );
+    assert!(
+        sampled < flat * 0.85,
+        "a ramp averaging half of 40 should be well under a flat 40: {context}"
     );
 }

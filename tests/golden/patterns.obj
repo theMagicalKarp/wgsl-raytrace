@@ -1,0 +1,31 @@
+# Two UV-mapped quads for the patterns golden. Written by hand rather than
+# exported: every other mesh here has no `vt` lines at all, and a scene that is
+# about texture coordinates needs a surface that has some.
+#
+# Both are wound so their geometric normal faces the room — the wall emits, and
+# emission is one-sided.
+
+# Floor, y = 0, twelve units square, facing +y.
+v -6.0 0.0 -6.0
+v -6.0 0.0  6.0
+v  6.0 0.0  6.0
+v  6.0 0.0 -6.0
+
+# Wall, z = -6, twelve wide and eight high, facing +z.
+v -6.0 0.0 -6.0
+v  6.0 0.0 -6.0
+v  6.0 8.0 -6.0
+v -6.0 8.0 -6.0
+
+# The unit square, shared by both: u runs left to right across each quad, v runs
+# away from the camera on the floor and upward on the wall.
+vt 0.0 0.0
+vt 0.0 1.0
+vt 1.0 1.0
+vt 1.0 0.0
+
+o Floor
+f 1/1 2/2 3/3 4/4
+
+o Wall
+f 5/1 6/4 7/3 8/2

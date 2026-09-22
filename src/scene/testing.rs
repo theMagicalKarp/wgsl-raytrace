@@ -3,6 +3,7 @@ use crate::config::Transform;
 use crate::config::Wavefront;
 use crate::math;
 use crate::scene::geometry;
+use crate::scene::geometry::GpuAttributes;
 use crate::scene::geometry::GpuTriangle;
 use crate::scene::wavefront::parse;
 use std::error::Error;
@@ -37,19 +38,26 @@ pub(super) fn wavefront(group: Option<&str>, transform: Vec<Transform>) -> Wavef
     }
 }
 
+/// The triangles and their shading attributes, which are built together and in
+/// the same order, so a test that cares about one usually cares about both.
 pub(super) fn load(
     source: &str,
     wavefront: &Wavefront,
-) -> Result<Vec<GpuTriangle>, Box<dyn Error>> {
+) -> Result<(Vec<GpuTriangle>, Vec<GpuAttributes>), Box<dyn Error>> {
     let object = parse(source)?;
 
     let mut out = Vec::new();
-    geometry::append(&object, wavefront, 0, &mut out)?;
-    Ok(out)
+    let mut attributes = Vec::new();
+    geometry::append(&object, wavefront, 0, &mut out, &mut attributes)?;
+    Ok((out, attributes))
 }
 
 pub(super) fn triangles(source: &str, wavefront: &Wavefront) -> Vec<GpuTriangle> {
-    load(source, wavefront).expect("test mesh should load")
+    load(source, wavefront).expect("test mesh should load").0
+}
+
+pub(super) fn attributes(source: &str, wavefront: &Wavefront) -> Vec<GpuAttributes> {
+    load(source, wavefront).expect("test mesh should load").1
 }
 
 pub(super) fn close(actual: [f32; 3], expected: [f32; 3]) {

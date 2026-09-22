@@ -36,6 +36,15 @@ const SKY: Golden = Golden {
     reference: "tests/golden/sky.png",
 };
 
+/// Lit by an emitter whose radiance is a pattern, over surfaces whose colour
+/// and roughness are patterns too. The only scene that reaches `resolve_material`
+/// with anything to resolve, and the only one where light sampling has to
+/// evaluate an emitter rather than read it.
+const PATTERNS: Golden = Golden {
+    scene: "tests/golden/patterns.toml",
+    reference: "tests/golden/patterns.png",
+};
+
 /// How far one channel may drift before its pixel is called an outlier rather
 /// than noise, out of 255.
 const OUTLIER: i32 = 24;
@@ -194,6 +203,11 @@ fn the_lit_render_matches_the_reference() {
 #[test]
 fn the_sky_render_matches_the_reference() {
     compare_to_reference(&SKY, "golden-sky");
+}
+
+#[test]
+fn the_patterned_render_matches_the_reference() {
+    compare_to_reference(&PATTERNS, "golden-patterns");
 }
 
 /// The filter with nothing to filter has to hand back exactly what it was

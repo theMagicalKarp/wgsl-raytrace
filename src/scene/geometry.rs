@@ -37,6 +37,33 @@ pub struct GpuTriangle {
 
 const _: () = assert!(size_of::<GpuTriangle>() == 96);
 
+/// The shading attributes of one triangle, in the same order as
+/// [`GpuTriangle`], as the shader reads them.
+///
+/// A second buffer rather than three more fields on the triangle, because
+/// traversal is the hot loop and it never wants these: a ray tests a few dozen
+/// triangles to find one hit, and only the hit is shaded. Keeping the tested
+/// bytes and the shaded bytes apart is what stops a texture coordinate from
+/// costing a cache line on every miss.
+///
+/// A `vec2f` is 8-aligned, so three of them pack with no padding at all.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuAttributes {
+    /// Texture coordinates as the `.obj` spelled them, one per corner, matching
+    /// `v0`, `v1` and `v2`. Zero on a face whose file supplied none, which is
+    /// every mesh here but melee's.
+    ///
+    /// Not flipped, wrapped or clamped: these are the file's numbers, and what
+    /// a coordinate outside the unit square means is the sampler's question,
+    /// not the loader's.
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+}
+
+const _: () = assert!(size_of::<GpuAttributes>() == 24);
+
 /// Appends `wavefront`'s triangles, in world space and tagged with `material`
 /// and its alpha.
 ///
@@ -53,6 +80,7 @@ pub(super) fn append(
     wavefront: &Wavefront,
     material: u32,
     out: &mut Vec<GpuTriangle>,
+    attributes: &mut Vec<GpuAttributes>,
 ) -> Result<(), Box<dyn Error>> {
     let model = Model::new(&wavefront.transform);
     let alpha = GpuMaterial::from(&wavefront.material).alpha;
@@ -63,8 +91,14 @@ pub(super) fn append(
         let (x, y, z, _) = object.positions[corner.0];
         math::transform_point(model.points, [x, y, z])
     };
+    let texture = |corner: Corner| {
+        corner.1.map_or([0.0, 0.0], |index| {
+            let (u, v, _) = object.tex_coords[index];
+            [u, v]
+        })
+    };
     let normal = |corner: Corner| {
-        corner.1.map(|index| {
+        corner.2.map(|index| {
             let (x, y, z) = object.normals[index];
             math::transform_direction(model.normals, [x, y, z])
         })
@@ -97,6 +131,12 @@ pub(super) fn append(
                 n2: normals[2],
                 _pad5: 0.0,
             });
+            let uv = fan.map(texture);
+            attributes.push(GpuAttributes {
+                uv0: uv[0],
+                uv1: uv[1],
+                uv2: uv[2],
+            });
         }
     }
 
@@ -113,6 +153,7 @@ mod tests {
     use crate::config::Transform;
     use crate::scene::testing::BLOCKS;
     use crate::scene::testing::QUAD;
+    use crate::scene::testing::attributes;
     use crate::scene::testing::close;
     use crate::scene::testing::load;
     use crate::scene::testing::triangles;
@@ -150,10 +191,10 @@ mod tests {
     #[test]
     fn every_triangle_carries_its_materials_alpha() {
         let mut object = wavefront(None, vec![]);
-        object.material = Material::Principled(Principled {
+        object.material = Material::Principled(Box::new(Principled {
             alpha: 0.3,
             ..Principled::default()
-        });
+        }));
         let cutout = triangles(QUAD, &object);
 
         object.material = Material::Lambertian { albedo: [0.5; 3] };
@@ -162,6 +203,64 @@ mod tests {
         assert_eq!(cutout.len(), 2);
         assert!(cutout.iter().all(|triangle| triangle.alpha == 0.3));
         assert!(opaque.iter().all(|triangle| triangle.alpha == 1.0));
+    }
+
+    /// A fan splits one face into triangles, and each one has to take the
+    /// texture coordinates of the corners it was actually built from — the same
+    /// three corners its positions came from, or the coordinates slide across
+    /// the quad's diagonal.
+    #[test]
+    fn keeps_the_texture_coordinates_a_file_supplies() {
+        let source = "
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 1.0 1.0 0.0
+v 0.0 1.0 0.0
+vt 0.0 0.0
+vt 1.0 0.0
+vt 1.0 1.0
+vt 0.0 1.0
+f 1/1 2/2 3/3 4/4
+";
+
+        let out = attributes(source, &wavefront(None, vec![]));
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].uv0, [0.0, 0.0]);
+        assert_eq!(out[0].uv1, [1.0, 0.0]);
+        assert_eq!(out[0].uv2, [1.0, 1.0]);
+        assert_eq!(out[1].uv0, [0.0, 0.0]);
+        assert_eq!(out[1].uv1, [1.0, 1.0]);
+        assert_eq!(out[1].uv2, [0.0, 1.0]);
+    }
+
+    /// Nearly every mesh here has no `vt` lines at all, and one that does not
+    /// is not an error — it is a surface no input can be mapped onto.
+    #[test]
+    fn a_face_without_texture_coordinates_gets_zeros() {
+        let out = attributes(QUAD, &wavefront(None, vec![]));
+
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|face| *face == Default::default()));
+    }
+
+    /// Texture coordinates belong to the surface, not to where it is standing.
+    #[test]
+    fn texture_coordinates_ignore_the_model_transform() {
+        let source = "
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+vt 0.25 0.75
+f 1/1 2/1 3/1
+";
+        let moved = Transform::Translate {
+            offset: [5.0, 0.0, 0.0],
+        };
+
+        let out = attributes(source, &wavefront(None, vec![moved]));
+
+        assert_eq!(out[0].uv0, [0.25, 0.75]);
     }
 
     #[test]

@@ -101,6 +101,14 @@ struct Material {
     // Henyey-Greenstein asymmetry for that walk: straight back at -1, every
     // direction alike at zero, straight on at 1.
     subsurface_anisotropy: f32,
+    // Where this surface's field table starts in `program`, or NO_PROGRAM when
+    // nothing about it is patterned — which is every material in every scene
+    // written before inputs existed, and the one test `resolve_material` has to
+    // make before it can skip all of this.
+    //
+    // Rides in what was padding beside the two subsurface scalars, so a surface
+    // with inputs and one without are the same eighty bytes.
+    inputs: u32,
     // Radiance given off the front face, decided by the geometric normal. Zero
     // for a surface that does not emit.
     emission: vec3f,
@@ -189,9 +197,34 @@ struct Albedo {
 }
 @group(0) @binding(4) var<storage, read_write> albedos: array<Albedo>;
 
+// The shading attributes of one triangle, packed by `GpuAttributes` and stored
+// in the same order as `triangles`, so one index addresses both.
+//
+// Split out of `Triangle` rather than added to it because traversal is what
+// touches triangles: a ray tests dozens of them to find the one it shades, and
+// none of this says anything about whether it was hit. The hot loop keeps the
+// bytes it reads and this keeps the bytes it does not.
+struct Attributes {
+    // Texture coordinates per corner, as the `.obj` spelled them. Zero on a
+    // mesh whose file supplied none.
+    uv0: vec2f,
+    uv1: vec2f,
+    uv2: vec2f,
+}
+
 @group(1) @binding(0) var<storage> materials: array<Material>;
 @group(1) @binding(1) var<storage> triangles: array<Triangle>;
 @group(1) @binding(2) var<storage> bvh: array<BvhNode>;
+@group(1) @binding(8) var<storage> attributes: array<Attributes>;
+// World space back to each object's own, one entry per material. A pattern
+// written in object coordinates reads through this, so it stays put on the
+// surface when the scene moves the object.
+@group(1) @binding(9) var<storage> inverse_models: array<mat4x4f>;
+// Every material's input programs, laid out by `scene::program`: a field table
+// per material, and behind each table the postfix programs its slots name.
+// One buffer of plain words rather than a buffer per thing, because a storage
+// binding is the scarce resource here and a word is not.
+@group(1) @binding(10) var<storage> program: array<u32>;
 // One emissive triangle, as an entry in the distribution the host built over
 // them in `scene/light.rs`.
 struct Light {
@@ -373,6 +406,16 @@ struct Intersection {
     // does not know where it is stored — and light sampling needs it to recover
     // the emitter's area from a hit.
     triangle: u32,
+    // Where on the triangle, as Möller-Trumbore's two coordinates: `v0` is
+    // weighted by `1 - u - v`, `v1` by `u` and `v2` by `v`.
+    //
+    // Carried out of traversal rather than derived from the point afterwards,
+    // because the test has them already and recovering them from a world
+    // position costs another cross product and loses digits on a thin triangle.
+    // What is *not* carried is anything interpolated from them: a texture
+    // coordinate is derived once, from the closest hit, by [`hit_uv`] — every
+    // triangle a ray tests would otherwise pay for the one it keeps.
+    bary: vec2f,
 }
 
 // What a path saw of the surface it landed on, for a denoiser to steer by.
@@ -428,7 +471,20 @@ fn no_features() -> Features {
 }
 
 fn no_intersection() -> Intersection {
-    return Intersection(vec3f(0.0), -1.0, 0u, true, 0u);
+    return Intersection(vec3f(0.0), -1.0, 0u, true, 0u, vec2f(0.0));
+}
+
+// The texture coordinate of a point on a triangle, interpolated across it.
+// Worth calling once per shaded point and never inside traversal.
+//
+// Takes an index and barycentrics rather than an `Intersection`, because light
+// sampling draws a point on an emitter without ever intersecting it and has to
+// arrive at the same coordinate the scattered ray would.
+fn triangle_uv(triangle: u32, bary: vec2f) -> vec2f {
+    let face = attributes[triangle];
+    let w = 1.0 - bary.x - bary.y;
+
+    return face.uv0 * w + face.uv1 * bary.x + face.uv2 * bary.y;
 }
 
 // Möller-Trumbore. Deliberately two-sided: a mesh here is a surface rather than
@@ -472,7 +528,7 @@ fn intersect_triangle(ray: Ray, tri: Triangle) -> Intersection {
     let front_face = dot(ray.direction, normal) < 0.0;
     normal = select(-normal, normal, front_face);
 
-    return Intersection(normal, t, tri.material, front_face, 0u);
+    return Intersection(normal, t, tri.material, front_face, 0u, vec2f(u, v));
 }
 
 // The same test as [`intersect_triangle`], answering only whether the triangle
@@ -1541,6 +1597,10 @@ fn exit_surface() -> Material {
         1.0,
         0.0,
         0.0,
+        // Nothing patterned: the exit of a walk is a literal white Lambertian,
+        // not the surface the walk started on, and it has no coordinates worth
+        // evaluating anything at.
+        NO_PROGRAM,
         vec3f(0.0),
         vec3f(0.0),
     );
@@ -1560,6 +1620,220 @@ fn exit_surface() -> Material {
 // Only the pixel is stratified. The lens draw below, the scatter directions and
 // the light draws stay independent: padding those dimensions needs machinery
 // this does not have, and the edge noise is what the pixel grid buys.
+// ---------------------------------------------------------------------------
+// Material inputs
+//
+// Every patternable field of a surface is either a constant, already sitting in
+// the material, or a program: a postfix list of ops evaluated once per hit on a
+// small register stack. One machinery for all of it, which is what lets an
+// image, a noise and a mix of the two be the same kind of thing later on.
+//
+// An input *replaces* the value it stands in for. Nothing here multiplies the
+// field's constant back in, because a field's default is not a neutral element
+// — `roughness` defaults to 0.5 — and "this pattern, halved" is not what a
+// scene that writes a pattern is asking for.
+// ---------------------------------------------------------------------------
+
+// A field with no program, and a material with no field table.
+const NO_PROGRAM: u32 = 0xffffffffu;
+
+// Op codes, matching `scene::program`.
+const OP_END: u32 = 0u;
+const OP_CONSTANT: u32 = 1u;
+const OP_COORDINATES: u32 = 2u;
+const OP_CHANNEL: u32 = 3u;
+const OP_INVERT: u32 = 4u;
+const OP_REMAP: u32 = 5u;
+const OP_MIX: u32 = 6u;
+
+const SPACE_UV: u32 = 0u;
+const SPACE_OBJECT: u32 = 1u;
+const SPACE_WORLD: u32 = 2u;
+
+const BLEND_MIX: u32 = 0u;
+const BLEND_MULTIPLY: u32 = 1u;
+const BLEND_ADD: u32 = 2u;
+const BLEND_OVERLAY: u32 = 3u;
+
+// Slots of a material's field table, in the order the host writes them.
+const FIELD_BASE_COLOR: u32 = 0u;
+const FIELD_ROUGHNESS: u32 = 1u;
+const FIELD_METALLIC: u32 = 2u;
+const FIELD_IOR: u32 = 3u;
+const FIELD_TRANSMISSION: u32 = 4u;
+const FIELD_SUBSURFACE_WEIGHT: u32 = 5u;
+const FIELD_EMISSION: u32 = 6u;
+
+// How many values a program may have in flight. A fixed array, so this is paid
+// for in occupancy by every thread whether it evaluates anything or not — which
+// is why it is eight and not sixty-four. The host rejects a tree that would
+// outrun it, so nothing here has to check.
+const MAX_INPUT_STACK: u32 = 8u;
+
+// Where a hit is, in every space a pattern can be written in. Built once per
+// resolved hit, because a program can ask for any of them and asking twice for
+// the same one is a matrix multiply nobody needed.
+struct Coordinates {
+    uv: vec2f,
+    object: vec3f,
+    world: vec3f,
+}
+
+fn surface_coordinates(triangle: u32, material: u32, bary: vec2f, point: vec3f) -> Coordinates {
+    let object = inverse_models[material] * vec4f(point, 1.0);
+
+    return Coordinates(triangle_uv(triangle, bary), object.xyz, point);
+}
+
+// The two sides of a blend, mixed the way `config::input::blend` does on the
+// host — the host's bounds for the light table are computed with that one, so
+// the two have to say the same thing.
+//
+// The factor is clamped rather than extrapolated. That is what makes a mix
+// bounded by its two sides whatever drives it, which is what lets an emissive
+// mix be weighted in the light table at all.
+fn blend_inputs(mode: u32, a: vec4f, b: vec4f, factor: f32) -> vec4f {
+    var mixed = b;
+    if mode == BLEND_MULTIPLY {
+        mixed = a * b;
+    } else if mode == BLEND_ADD {
+        mixed = a + b;
+    } else if mode == BLEND_OVERLAY {
+        // Multiply in the dark half, screen in the light half, per channel.
+        let dark = 2.0 * a * b;
+        let light = 1.0 - 2.0 * (1.0 - a) * (1.0 - b);
+        mixed = select(light, dark, a < vec4f(0.5));
+    }
+
+    return a + (mixed - a) * clamp(factor, 0.0, 1.0);
+}
+
+// Runs one field's program and returns what it left on the stack.
+//
+// The program is a flat list of words: each op is its code followed by its
+// immediate operands, floats carried as their bit patterns. The host laid it
+// out and checked it, so there is no malformed program to defend against here —
+// only `OP_END`, which is what stops the loop.
+fn evaluate_input(start: u32, coords: Coordinates) -> vec4f {
+    var stack: array<vec4f, MAX_INPUT_STACK>;
+    var depth = 0u;
+    var pc = start;
+
+    loop {
+        let code = program[pc];
+        pc += 1u;
+
+        if code == OP_END {
+            break;
+        }
+
+        if code == OP_CONSTANT {
+            stack[depth] = vec4f(
+                bitcast<f32>(program[pc]),
+                bitcast<f32>(program[pc + 1u]),
+                bitcast<f32>(program[pc + 2u]),
+                bitcast<f32>(program[pc + 3u]),
+            );
+            pc += 4u;
+            depth += 1u;
+        } else if code == OP_COORDINATES {
+            let space = program[pc];
+            pc += 1u;
+
+            var value = vec4f(coords.uv, 0.0, 1.0);
+            if space == SPACE_OBJECT {
+                value = vec4f(coords.object, 1.0);
+            } else if space == SPACE_WORLD {
+                value = vec4f(coords.world, 1.0);
+            }
+            stack[depth] = value;
+            depth += 1u;
+        } else if code == OP_CHANNEL {
+            // One component, broadcast: a field that wants a scalar reads the
+            // first channel, and one that wants a color gets grey.
+            let channel = program[pc];
+            pc += 1u;
+            stack[depth - 1u] = vec4f(stack[depth - 1u][channel]);
+        } else if code == OP_INVERT {
+            stack[depth - 1u] = vec4f(1.0) - stack[depth - 1u];
+        } else if code == OP_REMAP {
+            let source = vec2f(bitcast<f32>(program[pc]), bitcast<f32>(program[pc + 1u]));
+            let onto = vec2f(bitcast<f32>(program[pc + 2u]), bitcast<f32>(program[pc + 3u]));
+            pc += 4u;
+
+            // Clamped, which is what gives an unbounded pattern — a raw
+            // coordinate — a range it is allowed to drive a field with. The
+            // host rejects a `from` with no width, so this cannot divide by
+            // zero.
+            let t = clamp((stack[depth - 1u] - source.x) / (source.y - source.x), vec4f(0.0), vec4f(1.0));
+            stack[depth - 1u] = onto.x + t * (onto.y - onto.x);
+        } else if code == OP_MIX {
+            let mode = program[pc];
+            pc += 1u;
+
+            // Pushed a, then b, then the factor, so they come back the other
+            // way round. The factor is a scalar: its first channel, whatever it
+            // was computed as.
+            let factor = stack[depth - 1u].x;
+            stack[depth - 3u] = blend_inputs(mode, stack[depth - 3u], stack[depth - 2u], factor);
+            depth -= 2u;
+        }
+    }
+
+    return stack[0];
+}
+
+// Evaluates one slot of a field table, or hands back `fallback` when nothing
+// patterns it.
+fn resolve_field(table: u32, field: u32, coords: Coordinates, fallback: vec3f) -> vec3f {
+    let offset = program[table + field];
+    if offset == NO_PROGRAM {
+        return fallback;
+    }
+
+    return evaluate_input(offset, coords).rgb;
+}
+
+// The surface at a hit, with every patterned field evaluated there.
+//
+// The single place a material is read for shading. Everything downstream — the
+// features, next event estimation, `bsdf_sample`, the subsurface walk — takes a
+// plain `Material` and cannot tell that any of this happened, which is the
+// whole point of resolving here and nowhere else.
+//
+// A surface with nothing patterned leaves on the first branch, having paid one
+// comparison. That is every material in every scene that came before this.
+fn resolve_material(hit: Intersection, point: vec3f) -> Material {
+    var material = materials[hit.material];
+    if material.inputs == NO_PROGRAM {
+        return material;
+    }
+
+    let table = material.inputs;
+    let coords = surface_coordinates(hit.triangle, hit.material, hit.bary, point);
+
+    // Clamped into the range the BSDF can price. A constant was checked by the
+    // host, but a pattern is a function of where the ray landed and no host can
+    // check that — an unclamped remap onto a wide range, or a coordinate run
+    // through a mix, is a roughness of 4 or an index of refraction of 0.2 at
+    // some hit somewhere, and either one is a NaN a few lines later.
+    material.color = max(resolve_field(table, FIELD_BASE_COLOR, coords, material.color), vec3f(0.0));
+    material.roughness = clamp(resolve_field(table, FIELD_ROUGHNESS, coords, vec3f(material.roughness)).r, 0.0, 1.0);
+    material.metallic = clamp(resolve_field(table, FIELD_METALLIC, coords, vec3f(material.metallic)).r, 0.0, 1.0);
+    material.ior = max(resolve_field(table, FIELD_IOR, coords, vec3f(material.ior)).r, 1.0);
+    material.transmission = clamp(resolve_field(table, FIELD_TRANSMISSION, coords, vec3f(material.transmission)).r, 0.0, 1.0);
+    material.subsurface_weight = clamp(resolve_field(table, FIELD_SUBSURFACE_WEIGHT, coords, vec3f(material.subsurface_weight)).r, 0.0, 1.0);
+
+    // Emission is the one field whose constant is not a placeholder: it is the
+    // upper bound the light table was built from, and `light_pdf` still prices
+    // a direction by it. What the surface gives off *here* replaces it only for
+    // the radiance, which is why this is the last line and nothing above reads
+    // it.
+    material.emission = max(resolve_field(table, FIELD_EMISSION, coords, material.emission), vec3f(0.0));
+
+    return material;
+}
+
 fn primary_ray(pixel: vec2u) -> Ray {
     let resolution = vec2f(f32(camera.width), f32(camera.height));
 
@@ -1667,6 +1941,36 @@ fn emitted(material: Material) -> vec3f {
     return material.emission * material.alpha;
 }
 
+// What an emitter gives off at one point on it, which is not the same question
+// once a pattern drives emission.
+//
+// `material.emission` is then an upper bound and not a value: it is what the
+// light table was built from and what `light_density` prices a draw by, and
+// both of those are decided before the render starts. The radiance the
+// estimator actually divides by that density has to be what the surface emits
+// *there* — a bound handed back as radiance would be light invented out of the
+// slack in the bound.
+//
+// The scattered ray's half of this needs nothing special: it reads a resolved
+// material, which already has the evaluated emission in it.
+fn emitted_at(triangle: u32, bary: vec2f, point: vec3f) -> vec3f {
+    let index = triangles[triangle].material;
+    let material = materials[index];
+    if material.inputs == NO_PROGRAM {
+        return emitted(material);
+    }
+
+    let offset = program[material.inputs + FIELD_EMISSION];
+    if offset == NO_PROGRAM {
+        return emitted(material);
+    }
+
+    let coords = surface_coordinates(triangle, index, bary, point);
+    let emission = max(evaluate_input(offset, coords).rgb, vec3f(0.0));
+
+    return emission * material.alpha;
+}
+
 // The density with which [`sample_light`] draws a direction, per unit solid
 // angle, given the emitter it lands on and how that emitter is turned.
 //
@@ -1760,7 +2064,8 @@ struct LightSample {
 // Draws a point on an emitter: a triangle out of the table, then a point
 // uniformly on that triangle.
 fn sample_light(origin: vec3f) -> LightSample {
-    let tri = triangles[select_light(rand_f32()).triangle];
+    let index = select_light(rand_f32()).triangle;
+    let tri = triangles[index];
 
     let e1 = tri.v1 - tri.v0;
     let e2 = tri.v2 - tri.v0;
@@ -1786,15 +2091,23 @@ fn sample_light(origin: vec3f) -> LightSample {
     let material = materials[tri.material];
     let cosine = emitted_cosine(tri, direction);
 
+    // The density is priced off `material.emission`, which is the *bound* when a
+    // pattern drives it, because that is what the table was built in proportion
+    // to and the two have to be the same number. A loose bound only makes this
+    // strategy noisier — it spends draws on a triangle that turned out dim —
+    // and never makes it wrong.
     var pdf = 0.0;
     if distance > 0.0 {
         pdf = light_density(emitted(material), distance, cosine);
     }
 
-    // An emitter with its back turned leaves `pdf` at zero, and
-    // `direct_light` ends the draw on that before the shadow ray is cast — so
-    // this is a traversal saving as much as it is a knob.
-    return LightSample(direction, distance, emitted(material), pdf);
+    // The radiance is what the emitter gives off at the point that was actually
+    // drawn, which is the bound only when nothing patterns it.
+    //
+    // An emitter with its back turned leaves `pdf` at zero, and `direct_light`
+    // ends the draw on that before the shadow ray is cast — so this is a
+    // traversal saving as much as it is a knob.
+    return LightSample(direction, distance, emitted_at(index, vec2f(u, v), point), pdf);
 }
 
 // The row of the sky's distribution a uniform draw lands in: the first whose
@@ -2095,9 +2408,14 @@ fn trace_path(primary: Ray) -> Path {
             return Path(radiance + throughput * escaped, features);
         }
 
-        let material = materials[hit.material];
+        // Coverage, which is the one thing read before the surface is resolved:
+        // alpha is not patternable, a shadow ray settles it off the triangle
+        // without a material lookup at all, and a ray that passes through never
+        // shades what it passed through. Resolving first would be evaluating a
+        // program for a surface the path is about to decide is not there.
+        let coverage = materials[hit.material].alpha;
 
-        // Coverage. With probability `1 - alpha` the surface is not there: the
+        // With probability `1 - alpha` the surface is not there: the
         // ray carries on from it undeviated, and nothing about the path
         // changes — not the throughput, and not how its direction was chosen,
         // so whatever it lands on next is weighed against the vertex that
@@ -2106,7 +2424,7 @@ fn trace_path(primary: Ray) -> Path {
         //
         // The roll is only taken below one, so an opaque scene keeps exactly
         // the random stream it drew before alpha existed.
-        if material.alpha < 1.0 && rand_f32() >= material.alpha {
+        if coverage < 1.0 && rand_f32() >= coverage {
             ray = Ray(point_on_ray(ray, hit.t), ray.direction);
             segment += hit.t;
             traveled += hit.t;
@@ -2116,6 +2434,12 @@ fn trace_path(primary: Ray) -> Path {
             }
             continue;
         }
+
+        // The one place a material is read for shading, and so the one place
+        // its inputs are evaluated. Everything below takes the resolved surface
+        // and cannot tell that any field of it came from a pattern.
+        let point = point_on_ray(ray, hit.t);
+        let material = resolve_material(hit, point);
 
         // The surface a denoiser gets to steer by, and it is deliberately not
         // the first one the ray met. Following melee's glass torus through to
@@ -2174,7 +2498,7 @@ fn trace_path(primary: Ray) -> Path {
         // added to, so everything below reads the same four names either way.
         var surface = material;
         var vertex = hit;
-        var origin = point_on_ray(ray, hit.t);
+        var origin = point;
         var outgoing = -ray.direction;
 
         var scattered = absorbed();
@@ -2214,7 +2538,10 @@ fn trace_path(primary: Ray) -> Path {
             surface = exit_surface();
             // `t` is never read off a vertex, and the material index is kept so
             // that the exit is still filed under the object it came out of.
-            vertex = Intersection(walk.normal, 0.0, vertex.material, true, walk.triangle);
+            // Barycentrics of zero rather than the exit point's: the surface
+            // that takes over there is a literal white Lambertian with nothing
+            // to look up, so no input is ever evaluated at this vertex.
+            vertex = Intersection(walk.normal, 0.0, vertex.material, true, walk.triangle, vec2f(0.0));
             origin = walk.point;
             // The exit is a diffuse transmission: what leaves does not depend on
             // which way the walk happened to arrive, and a surface at an index
