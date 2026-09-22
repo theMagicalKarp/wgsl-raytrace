@@ -172,13 +172,84 @@ into world space at load time.
 
 | `material` | Fields | Notes |
 | --- | --- | --- |
-| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `alpha`, `emission_color = [r, g, b]`, `emission_strength`, `subsurface_weight`, `subsurface_radius = [r, g, b]`, `subsurface_scale`, `subsurface_anisotropy` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). The surface emits `emission_color × emission_strength` from its front face only (the side its winding faces), on top of whatever it reflects, and is sampled as a light. `subsurface_weight` replaces that much of the diffuse base with a random walk under the surface (see below). All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `1.0`, `[1, 1, 1]`, `0.0`, `0.0`, `[1, 0.2, 0.1]`, `0.05`, `0.0`. `roughness`, `metallic`, `transmission`, `alpha` and `subsurface_weight` are in `[0, 1]`; `subsurface_anisotropy` is in `[-1, 1]`; `ior` is at least 1; emission, the radius and the scale are non-negative. |
+| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `alpha`, `emission_color = [r, g, b]`, `emission_strength`, `subsurface_weight`, `subsurface_radius = [r, g, b]`, `subsurface_scale`, `subsurface_anisotropy` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). The surface emits `emission_color × emission_strength` from its front face only (the side its winding faces), on top of whatever it reflects, and is sampled as a light. `subsurface_weight` replaces that much of the diffuse base with a random walk under the surface (see below). All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `1.0`, `[1, 1, 1]`, `0.0`, `0.0`, `[1, 0.2, 0.1]`, `0.05`, `0.0`. `roughness`, `metallic`, `transmission`, `alpha` and `subsurface_weight` are in `[0, 1]`; `subsurface_anisotropy` is in `[-1, 1]`; `ior` is at least 1; emission, the radius and the scale are non-negative. Most fields also accept a pattern instead of a number — see [Material inputs](#material-inputs). |
 | `lambertian` | `albedo = [r, g, b]` | Shorthand for `principled` with `base_color = albedo`, `roughness = 1`, `metallic = 0`, `ior = 1`. Pure diffuse. |
 | `metal` | `albedo`, `roughness` | Shorthand for `principled` with `base_color = albedo`, `metallic = 1`. |
 | `dielectric` | `refraction_index` | Shorthand for `principled` with `base_color = [1, 1, 1]`, `roughness = 0`, `metallic = 0`, `ior = refraction_index`, `transmission = 1`. Clear glass. |
 | `glass` | — | Dielectric with IOR 1.5. |
 | `water` | — | Dielectric with IOR 1.33. |
 | `light` | `emit = [r, g, b]` | Shorthand for `principled` with `base_color = [0, 0, 0]`, `ior = 1`, `emission_color = emit`, `emission_strength = 1`: emits from its front face and reflects nothing. Values above 1 are normal. |
+
+#### Material inputs
+
+Every field marked patternable below takes a number, *or* a pattern evaluated
+at every hit, written as an expression in a string:
+
+```toml
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+material = "principled"
+
+# Polished at one edge of the mesh's texture coordinates, rough at the other.
+roughness = "remap(uv.r, [0.05, 1.0])"
+
+# Red at the front of the object, blue at the back, in the object's own space
+# so it does not slide about when the object is moved.
+base_color = "mix([0.75, 0.15, 0.1], [0.1, 0.2, 0.7], remap(object.z, [-6, 6], [0, 1]))"
+```
+
+The whole grammar:
+
+```text
+operand     := primary {. channel}
+primary     := number | color | coordinates | call
+color       := [r, g, b]
+coordinates := uv | object | world
+channel     := r | g | b | a   (or x | y | z | w, for the same four)
+call        := invert(operand)
+             | remap(operand, [to0, to1])
+             | remap(operand, [from0, from1], [to0, to1])
+             | (mix | multiply | add | overlay)(a, b, factor)
+```
+
+A blend mode is the name of the call rather than an argument to it, so
+`overlay(a, b, f)` is the overlay mix. Whitespace is free, numbers may be
+written any way TOML writes them (`-6`, `0.5`, `1e-3`), and an error names the
+column it stopped at inside the string, on top of the line TOML names.
+
+A pattern **replaces** the field it is written in place of; it does not
+multiply it. Where a pattern produces three channels and the field wants one,
+the first is used; where it produces one and the field wants three, it is
+broadcast. `.channel` after any operand — not only after a coordinate — picks
+one component and broadcasts it, which is how a pattern says which of its
+channels a scalar field should read: `remap(uv, [0, 4]).g`.
+
+**Patternable**: `base_color`, `roughness`, `metallic`, `ior`, `transmission`,
+`emission_color`, `emission_strength`, `subsurface_weight`. **Not**: `alpha`,
+`subsurface_radius`, `subsurface_scale`, `subsurface_anisotropy`.
+
+| Expression | What it is |
+| --- | --- |
+| `uv`, `object`, `world` | Where the hit is. `uv` is the mesh's own texture coordinates, zero on a `.obj` with no `vt` lines. `object` is the space the file was authored in, recovered by undoing the object's transform, so a pattern written in it stays put when the object moves. `world` is fixed to the scene instead. |
+| `.r`/`.g`/`.b`/`.a` (or `.x`/`.y`/`.z`/`.w`) after any operand | Keeps that one component and broadcasts it to the rest. |
+| `invert(input)` | `1 - input`, per channel. |
+| `remap(input, [from], [to])`, `from` defaulting to `[0, 1]` | `input` taken from one range onto another, **clamped** to `to`. The way to give an unbounded pattern a range. `from` may not have two equal ends; `to` may descend. |
+| `mix(a, b, factor)`, and `multiply`, `add`, `overlay` the same way | `a` and `b` blended by `factor`, which is clamped to `[0, 1]`. Blender's Mix node arithmetic. |
+
+Any of `input`, `a`, `b` and `factor` may itself be a plain number, a colour, or
+another pattern, up to eight values in flight and 64 levels of nesting.
+
+Emission is the one field with a rule of its own. Emissive surfaces are sampled
+as lights, and the light table has to weigh each one before the render starts —
+so a patterned emission needs an **upper bound** the host can compute. Every op
+above has one except a bare `coordinates`, so an emission driven directly by a
+coordinate is a scene error naming the fix: wrap it in a `remap`. The rule only
+applies where the surface can emit at all: `emission_strength` defaults to zero,
+and a half that is constantly zero settles the product whatever the other half
+does. The bound is only used to decide how often to aim at the surface; what it
+actually emits is evaluated at the point that was drawn, so a loose bound costs
+noise and nothing else.
 
 #### Subsurface scattering
 
@@ -229,7 +300,10 @@ flowchart LR
    (`shader.wgsl`). Each thread:
    - Casts a stratified, jittered primary ray. With a lens, the ray starts on
      the lens disk.
-   - Walks the BVH to find the nearest hit, and adds the surface's emission if
+   - Walks the BVH to find the nearest hit and resolves its material: a
+     surface with patterned fields has each one evaluated at that hit, and
+     everything downstream sees a plain material either way.
+   - Adds the surface's emission if
      the front face was hit (weighed by MIS against the emitter sample from the
      previous bounce). A surface that scatters nothing, like a `light`, ends
      the path there.
@@ -390,7 +464,9 @@ golden`. On a machine with no GPU adapter, set `WGSL_RAYTRACE_SKIP_GPU_TESTS=1`.
 src/
   main.rs              CLI: parse, validate, load, render, write outputs
   config/mod.rs        TOML schema and CLI args (pure data, no GPU)
+  config/input.rs      material input trees (patterns), as pure data
   scene/               .obj loading, transforms, materials, BVH, light table, sky CDF
+  scene/program.rs     input trees → the flat program the shader evaluates
   math/mod.rs          matrices for model transforms
   render/
     mod.rs             device setup, sample loop, readback, resolve

@@ -52,7 +52,7 @@ const IN_FLIGHT_SAMPLES: usize = 4;
 /// those, so it asks the adapter for what it actually needs — and a test below
 /// counts the shader's own bindings against this number, so adding one and
 /// forgetting to raise it fails without a GPU in the room.
-const STORAGE_BUFFERS: u32 = 10;
+const STORAGE_BUFFERS: u32 = 13;
 
 /// Materials the object-id vote can hold: sixteen bits, less the zero that
 /// stands for a miss.
@@ -282,6 +282,29 @@ impl Renderer {
             contents: cast_slice(&scene.triangles),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let attribute_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("attributes"),
+            contents: cast_slice(&scene.attributes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        // One inverse model matrix per object, so a pattern written in object
+        // coordinates can be brought back out of the world space everything was
+        // baked into at load. Identity for an object with no transform, which
+        // is most of them, and cheap enough at 64 bytes an object not to be
+        // worth conditioning on.
+        let inverse_model_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("inverse models"),
+            contents: cast_slice(&scene.inverse_models),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        // Every material's input programs. `Programs::words` is never empty —
+        // a binding cannot be — and a scene with no patterns in it binds the
+        // one word nothing reads, the same fallback the light table takes.
+        let program_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("input programs"),
+            contents: cast_slice(scene.programs.words()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let bvh_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("bvh"),
             contents: cast_slice(&scene.nodes),
@@ -450,6 +473,18 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: sky_conditional.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: attribute_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: inverse_model_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: program_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1272,6 +1307,7 @@ mod tests {
     /// Unity gain: what every scene gets unless it says otherwise, and what the
     /// tests below that are not about exposure resolve at.
     const NEUTRAL: f32 = 1.0;
+    use crate::scene::GpuAttributes;
     use crate::scene::GpuBvhNode;
     use crate::scene::GpuMaterial;
     use crate::scene::GpuTriangle;
@@ -1355,6 +1391,10 @@ mod tests {
         assert_eq!(wgsl("Material"), size_of::<GpuMaterial>());
         assert_eq!(wgsl("Triangle"), size_of::<GpuTriangle>());
         assert_eq!(wgsl("BvhNode"), size_of::<GpuBvhNode>());
+        // The one struct whose two sides align differently: `vec2f` puts the
+        // shader's at eight and the host's at four, so a field added to either
+        // can change the stride without changing the other's.
+        assert_eq!(wgsl("Attributes"), size_of::<GpuAttributes>());
         // Never uploaded, but read back: the host walks them as `[f32; 4]`.
         assert_eq!(wgsl("Moments"), size_of::<[f32; 4]>());
         assert_eq!(wgsl("Albedo"), size_of::<[f32; 4]>());

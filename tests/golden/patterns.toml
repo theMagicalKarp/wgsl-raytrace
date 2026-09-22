@@ -1,0 +1,85 @@
+# The fourth golden scene: the one with patterned materials in it.
+#
+# Everything else here renders a surface whose every field is one number. This
+# one renders three whose fields are decided per hit, and it is chosen to put a
+# strategy on each side of every part of that machinery:
+#
+# - The floor's roughness is a remap of `u` and its colour a mix across `v`, so
+#   a texture coordinate that is interpolated wrong shows as a gradient running
+#   the wrong way rather than as noise.
+# - The wall emits a ramp across `u`. That reaches the half of this that a
+#   constant cannot: the light table weighs the wall by an upper bound, and
+#   `sample_light` has to hand back what the wall emits at the point it drew.
+#   Returning the bound instead lights the floor evenly across its width, which
+#   this frame would show as a floor that is flatly too bright on the left.
+# - The orb's colour is a remap of *object* y, and the orb is scaled and moved,
+#   so the inverse model matrix is load-bearing: read the pattern in world space
+#   and the band slides off the sphere.
+#
+# Nothing here may change without regenerating the reference beside it:
+#
+#   UPDATE_GOLDEN=1 cargo test golden
+
+[camera]
+aspect_ratio = "square"
+image_width = 32
+samples = 64
+max_bounces = 8
+fov = 40
+look_from = [0.0, 5.0, 12.0]
+look_at = [0.0, 2.2, -2.0]
+vup = [0.0, 1.0, 0.0]
+
+[environment]
+# Just enough to keep the orb's camera-facing side off black — everything in
+# here is lit from behind by the wall, which is the only real light in the
+# scene and the only thing the ramp across it can be seen in.
+#
+# A flat sky deliberately: it gets no sampling distribution built for it, so
+# adding it does not quietly bring a second estimator into a frame that is here
+# to test the first one.
+color = [0.16, 0.165, 0.2]
+
+# Floor: rough on the left and polished on the right, red at the back and blue
+# at the front. The orb stands on the polished half, so its reflection in the
+# floor is what a roughness read off the wrong channel — or off no pattern at
+# all — takes away.
+[[objects]]
+shape = "wavefront"
+file = "patterns.obj"
+group = "Floor"
+material = "principled"
+roughness = "remap(uv.r, [1.0, 0.05])"
+base_color = "mix([0.75, 0.15, 0.1], [0.1, 0.2, 0.7], uv.g)"
+
+# Wall: dark on the left, bright on the right.
+[[objects]]
+shape = "wavefront"
+file = "patterns.obj"
+group = "Wall"
+material = "principled"
+base_color = [0.0, 0.0, 0.0]
+ior = 1.0
+emission_color = "remap(uv.r, [0.0, 1.0])"
+emission_strength = 1.6
+
+# Orb: banded in its own coordinates, stretched to twice its height and dropped
+# so it stands on the floor. The stretch is what makes the space matter — the
+# band spans object y 1 to 3 whatever is done to the orb, where the same
+# numbers read in world space would squeeze the whole of it into the bottom
+# third. The remap descends, so the top is the first colour.
+[[objects]]
+shape = "wavefront"
+file = "normals.obj"
+group = "Smooth"
+material = "principled"
+roughness = 0.35
+base_color = "mix([0.95, 0.8, 0.05], [0.05, 0.35, 0.95], remap(object.y, [1.0, 3.0], [1.0, 0.0]))"
+
+[[objects.transform]]
+type = "scale"
+scalar = [0.9, 1.6, 0.9]
+
+[[objects.transform]]
+type = "translate"
+offset = [3.0, -1.6, 2.0]

@@ -3,6 +3,7 @@ mod environment;
 mod geometry;
 mod light;
 mod material;
+pub mod program;
 mod sky;
 mod transform;
 mod wavefront;
@@ -12,13 +13,17 @@ mod testing;
 
 pub use bvh::GpuBvhNode;
 pub use environment::Environment;
+pub use geometry::GpuAttributes;
 pub use geometry::GpuTriangle;
 pub use light::GpuLight;
 pub use material::GpuMaterial;
+pub use program::Programs;
 pub use sky::Sky;
 
 use crate::config::Config;
 use crate::config::Object;
+use crate::math::Mat4;
+use crate::scene::transform::Model;
 use std::error::Error;
 
 /// Every mesh in the scene, flattened into world space and indexed by a BVH.
@@ -28,7 +33,17 @@ pub struct Scene {
     /// that is what lets a leaf name its triangles with an offset and a count,
     /// and it keeps the triangles one leaf tests next to each other in memory.
     pub triangles: Vec<GpuTriangle>,
+    /// One entry per triangle, in the same order, holding what shading needs
+    /// and traversal does not. Permuted alongside `triangles`, so the two are
+    /// indexed by the same number.
+    pub attributes: Vec<GpuAttributes>,
     pub materials: Vec<GpuMaterial>,
+    /// World space back to each object's own, one entry per material, which is
+    /// what lets an input be written in coordinates that do not swim when the
+    /// object is moved. Identity for an object with no transform.
+    pub inverse_models: Vec<Mat4>,
+    /// Every material's input programs, flattened into one buffer.
+    pub programs: Programs,
     /// The distribution the shader draws emitters from, built over `triangles`
     /// after the permutation above so its indices address the list the shader is
     /// handed. Empty when nothing in the scene emits.
@@ -63,13 +78,26 @@ impl Scene {
     /// reported here rather than assumed away.
     pub fn load(config: &Config) -> Result<Scene, Box<dyn Error>> {
         let mut triangles = Vec::new();
+        let mut attributes = Vec::new();
         let mut materials = Vec::with_capacity(config.objects.len());
+        let mut inverse_models = Vec::with_capacity(config.objects.len());
+        let mut programs = Programs::default();
 
         for (index, Object::Wavefront(wavefront)) in config.objects.iter().enumerate() {
-            materials.push(GpuMaterial::from(&wavefront.material));
+            materials.push(
+                GpuMaterial::build(&wavefront.material, &mut programs)
+                    .map_err(|error| format!("Object {index} material: {error}"))?,
+            );
+            inverse_models.push(Model::new(&wavefront.transform).inverse);
 
             let object = wavefront::read(&wavefront.file)?;
-            geometry::append(&object, wavefront, index as u32, &mut triangles)?;
+            geometry::append(
+                &object,
+                wavefront,
+                index as u32,
+                &mut triangles,
+                &mut attributes,
+            )?;
         }
 
         let environment = match &config.environment.file {
@@ -85,6 +113,11 @@ impl Scene {
             .map(|triangle| bvh::Aabb::of_points([triangle.v0, triangle.v1, triangle.v2]))
             .collect();
         let hierarchy = bvh::build(&bounds);
+        let attributes: Vec<GpuAttributes> = hierarchy
+            .order
+            .iter()
+            .map(|&index| attributes[index as usize])
+            .collect();
         let triangles: Vec<GpuTriangle> = hierarchy
             .order
             .iter()
@@ -95,7 +128,10 @@ impl Scene {
 
         Ok(Scene {
             triangles,
+            attributes,
             materials,
+            inverse_models,
+            programs,
             lights,
             light_power,
             nodes: hierarchy.nodes,

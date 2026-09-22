@@ -106,6 +106,7 @@ pub(super) fn build(triangles: &[GpuTriangle], materials: &[GpuMaterial]) -> (Ve
 mod tests {
     use super::*;
     use crate::config::Material;
+    use crate::config::Operand;
     use crate::config::Principled;
     use crate::scene::testing::QUAD;
     use crate::scene::testing::triangles as load_triangles;
@@ -195,11 +196,11 @@ mod tests {
         let (mut triangles, _) = quad(Material::Light { emit: [1.0; 3] });
         let materials = vec![
             GpuMaterial::from(&Material::Light { emit: [2.0; 3] }),
-            GpuMaterial::from(&Material::Principled(Principled {
-                emission_color: [0.5; 3],
-                emission_strength: 12.0,
+            GpuMaterial::from(&Material::Principled(Box::new(Principled {
+                emission_color: Operand::Color([0.5; 3]),
+                emission_strength: Operand::Scalar(12.0),
                 ..Principled::default()
-            })),
+            }))),
         ];
         triangles[1].material = 1;
 
@@ -216,28 +217,28 @@ mod tests {
     #[test]
     fn a_partly_transparent_emitter_weighs_its_alpha() {
         let glow = |alpha| Principled {
-            emission_color: [1.0; 3],
-            emission_strength: 4.0,
+            emission_color: Operand::Color([1.0; 3]),
+            emission_strength: Operand::Scalar(4.0),
             alpha,
             ..Principled::default()
         };
 
-        let (triangles, materials) = quad(Material::Principled(glow(0.25)));
+        let (triangles, materials) = quad(Material::Principled(Box::new(glow(0.25))));
         let (table, total) = build(&triangles, &materials);
         assert_eq!(table.len(), 2, "{table:?}");
         // Two half-unit triangles at a luminance of four, a quarter there.
         assert!((total - 1.0).abs() < 1e-5, "{total}");
 
-        let (triangles, materials) = quad(Material::Principled(glow(0.0)));
+        let (triangles, materials) = quad(Material::Principled(Box::new(glow(0.0))));
         assert_eq!(build(&triangles, &materials), (Vec::new(), 0.0));
     }
 
     #[test]
     fn a_principled_surface_with_no_strength_does_not_emit() {
-        let (triangles, materials) = quad(Material::Principled(Principled {
-            emission_color: [5.0; 3],
+        let (triangles, materials) = quad(Material::Principled(Box::new(Principled {
+            emission_color: Operand::Color([5.0; 3]),
             ..Principled::default()
-        }));
+        })));
 
         assert_eq!(build(&triangles, &materials), (Vec::new(), 0.0));
     }

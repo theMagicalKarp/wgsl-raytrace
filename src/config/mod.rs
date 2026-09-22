@@ -5,6 +5,18 @@
 //! checked without loading a single triangle — [`Config::validate`] is the step
 //! that resolves object paths against the config's directory.
 
+mod expression;
+mod input;
+
+pub use input::Blend;
+pub use input::Channel;
+pub use input::Input;
+pub use input::MAX_NESTING;
+pub use input::Operand;
+pub use input::Space;
+#[cfg(test)]
+pub use input::blend;
+
 use clap::Parser;
 use colored::Colorize;
 use serde::Deserialize;
@@ -358,31 +370,35 @@ impl CameraOptions {
 ///
 /// Every field defaults to what Blender's node does, so `material =
 /// "principled"` alone is a grey, half-rough plastic.
+/// Fields marked patternable hold an [`Operand`]: a constant, or an input tree
+/// evaluated per hit. The ones that are not are the ones nothing downstream
+/// could yet read per hit — `alpha` is settled by a shadow ray without a
+/// material lookup, and the subsurface radius is fixed before the walk starts.
 #[serde_inline_default]
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Principled {
     /// Diffuse albedo, and the reflectance at normal incidence once metallic.
-    #[serde_inline_default([0.8, 0.8, 0.8])]
-    pub base_color: [f32; 3],
+    #[serde_inline_default(Operand::Color([0.8, 0.8, 0.8]))]
+    pub base_color: Operand,
 
     /// Microfacet roughness in `[0, 1]`, squared into GGX's alpha.
-    #[serde_inline_default(0.5)]
-    pub roughness: f32,
+    #[serde_inline_default(Operand::Scalar(0.5))]
+    pub roughness: Operand,
 
     /// Dielectric at zero, conductor at one, and a blend of the two between.
-    #[serde_inline_default(0.0)]
-    pub metallic: f32,
+    #[serde_inline_default(Operand::Scalar(0.0))]
+    pub metallic: Operand,
 
     /// Index of refraction, which sets how strongly the dielectric part
     /// reflects. One reflects nothing at any angle.
-    #[serde_inline_default(1.5)]
-    pub ior: f32,
+    #[serde_inline_default(Operand::Scalar(1.5))]
+    pub ior: Operand,
 
     /// Opaque at zero, glass at one: the share of the dielectric part that
     /// refracts through the surface rather than scattering off its base.
-    #[serde_inline_default(0.0)]
-    pub transmission: f32,
+    #[serde_inline_default(Operand::Scalar(0.0))]
+    pub transmission: Operand,
 
     /// Coverage: the chance a ray is stopped by the surface at all. The rest
     /// pass straight through as though it were not there, which is a cutout
@@ -392,19 +408,19 @@ pub struct Principled {
 
     /// The color of the light the surface gives off, scaled by
     /// `emission_strength`. Emitted from the front face only.
-    #[serde_inline_default([1.0, 1.0, 1.0])]
-    pub emission_color: [f32; 3],
+    #[serde_inline_default(Operand::Color([1.0, 1.0, 1.0]))]
+    pub emission_color: Operand,
 
     /// Radiance emitted, as a multiple of `emission_color`. Zero, the default,
     /// emits nothing.
-    #[serde_inline_default(0.0)]
-    pub emission_strength: f32,
+    #[serde_inline_default(Operand::Scalar(0.0))]
+    pub emission_strength: Operand,
 
     /// How much of the diffuse base is replaced by light that goes *into* the
     /// surface, scatters about inside it and leaves somewhere else. Zero, the
     /// default, is an ordinary opaque surface; one is skin, wax or marble.
-    #[serde_inline_default(0.0)]
-    pub subsurface_weight: f32,
+    #[serde_inline_default(Operand::Scalar(0.0))]
+    pub subsurface_weight: Operand,
 
     /// How far light of each channel travels inside the surface between
     /// scattering events, in multiples of `subsurface_scale`. Blender's default
@@ -429,15 +445,15 @@ pub struct Principled {
 impl Default for Principled {
     fn default() -> Self {
         Principled {
-            base_color: [0.8, 0.8, 0.8],
-            roughness: 0.5,
-            metallic: 0.0,
-            ior: 1.5,
-            transmission: 0.0,
+            base_color: Operand::Color([0.8, 0.8, 0.8]),
+            roughness: Operand::Scalar(0.5),
+            metallic: Operand::Scalar(0.0),
+            ior: Operand::Scalar(1.5),
+            transmission: Operand::Scalar(0.0),
             alpha: 1.0,
-            emission_color: [1.0, 1.0, 1.0],
-            emission_strength: 0.0,
-            subsurface_weight: 0.0,
+            emission_color: Operand::Color([1.0, 1.0, 1.0]),
+            emission_strength: Operand::Scalar(0.0),
+            subsurface_weight: Operand::Scalar(0.0),
             subsurface_radius: [1.0, 0.2, 0.1],
             subsurface_scale: 0.05,
             subsurface_anisotropy: 0.0,
@@ -454,7 +470,7 @@ impl Default for Principled {
 #[serde(tag = "material", deny_unknown_fields)]
 pub enum Material {
     #[serde(rename = "principled")]
-    Principled(Principled),
+    Principled(Box<Principled>),
 
     #[serde(rename = "lambertian")]
     Lambertian { albedo: [f32; 3] },
@@ -480,8 +496,8 @@ impl fmt::Display for Material {
         match self {
             Material::Principled(p) => write!(
                 f,
-                "principled{:?} roughness {} metallic {} ior {} transmission {} alpha {} \
-                 emission{:?} strength {} subsurface {} radius{:?} scale {} anisotropy {}",
+                "principled[{}] roughness {} metallic {} ior {} transmission {} alpha {} \
+                 emission[{}] strength {} subsurface {} radius{:?} scale {} anisotropy {}",
                 p.base_color,
                 p.roughness,
                 p.metallic,
@@ -509,6 +525,50 @@ impl fmt::Display for Material {
     }
 }
 
+/// The largest radiance a surface can give off, which is what the light table
+/// weights it by. `None` when either half of it is a pattern with no ceiling.
+///
+/// Public because `scene::light` is built from it and `scene::material` uploads
+/// it, and both have to arrive at the same number.
+pub fn emission_bound(principled: &Principled) -> Option<[f32; 3]> {
+    // A half that is constantly zero decides the product on its own, so a
+    // surface that cannot emit needs no bound — and an unbounded pattern on
+    // the other half is not a scene error, because nothing will ever weigh it.
+    // `emission_strength` defaults to zero, which makes this the answer for
+    // every surface that is not a light.
+    if principled.emission_color.is_zero() || principled.emission_strength.is_zero() {
+        return Some([0.0; 3]);
+    }
+
+    let (_, color) = principled.emission_color.range()?;
+    let (_, strength) = principled.emission_strength.range()?;
+
+    // Both are clamped at zero first. A range can legitimately reach below it
+    // only through a mix of two constants the validator has already accepted,
+    // and a negative half would otherwise turn a bound into an understatement.
+    //
+    // The strength is a scalar field, so only its first channel is read — see
+    // the fold in `scene::program`, which this has to arrive at the same
+    // number as.
+    let mut bound = [0.0; 3];
+    for (channel, slot) in bound.iter_mut().enumerate() {
+        *slot = color[channel].max(0.0) * strength[0].max(0.0);
+    }
+    Some(bound)
+}
+
+/// Rejects an emissive surface whose emission has no bound, naming the fix.
+fn emissive_bound(principled: &Principled) -> Result<(), String> {
+    match emission_bound(principled) {
+        Some(_) => Ok(()),
+        None => Err(String::from(
+            "emission driven by a pattern needs a bound the light table can \
+             weight it by; wrap the pattern in a remap, which clamps onto its \
+             `to` range",
+        )),
+    }
+}
+
 impl Material {
     /// Rejects the values a scene can spell but the BSDF cannot price: a
     /// roughness or metallic outside `[0, 1]` has no microfacet meaning, an
@@ -523,46 +583,78 @@ impl Material {
     /// them; the shader holds the phase function a hair off either one, where it
     /// would otherwise be a spike with no density to sample.
     fn validate(&self) -> Result<(), String> {
-        let unit = |name: &str, value: f32| match (0.0..=1.0).contains(&value) {
-            true => Ok(()),
-            false => Err(format!("{name} must be between 0 and 1, not {value}")),
-        };
-        let color =
-            |name: &str, value: [f32; 3]| match value.iter().all(|c| c.is_finite() && *c >= 0.0) {
+        fn unit(name: &str, value: f32) -> Result<(), String> {
+            match (0.0..=1.0).contains(&value) {
+                true => Ok(()),
+                false => Err(format!("{name} must be between 0 and 1, not {value}")),
+            }
+        }
+        fn color(name: &str, value: [f32; 3]) -> Result<(), String> {
+            match value.iter().all(|c| c.is_finite() && *c >= 0.0) {
                 true => Ok(()),
                 false => Err(format!(
                     "{name} must be finite and non-negative, not {value:?}"
                 )),
-            };
-        let non_negative = |name: &str, value: f32| match value.is_finite() && value >= 0.0 {
-            true => Ok(()),
-            false => Err(format!(
-                "{name} must be finite and non-negative, not {value}"
-            )),
-        };
+            }
+        }
+        fn non_negative(name: &str, value: f32) -> Result<(), String> {
+            match value.is_finite() && value >= 0.0 {
+                true => Ok(()),
+                false => Err(format!(
+                    "{name} must be finite and non-negative, not {value}"
+                )),
+            }
+        }
         let asymmetry = |name: &str, value: f32| match (-1.0..=1.0).contains(&value) {
             true => Ok(()),
             false => Err(format!("{name} must be between -1 and 1, not {value}")),
         };
-        let ior = |name: &str, value: f32| match value >= 1.0 {
-            true => Ok(()),
-            false => Err(format!("{name} must be at least 1, not {value}")),
+        fn ior(name: &str, value: f32) -> Result<(), String> {
+            match value >= 1.0 {
+                true => Ok(()),
+                false => Err(format!("{name} must be at least 1, not {value}")),
+            }
+        }
+
+        // The same four checks against a patternable field. A constant is held
+        // to exactly the range it always was; a pattern is held to its *bounds*
+        // where it has them, and otherwise waved through — the shader clamps
+        // every resolved value into range before it is used, which is the only
+        // place an unbounded pattern can be caught at all.
+        type Check<'a> = &'a dyn Fn(&str, [f32; 3]) -> Result<(), String>;
+        let operand = |name: &str, value: &Operand, check: Check| match value.range() {
+            Some((low, high)) => check(name, low).and_then(|()| check(name, high)),
+            None => Ok(()),
+        };
+        let channels = |check: &'static dyn Fn(&str, f32) -> Result<(), String>| {
+            move |name: &str, value: [f32; 3]| value.iter().try_for_each(|c| check(name, *c))
         };
 
         match self {
             Material::Principled(p) => {
-                color("base_color", p.base_color)?;
-                unit("roughness", p.roughness)?;
-                unit("metallic", p.metallic)?;
-                unit("transmission", p.transmission)?;
+                operand("base_color", &p.base_color, &color)?;
+                operand("roughness", &p.roughness, &channels(&unit))?;
+                operand("metallic", &p.metallic, &channels(&unit))?;
+                operand("transmission", &p.transmission, &channels(&unit))?;
                 unit("alpha", p.alpha)?;
-                color("emission_color", p.emission_color)?;
-                non_negative("emission_strength", p.emission_strength)?;
-                unit("subsurface_weight", p.subsurface_weight)?;
+                operand("emission_color", &p.emission_color, &color)?;
+                operand(
+                    "emission_strength",
+                    &p.emission_strength,
+                    &channels(&non_negative),
+                )?;
+                operand("subsurface_weight", &p.subsurface_weight, &channels(&unit))?;
                 color("subsurface_radius", p.subsurface_radius)?;
                 non_negative("subsurface_scale", p.subsurface_scale)?;
                 asymmetry("subsurface_anisotropy", p.subsurface_anisotropy)?;
-                ior("ior", p.ior)
+                operand("ior", &p.ior, &channels(&ior))?;
+
+                // Emission is the one field the host has to know a number for
+                // before the render starts: the light table weights every
+                // triangle by what it gives off, and a pattern with no ceiling
+                // gives the table nothing to weight by. A remap is the fix, and
+                // saying so is more use than the bound would have been.
+                emissive_bound(p)
             }
             Material::Lambertian { albedo } => color("albedo", *albedo),
             Material::Metal { albedo, roughness } => {
@@ -1035,6 +1127,36 @@ degrees = 31.5
 
     /// Past the ceiling every pass is a no-op that still costs a dispatch, and
     /// an unbounded count builds a `Vec` the size of whatever was typed.
+    /// Emission is the one field that has to be bounded before the render
+    /// starts, and the rule only applies to a surface that can emit at all.
+    /// `emission_strength` defaults to zero, so an unbounded colour on an
+    /// ordinary surface is not a scene error.
+    #[test]
+    fn an_unbounded_emission_is_an_error_only_where_it_emits() {
+        let material = |body: &str| {
+            toml::from_str::<Material>(&format!("material = \"principled\"\n{body}"))
+                .expect("should deserialize")
+                .validate()
+        };
+
+        assert!(
+            material(r#"emission_color = "uv""#).is_ok(),
+            "a strength of zero emits nothing whatever the colour is"
+        );
+        assert!(
+            material("emission_color = [1.0, 1.0, 1.0]\nemission_strength = \"uv.r\"").is_err(),
+            "and an unbounded strength on a lit surface is still refused"
+        );
+        assert!(
+            material(
+                r#"emission_strength = "uv.r"
+emission_color = [0.0, 0.0, 0.0]"#
+            )
+            .is_ok(),
+            "a colour of zero emits nothing either"
+        );
+    }
+
     #[test]
     fn an_unbounded_iteration_count_is_named_rather_than_dispatched() {
         let source = format!("{MINIMAL}\n[denoise]\niterations = 4000000000\n");
@@ -1130,25 +1252,22 @@ emit = [3.0, 3.0, 3.0]"#,
 
         assert_eq!(
             wavefront.material,
-            Material::Principled(Principled {
-                base_color: [0.8, 0.8, 0.8],
-                roughness: 0.5,
-                metallic: 0.0,
-                ior: 1.5,
-                transmission: 0.0,
+            Material::Principled(Box::new(Principled {
+                base_color: Operand::Color([0.8, 0.8, 0.8]),
+                roughness: Operand::Scalar(0.5),
+                metallic: Operand::Scalar(0.0),
+                ior: Operand::Scalar(1.5),
+                transmission: Operand::Scalar(0.0),
                 alpha: 1.0,
-                emission_color: [1.0, 1.0, 1.0],
-                emission_strength: 0.0,
-                subsurface_weight: 0.0,
+                emission_color: Operand::Color([1.0, 1.0, 1.0]),
+                emission_strength: Operand::Scalar(0.0),
+                subsurface_weight: Operand::Scalar(0.0),
                 subsurface_radius: [1.0, 0.2, 0.1],
                 subsurface_scale: 0.05,
                 subsurface_anisotropy: 0.0,
-            })
+            }))
         );
-        assert_eq!(
-            wavefront.material,
-            Material::Principled(Principled::default())
-        );
+        assert_eq!(wavefront.material, Material::Principled(Box::default()));
     }
 
     #[test]
@@ -1165,20 +1284,20 @@ emit = [3.0, 3.0, 3.0]"#,
 
         assert_eq!(
             wavefront.material,
-            Material::Principled(Principled {
-                base_color: [0.1, 0.2, 0.3],
-                roughness: 0.25,
-                metallic: 1.0,
-                ior: 1.33,
-                transmission: 0.75,
+            Material::Principled(Box::new(Principled {
+                base_color: Operand::Color([0.1, 0.2, 0.3]),
+                roughness: Operand::Scalar(0.25),
+                metallic: Operand::Scalar(1.0),
+                ior: Operand::Scalar(1.33),
+                transmission: Operand::Scalar(0.75),
                 alpha: 0.4,
-                emission_color: [0.5, 0.6, 0.7],
-                emission_strength: 2.5,
-                subsurface_weight: 0.6,
+                emission_color: Operand::Color([0.5, 0.6, 0.7]),
+                emission_strength: Operand::Scalar(2.5),
+                subsurface_weight: Operand::Scalar(0.6),
                 subsurface_radius: [0.9, 0.3, 0.15],
                 subsurface_scale: 0.2,
                 subsurface_anisotropy: -0.4,
-            })
+            }))
         );
         assert!(
             toml::from_str::<Config>(&format!(

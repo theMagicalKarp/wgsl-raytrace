@@ -34,18 +34,24 @@ fn as_groups(source: &str) -> String {
 }
 
 /// One corner of a polygon: an index into the file's positions, and into its
-/// normals when the file supplied one.
-pub(super) type Corner = (usize, Option<usize>);
+/// texture coordinates and its normals when the file supplied them.
+pub(super) type Corner = (usize, Option<usize>, Option<usize>);
 
-/// Flattens the four ways a `.obj` face can spell its corners into the two
-/// pieces this tracer uses. Texture coordinates are dropped — no material here
-/// samples one.
+/// Flattens the four ways a `.obj` face can spell its corners into the three
+/// pieces this tracer uses.
+///
+/// A corner without a texture coordinate is not an error and never has been —
+/// only `examples/melee` ships `vt` lines — so the slot is optional and the
+/// caller decides what a face with no coordinates is worth.
 pub(super) fn corners(polygon: &Polygon) -> Vec<Corner> {
     match polygon {
-        Polygon::P(corners) => corners.iter().map(|&p| (p, None)).collect(),
-        Polygon::PT(corners) => corners.iter().map(|&(p, _)| (p, None)).collect(),
-        Polygon::PN(corners) => corners.iter().map(|&(p, n)| (p, Some(n))).collect(),
-        Polygon::PTN(corners) => corners.iter().map(|&(p, _, n)| (p, Some(n))).collect(),
+        Polygon::P(corners) => corners.iter().map(|&p| (p, None, None)).collect(),
+        Polygon::PT(corners) => corners.iter().map(|&(p, t)| (p, Some(t), None)).collect(),
+        Polygon::PN(corners) => corners.iter().map(|&(p, n)| (p, None, Some(n))).collect(),
+        Polygon::PTN(corners) => corners
+            .iter()
+            .map(|&(p, t, n)| (p, Some(t), Some(n)))
+            .collect(),
     }
 }
 
