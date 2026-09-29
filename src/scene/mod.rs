@@ -5,6 +5,7 @@ mod light;
 mod material;
 pub mod program;
 mod sky;
+pub mod texture;
 mod transform;
 mod wavefront;
 
@@ -17,8 +18,11 @@ pub use geometry::GpuAttributes;
 pub use geometry::GpuTriangle;
 pub use light::GpuLight;
 pub use material::GpuMaterial;
+#[cfg(test)]
+pub use material::specular_ior;
 pub use program::Programs;
 pub use sky::Sky;
+pub use texture::Textures;
 
 use crate::config::Config;
 use crate::config::Object;
@@ -44,6 +48,9 @@ pub struct Scene {
     pub inverse_models: Vec<Mat4>,
     /// Every material's input programs, flattened into one buffer.
     pub programs: Programs,
+    /// The images those programs sample, decoded into the two texture arrays
+    /// the shader binds. One unused texel each when nothing samples them.
+    pub textures: Textures,
     /// The distribution the shader draws emitters from, built over `triangles`
     /// after the permutation above so its indices address the list the shader is
     /// handed. Empty when nothing in the scene emits.
@@ -100,6 +107,8 @@ impl Scene {
             )?;
         }
 
+        let textures = programs.images().load()?;
+
         let environment = match &config.environment.file {
             Some(file) => Some(environment::read(file)?),
             None => None,
@@ -132,6 +141,7 @@ impl Scene {
             materials,
             inverse_models,
             programs,
+            textures,
             lights,
             light_power,
             nodes: hierarchy.nodes,
@@ -308,6 +318,28 @@ vup = [0.0, 1.0, 0.0]
 
         assert!(scene.lights.is_empty());
         assert_eq!(scene.light_power, 0.0);
+    }
+
+    /// The image-map example: four materials, each with one colour map (base
+    /// colour) and three data maps (roughness, metallic, normal).
+    #[test]
+    fn the_textured_example_loads_each_image_once() {
+        let source = fs::read_to_string("examples/textures/render.toml").unwrap();
+        let mut config: Config = toml::from_str(&source).unwrap();
+        config.validate(Path::new("examples/textures")).unwrap();
+
+        let scene = Scene::load(&config).unwrap();
+
+        assert_eq!(scene.textures.color.count, 4);
+        assert_eq!(scene.textures.data.count, 12);
+        assert_eq!(
+            (scene.textures.color.width, scene.textures.color.height),
+            (2048, 2048)
+        );
+        assert!(
+            scene.attributes.iter().any(|a| a.uv1 != a.uv0),
+            "the mesh carries texture coordinates"
+        );
     }
 
     #[test]

@@ -237,12 +237,26 @@ impl Renderer {
             .into());
         }
 
+        // Every image a scene names is a layer of one of two arrays, so a scene
+        // with enough of them runs out of layers before it runs out of memory.
+        let layers = scene.textures.color.count.max(scene.textures.data.count);
+        let available = adapter.limits().max_texture_array_layers;
+        if available < layers {
+            return Err(format!(
+                "the scene reads {layers} images one way and the adapter holds at \
+                 most {available} in a texture array",
+            )
+            .into());
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("device"),
                 required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: STORAGE_BUFFERS,
+                    max_texture_array_layers: layers
+                        .max(wgpu::Limits::default().max_texture_array_layers),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -326,6 +340,8 @@ impl Renderer {
 
         let (environment_texture, environment_sampler) =
             environment(&device, &queue, config, scene);
+        let (color_textures, data_textures, texture_sampler) =
+            textures(&device, &queue, &scene.textures);
 
         // The sky's sampling distribution, and the same fallback the light table
         // takes: a scene with no map to aim at still has to bind something, so it
@@ -485,6 +501,18 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: program_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&color_textures),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&data_textures),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
                 },
             ],
         });
@@ -1200,6 +1228,70 @@ fn environment(
     });
 
     (texture.create_view(&Default::default()), sampler)
+}
+
+/// Uploads the images the scene's patterns read, as the two texture arrays the
+/// shader samples them from, with the sampler that reads both.
+///
+/// Repeat on both axes, which is what a texture coordinate past the unit square
+/// means everywhere else, and linear filtering with no mipmaps: a compute shader
+/// has no derivatives to pick a level with, and the per-sample jitter across the
+/// pixel supersamples away what a mip chain would have filtered.
+pub(crate) fn textures(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    textures: &crate::scene::Textures,
+) -> (wgpu::TextureView, wgpu::TextureView, wgpu::Sampler) {
+    let upload = |label, layers: &crate::scene::texture::Layers, format| {
+        let texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: layers.width,
+                    height: layers.height,
+                    depth_or_array_layers: layers.count,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &layers.texels,
+        );
+        // Explicitly an array, even at one layer: a view of a one-layer
+        // texture defaults to a plain 2D one, which is not what is bound.
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        })
+    };
+
+    let color = upload(
+        "color textures",
+        &textures.color,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    );
+    let data = upload(
+        "data textures",
+        &textures.data,
+        wgpu::TextureFormat::Rgba8Unorm,
+    );
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("textures"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    (color, data, sampler)
 }
 
 /// Box-averages the accumulated sums down to `to`, for a preview that has to fit

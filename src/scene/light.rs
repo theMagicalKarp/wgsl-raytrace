@@ -131,14 +131,18 @@ mod tests {
     #[test]
     fn a_black_light_is_not_worth_an_entry() {
         // It would never be drawn, and every search would still walk past it.
-        let (triangles, materials) = quad(Material::Light { emit: [0.0; 3] });
+        let (triangles, materials) = quad(Material::Light {
+            emit: Operand::Color([0.0; 3]),
+        });
 
         assert_eq!(build(&triangles, &materials), (Vec::new(), 0.0));
     }
 
     #[test]
     fn equal_triangles_split_the_distribution_evenly() {
-        let (triangles, materials) = quad(Material::Light { emit: [1.0; 3] });
+        let (triangles, materials) = quad(Material::Light {
+            emit: Operand::Color([1.0; 3]),
+        });
 
         let (table, total) = build(&triangles, &materials);
 
@@ -153,7 +157,9 @@ mod tests {
 
     #[test]
     fn a_bigger_triangle_takes_a_bigger_share() {
-        let (mut triangles, materials) = quad(Material::Light { emit: [1.0; 3] });
+        let (mut triangles, materials) = quad(Material::Light {
+            emit: Operand::Color([1.0; 3]),
+        });
 
         // Three times the area of the half-unit triangle it replaces, so it
         // should be worth three draws in four.
@@ -171,13 +177,15 @@ mod tests {
     fn brightness_counts_as_much_as_size() {
         // Rec. 709 puts green well above red, so of two emitters the same size
         // the green one should take that much more of the distribution.
-        let (mut triangles, _) = quad(Material::Light { emit: [1.0; 3] });
+        let (mut triangles, _) = quad(Material::Light {
+            emit: Operand::Color([1.0; 3]),
+        });
         let materials = vec![
             GpuMaterial::from(&Material::Light {
-                emit: [1.0, 0.0, 0.0],
+                emit: Operand::Color([1.0, 0.0, 0.0]),
             }),
             GpuMaterial::from(&Material::Light {
-                emit: [0.0, 1.0, 0.0],
+                emit: Operand::Color([0.0, 1.0, 0.0]),
             }),
         ];
         triangles[1].material = 1;
@@ -193,9 +201,13 @@ mod tests {
     /// its color times its strength.
     #[test]
     fn any_emissive_principled_surface_is_an_emitter() {
-        let (mut triangles, _) = quad(Material::Light { emit: [1.0; 3] });
+        let (mut triangles, _) = quad(Material::Light {
+            emit: Operand::Color([1.0; 3]),
+        });
         let materials = vec![
-            GpuMaterial::from(&Material::Light { emit: [2.0; 3] }),
+            GpuMaterial::from(&Material::Light {
+                emit: Operand::Color([2.0; 3]),
+            }),
             GpuMaterial::from(&Material::Principled(Box::new(Principled {
                 emission_color: Operand::Color([0.5; 3]),
                 emission_strength: Operand::Scalar(12.0),
@@ -245,10 +257,14 @@ mod tests {
 
     #[test]
     fn the_table_only_holds_what_emits() {
-        let (mut triangles, _) = quad(Material::Light { emit: [3.0; 3] });
+        let (mut triangles, _) = quad(Material::Light {
+            emit: Operand::Color([3.0; 3]),
+        });
         let materials = vec![
             GpuMaterial::from(&Material::Lambertian { albedo: [0.5; 3] }),
-            GpuMaterial::from(&Material::Light { emit: [3.0; 3] }),
+            GpuMaterial::from(&Material::Light {
+                emit: Operand::Color([3.0; 3]),
+            }),
         ];
         triangles[1].material = 1;
 

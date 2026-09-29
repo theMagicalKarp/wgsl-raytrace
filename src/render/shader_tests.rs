@@ -69,10 +69,37 @@ fn run_over_scene<I: Pod, O: Pod>(
     let module = format!("{}\n{source}\n{ENTRY}", include_str!("shader.wgsl"));
     check_layout::<I, O>(&module);
 
-    Some(pollster::block_on(dispatch(&module, inputs, scene)).expect(
-        "the test shader should run — set WGSL_RAYTRACE_SKIP_GPU_TESTS=1 \
+    Some(
+        pollster::block_on(dispatch(&module, inputs, scene, None)).expect(
+            "the test shader should run — set WGSL_RAYTRACE_SKIP_GPU_TESTS=1 \
          on a machine with no working adapter",
-    ))
+        ),
+    )
+}
+
+/// The same again, with the scene's two texture arrays bound as well: what a
+/// function that can sample an image reaches, which is anything that runs a
+/// program.
+fn run_with_textures<I: Pod, O: Pod>(
+    source: &str,
+    inputs: &[I],
+    scene: &[(u32, Vec<u8>)],
+    textures: &crate::scene::Textures,
+) -> Option<Vec<O>> {
+    if env::var_os("WGSL_RAYTRACE_SKIP_GPU_TESTS").is_some() {
+        return None;
+    }
+    assert!(!inputs.is_empty(), "an empty buffer cannot be bound");
+
+    let module = format!("{}\n{source}\n{ENTRY}", include_str!("shader.wgsl"));
+    check_layout::<I, O>(&module);
+
+    Some(
+        pollster::block_on(dispatch(&module, inputs, scene, Some(textures))).expect(
+            "the test shader should run — set WGSL_RAYTRACE_SKIP_GPU_TESTS=1 \
+             on a machine with no working adapter",
+        ),
+    )
 }
 
 /// Validates the module with naga, which reports errors against the combined
@@ -104,6 +131,7 @@ async fn dispatch<I: Pod, O: Pod>(
     module: &str,
     inputs: &[I],
     scene: &[(u32, Vec<u8>)],
+    textures: Option<&crate::scene::Textures>,
 ) -> Result<Vec<O>, Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
@@ -176,7 +204,7 @@ async fn dispatch<I: Pod, O: Pod>(
             })
         })
         .collect();
-    let scene_entries: Vec<wgpu::BindGroupEntry> = scene
+    let mut scene_entries: Vec<wgpu::BindGroupEntry> = scene
         .iter()
         .zip(&scene_buffers)
         .map(|((binding, _), buffer)| wgpu::BindGroupEntry {
@@ -184,7 +212,24 @@ async fn dispatch<I: Pod, O: Pod>(
             resource: buffer.as_entire_binding(),
         })
         .collect();
-    let scene_bindings = match scene.is_empty() {
+    let uploaded = textures.map(|textures| super::textures(&device, &queue, textures));
+    if let Some((color, data, sampler)) = &uploaded {
+        scene_entries.extend([
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(color),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(data),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ]);
+    }
+    let scene_bindings = match scene_entries.is_empty() {
         true => None,
         false => Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("test scene"),
@@ -474,8 +519,8 @@ fn test(input: Input, index: u32) -> Output {
 
     // The lambertian preset, as `GpuMaterial::from` writes it.
     let material = Material(
-        input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, NO_PROGRAM, vec3f(0.0),
-        vec3f(0.0),
+        input.color, PRINCIPLED, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, NO_PROGRAM, vec3f(0.0), 1.0,
+        vec3f(0.0), 0.5,
     );
     let hit = Intersection(input.normal, 1.0, 0u, true, 0u, vec2f(0.0));
     let sample = bsdf_sample(material, hit, input.wo);
@@ -644,7 +689,9 @@ fn test(input: Input, index: u32) -> Output {
         0.0,
         NO_PROGRAM,
         vec3f(0.0),
+        input.params.z,
         vec3f(0.0),
+        0.5,
     );
     let hit = Intersection(input.normal, 1.0, 0u, input.front_face != 0u, 0u, vec2f(0.0));
     let sample = bsdf_sample(material, hit, input.wo);
@@ -1818,7 +1865,9 @@ fn test(input: Input, index: u32) -> Output {
         g,
         NO_PROGRAM,
         vec3f(0.0),
+        1.0,
         vec3f(0.1, 0.1, 0.1),
+        0.5,
     );
     let normal = vec3f(0.0, 0.0, 1.0);
     let hit = Intersection(normal, 1.0, 0u, true, 0u, vec2f(0.0));
@@ -2508,6 +2557,11 @@ fn the_program_evaluator_agrees_with_the_reference() {
             "overlay([0.9, 0.1, 0.5], [0.2, 0.7, 0.5], 1.0)",
         ),
         ("a factor the shader has to clamp", "mix(0.0, 1.0, world.x)"),
+        ("a normal map", "normal_map([0.75, 0.25, 0.9])"),
+        (
+            "a normal map in DirectX, at half strength, off a coordinate",
+            "normal_map(uv, strength: 0.5, convention: \"directx\")",
+        ),
         (
             "a nest of all of them",
             "remap(multiply(invert(uv), object, remap(world.y, [0.0, 12.0], [0.0, 1.0])), \
@@ -2563,7 +2617,9 @@ fn test(input: Input, index: u32) -> Output {
 }
 "#;
     let words: Vec<u8> = cast_slice(programs.words()).to_vec();
-    let Some(outputs): Option<Vec<[f32; 4]>> = run_over_scene(source, &inputs, &[(10, words)])
+    let textures = programs.images().load().expect("no images to read");
+    let Some(outputs): Option<Vec<[f32; 4]>> =
+        run_with_textures(source, &inputs, &[(10, words)], &textures)
     else {
         return;
     };
@@ -2721,4 +2777,538 @@ emission_strength = 40.0"#;
         sampled < flat * 0.85,
         "a ramp averaging half of 40 should be well under a flat 40: {context}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Image maps
+// ---------------------------------------------------------------------------
+
+/// Two by two texels of RGBA, rows from the top.
+fn layer(texels: [[u8; 4]; 4]) -> Vec<u8> {
+    texels.into_iter().flatten().collect()
+}
+
+/// The texel `uv` lands on in a two-by-two layer, the way the shader reads it:
+/// scaled and offset, wrapped, and `v` turned over into the image's rows.
+fn texel_at(texels: &[u8], uv: [f32; 2]) -> [u8; 4] {
+    let s = uv[0].rem_euclid(1.0);
+    let t = (1.0 - uv[1]).rem_euclid(1.0);
+    let (column, row) = ((s * 2.0) as usize, (t * 2.0) as usize);
+    let at = (row * 2 + column) * 4;
+    [texels[at], texels[at + 1], texels[at + 2], texels[at + 3]]
+}
+
+/// An 8-bit channel through the sRGB curve, which is what the colour array's
+/// format does to everything but alpha.
+fn srgb(channel: u8) -> f32 {
+    let c = channel as f32 / 255.0;
+    match c <= 0.04045 {
+        true => c / 12.92,
+        false => ((c + 0.055) / 1.055).powf(2.4),
+    }
+}
+
+/// An image, read at the middle of each texel so the filter has nothing to
+/// blend, against the bytes it was built from: decoded from sRGB in the colour
+/// array and taken as they are in the data one. The same bytes are in both,
+/// so a program that looked in the wrong array reads the wrong curve.
+#[test]
+fn an_image_is_read_at_its_texels_in_the_space_it_asked_for() {
+    use crate::config::ColorSpace;
+    use crate::config::Input;
+    use crate::config::Operand;
+    use crate::scene::Programs;
+    use crate::scene::Textures;
+    use crate::scene::texture::Layers;
+    use std::path::PathBuf;
+
+    let painted = layer([
+        [128, 64, 255, 255],
+        [0, 10, 40, 200],
+        [255, 255, 255, 255],
+        [32, 200, 10, 100],
+    ]);
+    let numbers = layer([
+        [10, 20, 30, 40],
+        [50, 60, 70, 80],
+        [90, 100, 110, 120],
+        [130, 140, 150, 160],
+    ]);
+
+    let image = |file: &str, space, scale: [f32; 2], offset: [f32; 2]| {
+        Operand::Input(Input::Image {
+            file: PathBuf::from(file),
+            space: Some(space),
+            scale,
+            offset,
+        })
+    };
+    // `painted.png` read both ways lands in both arrays at layer zero, and
+    // `numbers.png` in the data array behind it.
+    let cases: Vec<(&str, Operand, &[u8], bool)> = vec![
+        (
+            "sRGB",
+            image("painted.png", ColorSpace::Srgb, [1.0; 2], [0.0; 2]),
+            &painted,
+            true,
+        ),
+        (
+            "linear",
+            image("painted.png", ColorSpace::Linear, [1.0; 2], [0.0; 2]),
+            &painted,
+            false,
+        ),
+        (
+            "a second layer",
+            image("numbers.png", ColorSpace::Linear, [1.0; 2], [0.0; 2]),
+            &numbers,
+            false,
+        ),
+        (
+            "scaled past the edge, and repeated",
+            image("numbers.png", ColorSpace::Linear, [2.0, 3.0], [0.0; 2]),
+            &numbers,
+            false,
+        ),
+        (
+            "offset",
+            image("numbers.png", ColorSpace::Linear, [1.0; 2], [0.5, -0.5]),
+            &numbers,
+            false,
+        ),
+    ];
+
+    let mut programs = Programs::default();
+    let compiled: Vec<u32> = cases
+        .iter()
+        .map(|(name, operand, _, _)| {
+            programs
+                .compile_one(operand)
+                .unwrap_or_else(|error| panic!("{name} should compile: {error}"))
+        })
+        .collect();
+    let textures = Textures {
+        color: Layers {
+            width: 2,
+            height: 2,
+            count: 1,
+            texels: painted.clone(),
+        },
+        data: Layers {
+            width: 2,
+            height: 2,
+            count: 2,
+            texels: [painted.clone(), numbers.clone()].concat(),
+        },
+    };
+
+    // Chosen so that every transform above still lands in a texel's middle.
+    let points: Vec<[f32; 2]> = vec![[0.25, 0.75], [0.75, 0.75], [0.25, 0.25], [0.75, 0.25]];
+    let mut inputs = Vec::new();
+    let mut expected = Vec::new();
+    for ((_, operand, texels, decoded), offset) in cases.iter().zip(&compiled) {
+        let Operand::Input(Input::Image {
+            scale,
+            offset: shift,
+            ..
+        }) = operand
+        else {
+            unreachable!()
+        };
+        for uv in &points {
+            // The transformed point, then pulled back to where it has to be
+            // asked for from so it lands on a texel's middle.
+            let at = [
+                uv[0] / scale[0] - shift[0] / scale[0],
+                uv[1] / scale[1] - shift[1] / scale[1],
+            ];
+            inputs.push(ProgramInput {
+                uv: at,
+                offset: *offset,
+                _pad: 0,
+                object: Vec3::new(0.0, 0.0, 0.0),
+                world: Vec3::new(0.0, 0.0, 0.0),
+            });
+            let texel = texel_at(texels, *uv);
+            expected.push(match decoded {
+                true => [
+                    srgb(texel[0]),
+                    srgb(texel[1]),
+                    srgb(texel[2]),
+                    texel[3] as f32 / 255.0,
+                ],
+                false => texel.map(|c| c as f32 / 255.0),
+            });
+        }
+    }
+
+    let source = r#"
+struct Input {
+    uv: vec2f,
+    offset: u32,
+    _pad: u32,
+    object: vec3f,
+    world: vec3f,
+}
+
+struct Output {
+    value: vec4f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    return Output(evaluate_input(input.offset, Coordinates(input.uv, input.object, input.world)));
+}
+"#;
+    let words: Vec<u8> = cast_slice(programs.words()).to_vec();
+    let Some(outputs): Option<Vec<[f32; 4]>> =
+        run_with_textures(source, &inputs, &[(10, words)], &textures)
+    else {
+        return;
+    };
+
+    let names = cases
+        .iter()
+        .flat_map(|(name, ..)| points.iter().map(move |uv| (name, uv)));
+    for ((actual, expected), (name, uv)) in outputs.iter().zip(&expected).zip(names) {
+        for channel in 0..4 {
+            // The sRGB curve is a table on some hardware, and good to about
+            // a part in a thousand.
+            assert!(
+                (actual[channel] - expected[channel]).abs() < 2e-3,
+                "{name} at {uv:?}: got {actual:?}, the texel says {expected:?}",
+            );
+        }
+    }
+}
+
+/// A triangle in the `z = 0` plane, its texture laid out along `x` and `y`
+/// with `u` running along `u_axis`.
+fn flat_triangle(u_axis: f32) -> (crate::scene::GpuTriangle, crate::scene::GpuAttributes) {
+    let mut triangle: crate::scene::GpuTriangle = Zeroable::zeroed();
+    triangle.v0 = [0.0, 0.0, 0.0];
+    triangle.v1 = [1.0, 0.0, 0.0];
+    triangle.v2 = [0.0, 1.0, 0.0];
+    triangle.n0 = [0.0, 0.0, 1.0];
+    triangle.n1 = [0.0, 0.0, 1.0];
+    triangle.n2 = [0.0, 0.0, 1.0];
+    triangle.alpha = 1.0;
+    let attributes = crate::scene::GpuAttributes {
+        uv0: [0.0, 0.0],
+        uv1: [u_axis, 0.0],
+        uv2: [0.0, 1.0],
+    };
+    (triangle, attributes)
+}
+
+/// The frame a normal map is read in: orthonormal whatever the triangle, `t`
+/// running the way `u` does and `b` the way `v` does, including across a UV
+/// island that was mirrored.
+#[test]
+fn the_tangent_frame_is_orthonormal_and_follows_the_texture() {
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Input {
+        // A `u32` packs into a `vec3f`'s last four bytes.
+        normal: [f32; 3],
+        triangle: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Output {
+        t: Vec3,
+        b: Vec3,
+        n: Vec3,
+    }
+
+    let (plain, plain_uv) = flat_triangle(1.0);
+    let (mirrored, mirrored_uv) = flat_triangle(-1.0);
+    // Skewed in space and in texture, with a shading normal well off the
+    // face's: the frame still has to come out orthonormal.
+    let mut skewed: crate::scene::GpuTriangle = Zeroable::zeroed();
+    skewed.v0 = [0.0, 0.0, 0.0];
+    skewed.v1 = [2.0, 0.5, 0.3];
+    skewed.v2 = [0.4, 1.5, -0.2];
+    let skewed_uv = crate::scene::GpuAttributes {
+        uv0: [0.1, 0.2],
+        uv1: [0.9, 0.35],
+        uv2: [0.3, 0.8],
+    };
+    // No texture coordinates at all, which is most meshes.
+    let (bare, _) = flat_triangle(1.0);
+    let bare_uv = crate::scene::GpuAttributes::default();
+
+    let triangles = [plain, mirrored, skewed, bare];
+    let attributes = [plain_uv, mirrored_uv, skewed_uv, bare_uv];
+    let tilted = Vec3::new(0.2, -0.3, 1.0).normalized();
+    let skewed_normal = Vec3::new(-0.2, 0.1, 1.0).normalized();
+    let inputs = [
+        (Vec3::new(0.0, 0.0, 1.0), 0),
+        (tilted, 0),
+        (Vec3::new(0.0, 0.0, 1.0), 1),
+        (skewed_normal, 2),
+        (Vec3::new(0.0, 0.0, 1.0), 3),
+    ]
+    .map(|(normal, triangle): (Vec3, u32)| Input {
+        normal: [normal.x, normal.y, normal.z],
+        triangle,
+    });
+
+    let source = r#"
+struct Input {
+    normal: vec3f,
+    triangle: u32,
+}
+
+struct Output {
+    t: vec3f,
+    b: vec3f,
+    n: vec3f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    let frame = tangent_frame(input.triangle, input.normal);
+    return Output(frame.t, frame.b, frame.n);
+}
+"#;
+    let Some(outputs): Option<Vec<Output>> = run_over_scene(
+        source,
+        &inputs,
+        &[
+            (1, cast_slice(&triangles).to_vec()),
+            (8, cast_slice(&attributes).to_vec()),
+        ],
+    ) else {
+        return;
+    };
+
+    for (index, output) in outputs[..4].iter().enumerate() {
+        let (t, b, n) = (output.t, output.b, output.n);
+        for (name, value) in [("|t|", t.dot(t)), ("|b|", b.dot(b)), ("|n|", n.dot(n))] {
+            assert!((value - 1.0).abs() < 1e-5, "case {index}: {name} = {value}");
+        }
+        for (name, value) in [("t·b", t.dot(b)), ("t·n", t.dot(n)), ("b·n", b.dot(n))] {
+            assert!(value.abs() < 1e-5, "case {index}: {name} = {value}");
+        }
+    }
+
+    let close = |a: Vec3, b: Vec3| a.distance(b) < 1e-5;
+    let x = Vec3::new(1.0, 0.0, 0.0);
+    let y = Vec3::new(0.0, 1.0, 0.0);
+    assert!(
+        close(outputs[0].t, x) && close(outputs[0].b, y),
+        "{:?}",
+        outputs[0]
+    );
+    assert!(
+        close(outputs[2].t, Vec3::new(-1.0, 0.0, 0.0)) && close(outputs[2].b, y),
+        "a mirrored island runs `u` the other way and keeps `v`: {:?}",
+        outputs[2]
+    );
+    // Off the face, `t` is `u`'s direction with the normal taken out of it.
+    assert!(outputs[1].t.dot(x) > 0.9 && outputs[1].b.dot(y) > 0.9);
+    // Skewed: `u` runs mostly along the first edge, `v` along the second.
+    let first_edge = Vec3::new(2.0, 0.5, 0.3).normalized();
+    assert!(outputs[3].t.dot(first_edge) > 0.8, "{:?}", outputs[3]);
+    assert!(outputs[3].b.dot(Vec3::new(0.4, 1.5, -0.2).normalized()) > 0.5);
+
+    assert!(
+        close(outputs[4].t, Vec3::new(0.0, 0.0, 0.0)),
+        "no texture coordinates, no frame: {:?}",
+        outputs[4]
+    );
+}
+
+/// What a normal map does to the shading normal on the flat triangle, where
+/// the frame is the world's own axes: nothing at all for the flat colour, the
+/// decoded tilt for anything else, turned over with the rest of a back face,
+/// and bent back up when the tilt would reflect the ray into the surface.
+#[test]
+fn a_normal_map_bends_the_shading_normal() {
+    use crate::scene::Programs;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Input {
+        // A `u32` packs into a `vec3f`'s last four bytes.
+        wo: [f32; 3],
+        table: u32,
+        front_face: u32,
+        _pad: [u32; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Output {
+        normal: Vec3,
+    }
+
+    let mut programs = Programs::default();
+    let mut table = |normal: &str| {
+        let material: crate::config::Principled =
+            toml::from_str(&format!("normal = {normal:?}")).expect("should parse");
+        programs.compile(&material, true).expect("should compile")
+    };
+    let flat = table("normal_map([0.5, 0.5, 1.0])");
+    // Thirty degrees toward `u`, then toward `v` in each convention.
+    let toward_u = table("normal_map([0.75, 0.5, 0.9330127])");
+    let toward_v = table("normal_map([0.5, 0.75, 0.9330127])");
+    let away_from_v = table(r#"normal_map([0.5, 0.75, 0.9330127], convention: "directx")"#);
+    let none = table("normal_map([0.75, 0.5, 0.9330127], strength: 0)");
+    // Forty-five degrees away from a grazing ray.
+    let steep = table("normal_map([0.1464466, 0.5, 0.8535534])");
+
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let grazing = Vec3::new(0.95, 0.0, 0.1).normalized();
+    let half = 0.5;
+    let root = 0.8660254;
+    let cases = [
+        (flat, up, true, Some(up)),
+        (toward_u, up, true, Some(Vec3::new(half, 0.0, root))),
+        (toward_v, up, true, Some(Vec3::new(0.0, half, root))),
+        (away_from_v, up, true, Some(Vec3::new(0.0, -half, root))),
+        (none, up, true, Some(up)),
+        (
+            flat,
+            Vec3::new(0.0, 0.0, -1.0),
+            false,
+            Some(Vec3::new(0.0, 0.0, -1.0)),
+        ),
+        (
+            toward_u,
+            Vec3::new(0.0, 0.0, -1.0),
+            false,
+            Some(Vec3::new(-half, 0.0, -root)),
+        ),
+        (steep, grazing, true, None),
+    ];
+
+    let inputs: Vec<Input> = cases
+        .iter()
+        .map(|(table, wo, front, _)| Input {
+            wo: [wo.x, wo.y, wo.z],
+            table: *table,
+            front_face: *front as u32,
+            _pad: [0; 3],
+        })
+        .collect();
+
+    let source = r#"
+struct Input {
+    wo: vec3f,
+    table: u32,
+    front_face: u32,
+}
+
+struct Output {
+    normal: vec3f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    let front = input.front_face != 0u;
+    let normal = select(vec3f(0.0, 0.0, -1.0), vec3f(0.0, 0.0, 1.0), front);
+    let hit = Intersection(normal, 1.0, 0u, front, 0u, vec2f(0.25, 0.25));
+    return Output(shading_normal(hit, input.table, vec3f(0.25, 0.25, 0.0), input.wo));
+}
+"#;
+    let (triangle, attributes) = flat_triangle(1.0);
+    let textures = programs.images().load().expect("no images to read");
+    let Some(outputs): Option<Vec<Output>> = run_with_textures(
+        source,
+        &inputs,
+        &[
+            (1, cast_slice(&[triangle]).to_vec()),
+            (8, cast_slice(&[attributes]).to_vec()),
+            (9, cast_slice(&[crate::math::IDENTITY]).to_vec()),
+            (10, cast_slice(programs.words()).to_vec()),
+        ],
+        &textures,
+    ) else {
+        return;
+    };
+
+    for (index, (output, (_, wo, _, expected))) in outputs.iter().zip(&cases).enumerate() {
+        let normal = output.normal;
+        assert!(
+            (normal.dot(normal) - 1.0).abs() < 1e-5,
+            "case {index}: unit length, not {normal:?}"
+        );
+        assert!(
+            normal.dot(*wo) > 0.0,
+            "case {index}: facing the ray, not {normal:?}"
+        );
+
+        match expected {
+            Some(expected) => assert!(
+                normal.distance(*expected) < 1e-5,
+                "case {index}: got {normal:?}, expected {expected:?}"
+            ),
+            // Bent: the mirror reflection of `wo` stays above the triangle,
+            // where the unbent normal would have sent it into it.
+            None => {
+                let reflected = normal.scale(2.0 * normal.dot(*wo)).add(wo.scale(-1.0));
+                assert!(
+                    reflected.z >= 0.01 - 1e-4,
+                    "case {index}: {normal:?} reflects {wo:?} to {reflected:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The coat's index on the GPU and on the host, which have to agree: the host
+/// works it out for a constant surface and the shader for a patterned one.
+#[test]
+fn the_specular_level_is_worked_out_the_same_on_both_sides() {
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Input {
+        ior: f32,
+        level: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Output {
+        ior: f32,
+    }
+
+    let inputs: Vec<Input> = [1.0, 1.33, 1.5, 2.4, 50.0]
+        .into_iter()
+        .flat_map(|ior| {
+            [0.0, 0.25, 0.5, 0.75, 1.0]
+                .into_iter()
+                .map(move |level| Input { ior, level })
+        })
+        .collect();
+
+    let source = r#"
+struct Input {
+    ior: f32,
+    level: f32,
+}
+
+struct Output {
+    ior: f32,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    return Output(specular_ior(input.ior, input.level));
+}
+"#;
+    let Some(outputs): Option<Vec<Output>> = run(source, &inputs) else {
+        return;
+    };
+
+    for (input, output) in inputs.iter().zip(&outputs) {
+        let expected = crate::scene::specular_ior(input.ior, input.level);
+        assert!(
+            (output.ior - expected).abs() <= 1e-5 * expected,
+            "{input:?}: the shader says {}, the host {expected}",
+            output.ior
+        );
+        if input.level == 0.5 {
+            assert_eq!(output.ior, input.ior, "the default is the index as written");
+        }
+    }
 }

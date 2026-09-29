@@ -24,6 +24,8 @@ use serde::de::SeqAccess;
 use serde::de::Visitor;
 use serde::de::value::SeqAccessDeserializer;
 use std::fmt;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// The coordinates a pattern can be laid out in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,51 @@ impl Channel {
             Channel::G => 1,
             Channel::B => 2,
             Channel::A => 3,
+        }
+    }
+}
+
+/// How an image's 8-bit texels are turned into numbers.
+///
+/// A colour a person painted is stored gamma-encoded, and reading it as though
+/// it were linear leaves every midtone too bright. Anything else — a
+/// roughness, a normal, a mask — is stored as the number it is, and decoding
+/// that as sRGB darkens it into something it never said. Which one a map is
+/// cannot be read off the file, so it defaults by the field the image drives
+/// ([`ColorSpace::default_for`]) and a scene can say otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColorSpace {
+    Srgb,
+    Linear,
+}
+
+impl ColorSpace {
+    /// The name a scene writes it under.
+    pub fn name(self) -> &'static str {
+        match self {
+            ColorSpace::Srgb => "srgb",
+            ColorSpace::Linear => "linear",
+        }
+    }
+}
+
+/// Which way up a tangent-space normal map's green channel points.
+///
+/// OpenGL (and Blender) store `+v` as green; DirectX stores `-v`. The two
+/// render the same surface lit from opposite sides, which is the mistake a
+/// normal map is most often wrong by and the hardest one to see in a still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Convention {
+    #[default]
+    OpenGl,
+    DirectX,
+}
+
+impl Convention {
+    pub fn name(self) -> &'static str {
+        match self {
+            Convention::OpenGl => "opengl",
+            Convention::DirectX => "directx",
         }
     }
 }
@@ -210,6 +257,75 @@ impl Operand {
             Operand::Input(input) => input.range(),
         }
     }
+
+    /// Every input directly under this one, which is what the walks below
+    /// recurse through.
+    fn children_mut(&mut self) -> Vec<&mut Operand> {
+        let Operand::Input(input) = self else {
+            return Vec::new();
+        };
+        match input {
+            Input::Coordinates { .. } | Input::Image { .. } => Vec::new(),
+            Input::Channel { input, .. }
+            | Input::Invert { input }
+            | Input::Remap { input, .. }
+            | Input::NormalMap { input, .. } => vec![input.as_mut()],
+            Input::Mix { a, b, factor, .. } => vec![a.as_mut(), b.as_mut(), factor.as_mut()],
+        }
+    }
+
+    fn children(&self) -> Vec<&Operand> {
+        let Operand::Input(input) = self else {
+            return Vec::new();
+        };
+        match input {
+            Input::Coordinates { .. } | Input::Image { .. } => Vec::new(),
+            Input::Channel { input, .. }
+            | Input::Invert { input }
+            | Input::Remap { input, .. }
+            | Input::NormalMap { input, .. } => vec![input.as_ref()],
+            Input::Mix { a, b, factor, .. } => vec![a.as_ref(), b.as_ref(), factor.as_ref()],
+        }
+    }
+
+    /// Rewrites every image path so it is relative to the process rather than
+    /// to the scene, and fails on the first one that is not there — the same
+    /// pass, for the same reason, that a mesh's path gets in `Config::validate`.
+    pub fn resolve_images(&mut self, dir: &Path) -> Result<(), String> {
+        if let Operand::Input(Input::Image { file, .. }) = self {
+            *file = dir.join(&*file);
+            if !file.is_file() {
+                return Err(format!("image file does not exist: {}", file.display()));
+            }
+        }
+        self.children_mut()
+            .into_iter()
+            .try_for_each(|child| child.resolve_images(dir))
+    }
+
+    /// This, with every image that did not name a colour space given `space`.
+    /// Which is the default is the field's to say, so it is filled in by
+    /// whoever knows the field.
+    pub fn with_space(&self, space: ColorSpace) -> Operand {
+        let mut operand = self.clone();
+        operand.fill_space(space);
+        operand
+    }
+
+    fn fill_space(&mut self, space: ColorSpace) {
+        if let Operand::Input(Input::Image { space: slot, .. }) = self {
+            slot.get_or_insert(space);
+        }
+        for child in self.children_mut() {
+            child.fill_space(space);
+        }
+    }
+
+    /// Whether a `normal_map` appears anywhere in this.
+    pub fn has_normal_map(&self) -> bool {
+        matches!(self, Operand::Input(Input::NormalMap { .. }))
+            || self.children().into_iter().any(Operand::has_normal_map)
+    }
 }
 
 /// One node of a pattern.
@@ -259,6 +375,47 @@ pub enum Input {
         factor: Box<Operand>,
         mode: Blend,
     },
+
+    /// An image file, read at the hit's texture coordinates times `scale` plus
+    /// `offset`, and repeated past the unit square.
+    ///
+    /// `space` is `None` until something decides it: a scene that does not
+    /// say gets the default of the field the image drives, which only the
+    /// field knows (`scene::program` asks [`ColorSpace::default_for`]).
+    ///
+    /// The path is relative to the scene file as written, and resolved against
+    /// it by [`Operand::resolve_images`] before anything reads it.
+    Image {
+        file: PathBuf,
+        space: Option<ColorSpace>,
+        scale: [f32; 2],
+        offset: [f32; 2],
+    },
+
+    /// A tangent-space normal map, decoded: `input`'s colour taken from
+    /// `[0, 1]` to `[-1, 1]`, its green flipped for DirectX, and leaned back
+    /// toward the unperturbed normal by `strength`.
+    ///
+    /// Only the `normal` field takes one, and only at its root. What it
+    /// produces is a direction and not a value, and the one thing that knows
+    /// what to do with a direction is the shading frame it is turned into.
+    NormalMap {
+        input: Box<Operand>,
+        strength: f32,
+        convention: Convention,
+    },
+}
+
+impl ColorSpace {
+    /// What an image in `field` is read as when the scene does not say: a
+    /// colour for the two fields that are colours, and a number for every
+    /// other one.
+    pub fn default_for(field: &str) -> ColorSpace {
+        match field {
+            "base_color" | "emission_color" => ColorSpace::Srgb,
+            _ => ColorSpace::Linear,
+        }
+    }
 }
 
 impl Blend {
@@ -297,6 +454,14 @@ impl Input {
             // is wherever the object is. Neither has a bound, and inventing one
             // would be inventing a light's brightness.
             Input::Coordinates { .. } => None,
+
+            // Eight bits a channel, normalized. The brightest texel would be
+            // tighter, but the image is not read until the scene loads, and a
+            // loose bound only costs an emissive image some noise.
+            Input::Image { .. } => Some(([0.0; 3], [1.0; 3])),
+
+            // A direction, which is not a thing a bound is asked of.
+            Input::NormalMap { .. } => None,
 
             Input::Channel { input, channel } => {
                 let (low, high) = input.range()?;
@@ -388,6 +553,43 @@ impl fmt::Display for Input {
             ),
             Input::Mix { a, b, factor, mode } => {
                 write!(f, "{}({a}, {b}, {factor})", mode.name())
+            }
+            // Only what differs from the defaults, so a plain image prints as
+            // the one argument it was written with.
+            Input::Image {
+                file,
+                space,
+                scale,
+                offset,
+            } => {
+                write!(f, "image(\"{}\"", file.display())?;
+                if let Some(space) = space {
+                    write!(f, ", color: \"{}\"", space.name())?;
+                }
+                if *scale != [1.0; 2] {
+                    match scale[0] == scale[1] {
+                        true => write!(f, ", scale: {}", scale[0])?,
+                        false => write!(f, ", scale: [{}, {}]", scale[0], scale[1])?,
+                    }
+                }
+                if *offset != [0.0; 2] {
+                    write!(f, ", offset: [{}, {}]", offset[0], offset[1])?;
+                }
+                f.write_str(")")
+            }
+            Input::NormalMap {
+                input,
+                strength,
+                convention,
+            } => {
+                write!(f, "normal_map({input}")?;
+                if *strength != 1.0 {
+                    write!(f, ", strength: {strength}")?;
+                }
+                if *convention != Convention::OpenGl {
+                    write!(f, ", convention: \"{}\"", convention.name())?;
+                }
+                f.write_str(")")
             }
         }
     }

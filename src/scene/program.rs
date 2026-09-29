@@ -15,12 +15,15 @@
 
 use crate::config::Blend;
 use crate::config::Channel;
+use crate::config::ColorSpace;
+use crate::config::Convention;
 use crate::config::Input;
 use crate::config::MAX_NESTING;
 use crate::config::Operand;
 use crate::config::Principled;
 use crate::config::Space;
 use crate::config::emission_bound;
+use crate::scene::texture::Images;
 
 /// A field table slot, or a material, with nothing patterned. Also what the
 /// shader tests against before it evaluates anything at all.
@@ -34,6 +37,8 @@ const OP_CHANNEL: u32 = 3;
 const OP_INVERT: u32 = 4;
 const OP_REMAP: u32 = 5;
 const OP_MIX: u32 = 6;
+const OP_IMAGE: u32 = 7;
+const OP_NORMAL_MAP: u32 = 8;
 
 /// How deep the register stack is, on the host and on the GPU. Eight is
 /// generous — the deepest tree anyone writes by hand is three or four — and it
@@ -54,12 +59,17 @@ pub const FIELD_IOR: usize = 3;
 pub const FIELD_TRANSMISSION: usize = 4;
 pub const FIELD_SUBSURFACE_WEIGHT: usize = 5;
 pub const FIELD_EMISSION: usize = 6;
-pub const FIELDS: usize = 7;
+pub const FIELD_SPECULAR_IOR_LEVEL: usize = 7;
+/// Not a value but a tangent-space direction, read by the shading frame rather
+/// than by `resolve_material`.
+pub const FIELD_NORMAL: usize = 8;
+pub const FIELDS: usize = 9;
 
-/// Every material's programs, concatenated.
+/// Every material's programs, concatenated, and every image they sample.
 #[derive(Debug, Default)]
 pub struct Programs {
     words: Vec<u32>,
+    images: Images,
 }
 
 impl Programs {
@@ -74,6 +84,12 @@ impl Programs {
             true => &[NO_PROGRAM],
             false => &self.words,
         }
+    }
+
+    /// The images the programs name, by the array and layer they were
+    /// compiled against.
+    pub fn images(&self) -> &Images {
+        &self.images
     }
 
     /// Compiles every patterned field of `principled` and returns the offset of
@@ -92,21 +108,33 @@ impl Programs {
     ) -> Result<u32, String> {
         // A field is compiled only when a pattern actually drives it. The
         // subsurface weight is the one that can be driven and still dropped,
-        // and emission is the one that is folded before it is asked.
+        // and emission is the one that is folded before it is asked. Each is
+        // handed the colour space its images default to on the way, because
+        // the field is the only thing that knows it.
         let emission = emission(principled);
-        let mut fields: [Option<&Operand>; FIELDS] = [None; FIELDS];
-        let patterned = |operand: &'a Operand| operand.is_input().then_some(operand);
+        let mut fields: [Option<Operand>; FIELDS] = Default::default();
+        let patterned = |operand: &'a Operand, field: &str| {
+            operand
+                .is_input()
+                .then(|| operand.with_space(ColorSpace::default_for(field)))
+        };
 
-        fields[FIELD_BASE_COLOR] = patterned(&principled.base_color);
-        fields[FIELD_ROUGHNESS] = patterned(&principled.roughness);
-        fields[FIELD_METALLIC] = patterned(&principled.metallic);
-        fields[FIELD_IOR] = patterned(&principled.ior);
-        fields[FIELD_TRANSMISSION] = patterned(&principled.transmission);
+        fields[FIELD_BASE_COLOR] = patterned(&principled.base_color, "base_color");
+        fields[FIELD_ROUGHNESS] = patterned(&principled.roughness, "roughness");
+        fields[FIELD_METALLIC] = patterned(&principled.metallic, "metallic");
+        fields[FIELD_IOR] = patterned(&principled.ior, "ior");
+        fields[FIELD_TRANSMISSION] = patterned(&principled.transmission, "transmission");
         fields[FIELD_SUBSURFACE_WEIGHT] = match subsurface {
-            true => patterned(&principled.subsurface_weight),
+            true => patterned(&principled.subsurface_weight, "subsurface_weight"),
             false => None,
         };
-        fields[FIELD_EMISSION] = emission.as_ref();
+        fields[FIELD_EMISSION] = emission;
+        fields[FIELD_SPECULAR_IOR_LEVEL] =
+            patterned(&principled.specular_ior_level, "specular_ior_level");
+        fields[FIELD_NORMAL] = principled
+            .normal
+            .as_ref()
+            .map(|normal| normal.with_space(ColorSpace::Linear));
 
         if fields.iter().all(Option::is_none) {
             return Ok(NO_PROGRAM);
@@ -121,7 +149,7 @@ impl Programs {
         for (slot, operand) in fields.into_iter().enumerate() {
             let Some(operand) = operand else { continue };
 
-            let offset = self.program(operand)?;
+            let offset = self.program(&operand)?;
             self.words[table as usize + slot] = offset;
         }
 
@@ -237,6 +265,47 @@ impl Programs {
                     Blend::Overlay => 3,
                 });
             }
+
+            Operand::Input(Input::Image {
+                file,
+                space,
+                scale,
+                offset,
+            }) => {
+                if !scale.iter().chain(offset).all(|value| value.is_finite()) {
+                    return Err(format!(
+                        "an image's scale and offset must be finite, not {scale:?} and {offset:?}"
+                    ));
+                }
+                // Every field fills in its default before compiling, so an
+                // image with no space here was built in code; data is the
+                // reading that changes a number least.
+                let (array, layer) = self.images.add(file, space.unwrap_or(ColorSpace::Linear));
+                self.words.push(OP_IMAGE);
+                self.words.push(array);
+                self.words.push(layer);
+                self.words
+                    .extend([scale[0], scale[1], offset[0], offset[1]].map(f32::to_bits));
+            }
+
+            Operand::Input(Input::NormalMap {
+                input,
+                strength,
+                convention,
+            }) => {
+                if !strength.is_finite() {
+                    return Err(format!(
+                        "a normal map's strength must be finite, not {strength}"
+                    ));
+                }
+                self.push(input, depth, nesting + 1)?;
+                self.words.push(OP_NORMAL_MAP);
+                self.words.push(strength.to_bits());
+                self.words.push(match convention {
+                    Convention::OpenGl => 0,
+                    Convention::DirectX => 1,
+                });
+            }
         }
 
         let after = depth + 1;
@@ -271,8 +340,10 @@ fn emission(principled: &Principled) -> Option<Operand> {
     }
 
     Some(Operand::Input(Input::Mix {
-        a: Box::new(color.clone()),
-        b: Box::new(scalar(strength)),
+        a: Box::new(color.with_space(ColorSpace::default_for("emission_color"))),
+        b: Box::new(scalar(
+            &strength.with_space(ColorSpace::default_for("emission_strength")),
+        )),
         factor: Box::new(Operand::Scalar(1.0)),
         mode: Blend::Multiply,
     }))
@@ -513,6 +584,111 @@ emission_strength = "remap(uv, [0.0, 4.0])"
         assert_eq!(emission_constant(&material), [0.0; 3]);
     }
 
+    /// An image is read the way the field it drives is: a colour for the two
+    /// colour fields, a number everywhere else — unless the scene says. One
+    /// file read the same way by two fields is one layer.
+    #[test]
+    fn an_image_lands_in_the_array_its_field_reads_it_from() {
+        use crate::scene::texture::COLOR_TEXTURES;
+        use crate::scene::texture::DATA_TEXTURES;
+
+        let mut programs = Programs::default();
+        let material = principled(
+            r#"
+base_color = 'image("wood.png")'
+roughness = 'image("wood.png").r'
+metallic = 'image("wood.png", color: "srgb").r'
+emission_color = 'image("glow.png")'
+emission_strength = 'image("glow.png").r'
+normal = 'normal_map(image("wood_nrm.png"))'
+"#,
+        );
+        let table = programs.compile(&material, true).expect("should compile");
+
+        // The first word after each field's `OP_IMAGE` is the array, the next
+        // the layer.
+        let image = |field: usize| {
+            let start = super::table(&programs, table, field) as usize;
+            let words = programs.words();
+            let at = words[start..]
+                .iter()
+                .position(|&word| word == OP_IMAGE)
+                .expect("the field samples an image")
+                + start;
+            (words[at + 1], words[at + 2])
+        };
+
+        assert_eq!(image(FIELD_BASE_COLOR), (COLOR_TEXTURES, 0));
+        assert_eq!(image(FIELD_ROUGHNESS), (DATA_TEXTURES, 0));
+        assert_eq!(
+            image(FIELD_METALLIC),
+            (COLOR_TEXTURES, 0),
+            "said otherwise, and shared"
+        );
+        assert_eq!(image(FIELD_EMISSION), (COLOR_TEXTURES, 1));
+        // Layers are handed out in field order, and emission comes first.
+        assert_eq!(image(FIELD_NORMAL), (DATA_TEXTURES, 2));
+
+        // The strength half of emission reads the same file as a number,
+        // which is a layer of its own in the other array.
+        let emission = super::table(&programs, table, FIELD_EMISSION) as usize;
+        let words = &programs.words()[emission..];
+        let second = words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word == OP_IMAGE)
+            .nth(1)
+            .map(|(at, _)| (words[at + 1], words[at + 2]));
+        assert_eq!(second, Some((DATA_TEXTURES, 1)));
+    }
+
+    /// An image's texels are normalized, so emission driven by one is
+    /// bounded without a remap around it.
+    #[test]
+    fn an_emissive_image_is_bounded_by_its_strength() {
+        let material = principled(
+            r#"
+emission_color = 'image("glow.png")'
+emission_strength = 5.0
+"#,
+        );
+
+        assert_eq!(emission_constant(&material), [5.0; 3]);
+    }
+
+    /// A tangent-space normal, decoded against the arithmetic written out: the
+    /// middle of the range is straight up, and DirectX turns green over.
+    #[test]
+    fn a_normal_map_decodes_the_texel() {
+        let at = Coordinates {
+            uv: [0.0; 2],
+            object: [0.0; 3],
+            world: [0.0; 3],
+        };
+        let decode = |source: &str| {
+            let mut parsed: std::collections::HashMap<String, Operand> =
+                toml::from_str(&format!("field = {source:?}")).expect("should parse");
+            evaluate(&parsed.remove("field").expect("one field"), at)
+        };
+
+        assert_eq!(decode("normal_map([0.5, 0.5, 1.0])"), [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(decode("normal_map([1.0, 0.75, 0.5])"), [1.0, 0.5, 0.0, 0.0]);
+        assert_eq!(
+            decode(r#"normal_map([1.0, 0.75, 0.5], convention: "directx")"#),
+            [1.0, -0.5, 0.0, 0.0]
+        );
+        assert_eq!(
+            decode("normal_map([1.0, 0.75, 0.5], strength: 0.5)"),
+            [0.5, 0.25, 0.5, 0.0],
+            "halfway back to straight up"
+        );
+        assert_eq!(
+            decode("normal_map([1.0, 0.75, 0.5], strength: 0)"),
+            [0.0, 0.0, 1.0, 0.0],
+            "and all the way at zero"
+        );
+    }
+
     /// The stack is one measure of a tree and the recursion here is another: an
     /// `invert` chain leaves the stack where it found it and still costs a
     /// frame a level, so a tree built in code rather than parsed is capped
@@ -608,6 +784,34 @@ pub fn evaluate(operand: &Operand, at: Coordinates) -> [f32; 4] {
                 *slot = blend(*mode, a[channel], b[channel], factor);
             }
             out
+        }
+
+        // An image is texels, and this has none. The GPU's sampling is held
+        // against known texels by its own test instead.
+        Operand::Input(Input::Image { file, .. }) => {
+            panic!("the reference cannot read {}", file.display())
+        }
+
+        Operand::Input(Input::NormalMap {
+            input,
+            strength,
+            convention,
+        }) => {
+            let value = evaluate(input, at);
+            let mut n = [
+                value[0] * 2.0 - 1.0,
+                value[1] * 2.0 - 1.0,
+                value[2] * 2.0 - 1.0,
+            ];
+            if *convention == Convention::DirectX {
+                n[1] = -n[1];
+            }
+            [
+                n[0] * strength,
+                n[1] * strength,
+                1.0 + (n[2] - 1.0) * strength,
+                0.0,
+            ]
         }
     }
 }
