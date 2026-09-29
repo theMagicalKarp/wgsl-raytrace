@@ -16,18 +16,40 @@
 //! The grammar is small enough to state in full:
 //!
 //! ```text
-//! operand     := primary {'.' channel}
-//! primary     := number | color | coordinates | call
+//! expression  := term {('+' | '-') term}
+//! term        := operand {('*' | '/') operand}
+//! operand     := ['-'] primary {'.' channel}
+//! primary     := number | color | coordinates | call | '(' expression ')'
 //! number      := -1.5, 2, 1e-3 …
 //! color       := '[' number ',' number ',' number ']'
 //! coordinates := 'uv' | 'object' | 'world'
 //! channel     := 'r' | 'g' | 'b' | 'a' | 'x' | 'y' | 'z' | 'w'
-//! call        := 'invert' '(' operand ')'
-//!              | 'remap' '(' operand ',' [range ','] range ')'
+//! call        := 'invert' '(' expression ')'
+//!              | 'remap' '(' expression ',' [range ','] range ')'
 //!              | ('mix' | 'multiply' | 'add' | 'overlay')
-//!                '(' operand ',' operand ',' operand ')'
+//!                '(' expression ',' expression ',' expression ')'
+//!              | 'blackbody' '(' number ')'
+//!              | 'image' '(' string {',' keyword} ')'
+//!              | 'normal_map' '(' expression {',' keyword} ')'
 //! range       := '[' number ',' number ']'
+//! string      := '"' any character but '"' … '"'
+//! keyword     := name ':' (number | range | string)
 //! ```
+//!
+//! Every argument a call cannot do without is positional, and every one it
+//! can is a `name: value` keyword after them, in any order and each at most
+//! once. The keywords a call takes, and what it does without each:
+//!
+//! ```text
+//! image       color: "srgb" | "linear"    the field's own default
+//!             scale: number | range       1
+//!             offset: range               [0, 0]
+//! normal_map  strength: number            1
+//!             convention: "opengl" | "directx"   "opengl"
+//! ```
+//!
+//! A channel is still the `.r` suffix rather than a keyword, so the roughness
+//! in the green of a packed map is `image("orm.png").g`.
 //!
 //! A channel is taken off whatever precedes it rather than off a coordinate
 //! only, so `remap(uv, [0, 4]).r` is a way of saying which channel a scalar
@@ -38,13 +60,27 @@
 //! `overlay(a, b, f)` is the `mode = "overlay"` mix — four names for one node,
 //! which is how the modes read at the call site and how [`Display`](fmt::Display)
 //! writes them back out.
+//!
+//! The four arithmetic operators are those two modes at a factor of one, and
+//! are written back out that way: `uv * 2` prints as `multiply(uv, 2, 1)`.
+//! There is no subtract or divide node, so `a - b` is `a + b * -1` and `a / b`
+//! is `a * (1 / b)` — which is why `b` may be anything in the first and only a
+//! constant in the second. `-a` is `a * -1` the same way. Between two constants
+//! each is folded on the spot instead, so `blackbody(6500) * 300` is the
+//! colour it works out to and never a pattern the shader runs. That is also
+//! why `blackbody` takes a number and not a pattern: it is a way of writing a
+//! colour, and is printed as one.
 
 use super::input::Blend;
 use super::input::Channel;
+use super::input::ColorSpace;
+use super::input::Convention;
 use super::input::Input;
 use super::input::MAX_NESTING;
 use super::input::Operand;
 use super::input::Space;
+use super::input::blend;
+use std::path::PathBuf;
 
 /// Parses a whole expression, which must be all of `source`.
 pub fn parse(source: &str) -> Result<Operand, String> {
@@ -53,7 +89,7 @@ pub fn parse(source: &str) -> Result<Operand, String> {
         at: 0,
         depth: 0,
     };
-    let operand = parser.operand()?;
+    let operand = parser.expression()?;
 
     parser.space();
     match parser.rest().is_empty() {
@@ -106,12 +142,84 @@ impl<'a> Parser<'a> {
         format!("{message}, at column {column} of `{}`", self.source)
     }
 
+    /// Terms joined by `+` and `-`, which bind looser than `*` and `/`.
+    fn expression(&mut self) -> Result<Operand, String> {
+        self.chain(['+', '-'], Self::term)
+    }
+
+    /// Operands joined by `*` and `/`.
+    fn term(&mut self) -> Result<Operand, String> {
+        self.chain(['*', '/'], Self::operand)
+    }
+
+    /// `next {operator next}`, folded to the left. Each link is a level of the
+    /// tree that no call of `operand` counted, so it is counted here, against
+    /// the same cap, instead: a long enough chain is as deep a tree as the
+    /// nesting it stands in for.
+    fn chain(
+        &mut self,
+        operators: [char; 2],
+        next: fn(&mut Self) -> Result<Operand, String>,
+    ) -> Result<Operand, String> {
+        let depth = self.depth;
+        let mut left = next(self)?;
+        while let Some(operator) = self.peek().filter(|c| operators.contains(c)) {
+            let at = self.at;
+            self.at += 1;
+            self.space();
+            let start = self.at;
+            let right = next(self)?;
+            self.depth += 1;
+            if self.depth > MAX_NESTING {
+                return Err(self.error(&format!(
+                    "a pattern nests deeper than the {MAX_NESTING} levels this parses"
+                )));
+            }
+
+            left = match operator {
+                '+' => combine(left, right, Blend::Add),
+                '-' => combine(left, negate(right), Blend::Add),
+                '*' => combine(left, right, Blend::Multiply),
+                _ => {
+                    let reciprocal = reciprocal(&right).map_err(|message| {
+                        self.at = start;
+                        self.error(message)
+                    })?;
+                    combine(left, reciprocal, Blend::Multiply)
+                }
+            };
+
+            // Folding two finite constants can still overflow, and a field
+            // holding infinity is what `number` refuses to parse for a reason.
+            if left
+                .constant()
+                .is_some_and(|c| c.iter().any(|v| !v.is_finite()))
+            {
+                self.at = at;
+                return Err(self.error(&format!("`{operator}` overflows to infinity")));
+            }
+        }
+        self.depth = depth;
+        Ok(left)
+    }
+
     fn operand(&mut self) -> Result<Operand, String> {
         self.depth += 1;
         if self.depth > MAX_NESTING {
             return Err(self.error(&format!(
                 "a pattern nests deeper than the {MAX_NESTING} levels this parses"
             )));
+        }
+
+        // A sign in front of a digit is the number's own. In front of anything
+        // else it negates what follows, channel and all: `-uv.r` is `-(uv.r)`.
+        let negated = self.peek() == Some('-')
+            && !self.rest()[1..].starts_with(|c: char| c.is_ascii_digit() || c == '.');
+        if negated {
+            self.at += 1;
+            let operand = negate(self.operand()?);
+            self.depth -= 1;
+            return Ok(operand);
         }
 
         let mut operand = self.primary()?;
@@ -127,6 +235,12 @@ impl<'a> Parser<'a> {
     fn primary(&mut self) -> Result<Operand, String> {
         match self.peek() {
             Some('[') => self.color(),
+            Some('(') => {
+                self.at += 1;
+                let inner = self.expression()?;
+                self.expect(')')?;
+                Ok(inner)
+            }
             Some(c) if c == '-' || c == '+' || c == '.' || c.is_ascii_digit() => {
                 self.number().map(Operand::Scalar)
             }
@@ -213,7 +327,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Everything that starts with a name: the three coordinate spaces, and the
-    /// six calls.
+    /// calls.
     fn named(&mut self) -> Result<Operand, String> {
         let start = self.at;
         let name = self.identifier();
@@ -247,16 +361,171 @@ impl<'a> Parser<'a> {
         match name {
             "invert" => self.invert(),
             "remap" => self.remap(),
+            "blackbody" => self.blackbody(),
+            "image" => self.image(),
+            "normal_map" => self.normal_map(),
             // A misspelling is reported where the name started rather than
             // where it ended, which is where the eye is.
             _ => {
                 self.at = start;
                 Err(self.error(&format!(
                     "unknown pattern `{name}`; expected uv, object, world, \
-                     invert, remap, mix, multiply, add or overlay"
+                     invert, remap, mix, multiply, add, overlay, blackbody, image \
+                     or normal_map"
                 )))
             }
         }
+    }
+
+    /// `"` anything `"`. No escapes: what goes between the quotes is a file
+    /// name, and a scene that writes the expression in a TOML literal string —
+    /// `'image("wood.jpg")'` — never has to escape the quotes around it either.
+    fn string(&mut self) -> Result<String, String> {
+        self.expect('"')?;
+        let Some(end) = self.rest().find('"') else {
+            return Err(self.error("a string is never closed"));
+        };
+        let value = self.rest()[..end].to_string();
+        self.at += end + 1;
+        Ok(value)
+    }
+
+    /// A number, or two of them: a scale that is the same both ways is written
+    /// once.
+    fn pair(&mut self, what: &str) -> Result<[f32; 2], String> {
+        match self.peek() {
+            Some('[') => self.numbers::<2>(what),
+            _ => self.number().map(|value| [value; 2]),
+        }
+    }
+
+    /// The `name: value` arguments after a call's positional ones, handed to
+    /// `take` one name at a time. `take` answers whether it knew the name; one
+    /// it did not is reported against `known`, and so is one given twice.
+    fn keywords(
+        &mut self,
+        call: &str,
+        known: &str,
+        mut take: impl FnMut(&mut Self, &str) -> Result<bool, String>,
+    ) -> Result<(), String> {
+        let mut seen: Vec<String> = Vec::new();
+        while self.peek() == Some(',') {
+            self.at += 1;
+            self.space();
+            let start = self.at;
+            // A name starts with a letter, so a positional argument where a
+            // keyword belongs is not read as a keyword called `0`.
+            let starts = self
+                .rest()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_');
+            let name = match starts {
+                true => self.identifier(),
+                false => "",
+            };
+            if name.is_empty() {
+                return Err(self.error(&format!("expected one of {call}'s keywords: {known}")));
+            }
+            if seen.iter().any(|already| already == name) {
+                self.at = start;
+                return Err(self.error(&format!("`{name}` is given twice")));
+            }
+            self.expect(':')?;
+            if !take(self, name)? {
+                self.at = start;
+                return Err(
+                    self.error(&format!("{call} has no keyword `{name}`; expected {known}"))
+                );
+            }
+            seen.push(name.to_string());
+        }
+        self.expect(')')
+    }
+
+    /// `image("file", …)`. See the module's table for the keywords.
+    fn image(&mut self) -> Result<Operand, String> {
+        self.expect('(')?;
+        let start = self.at;
+        let file = self.string()?;
+        if file.is_empty() {
+            self.at = start;
+            return Err(self.error("an image needs a file name"));
+        }
+
+        let mut space = None;
+        let mut scale = [1.0; 2];
+        let mut offset = [0.0; 2];
+        self.keywords("image", "color, scale or offset", |parser, name| {
+            match name {
+                "color" => {
+                    let start = parser.at;
+                    space = Some(match parser.string()?.as_str() {
+                        "srgb" => ColorSpace::Srgb,
+                        "linear" => ColorSpace::Linear,
+                        other => {
+                            parser.at = start;
+                            return Err(parser.error(&format!(
+                                "unknown color space `{other}`; expected \"srgb\" or \"linear\""
+                            )));
+                        }
+                    });
+                }
+                "scale" => scale = parser.pair("an image's scale")?,
+                "offset" => offset = parser.numbers::<2>("an image's offset")?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+
+        Ok(Operand::Input(Input::Image {
+            file: PathBuf::from(file),
+            space,
+            scale,
+            offset,
+        }))
+    }
+
+    /// `normal_map(input, …)`. See the module's table for the keywords.
+    fn normal_map(&mut self) -> Result<Operand, String> {
+        self.expect('(')?;
+        let input = self.expression()?;
+
+        let mut strength = 1.0;
+        let mut convention = Convention::OpenGl;
+        self.keywords("normal_map", "strength or convention", |parser, name| {
+            match name {
+                "strength" => {
+                    let start = parser.at;
+                    strength = parser.number()?;
+                    if strength < 0.0 {
+                        parser.at = start;
+                        return Err(parser.error("a normal map's strength cannot be negative"));
+                    }
+                }
+                "convention" => {
+                    let start = parser.at;
+                    convention = match parser.string()?.as_str() {
+                        "opengl" => Convention::OpenGl,
+                        "directx" => Convention::DirectX,
+                        other => {
+                            parser.at = start;
+                            return Err(parser.error(&format!(
+                                "unknown convention `{other}`; expected \"opengl\" or \"directx\""
+                            )));
+                        }
+                    };
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+
+        Ok(Operand::Input(Input::NormalMap {
+            input: Box::new(input),
+            strength,
+            convention,
+        }))
     }
 
     /// `.` channel, taken off the operand just parsed. Only reached with a `.`
@@ -299,7 +568,7 @@ impl<'a> Parser<'a> {
 
     fn invert(&mut self) -> Result<Operand, String> {
         self.expect('(')?;
-        let input = self.operand()?;
+        let input = self.expression()?;
         self.expect(')')?;
 
         Ok(Operand::Input(Input::Invert {
@@ -311,7 +580,7 @@ impl<'a> Parser<'a> {
     /// leaves `from` the unit range, exactly as the table form's default does.
     fn remap(&mut self) -> Result<Operand, String> {
         self.expect('(')?;
-        let input = self.operand()?;
+        let input = self.expression()?;
         self.expect(',')?;
         let first = self.numbers::<2>("a remap's range")?;
 
@@ -331,13 +600,30 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// `blackbody(kelvin)`: the colour a black body glows at that temperature,
+    /// as a constant. See [`blackbody`].
+    fn blackbody(&mut self) -> Result<Operand, String> {
+        self.expect('(')?;
+        self.space();
+        let start = self.at;
+        let kelvin = self.number()?;
+        let color = blackbody(kelvin).ok_or_else(|| {
+            self.at = start;
+            self.error(&format!(
+                "a blackbody's temperature must be at least {MIN_KELVIN} kelvin, not {kelvin}"
+            ))
+        })?;
+        self.expect(')')?;
+        Ok(Operand::Color(color))
+    }
+
     fn mix(&mut self, mode: Blend) -> Result<Operand, String> {
         self.expect('(')?;
-        let a = self.operand()?;
+        let a = self.expression()?;
         self.expect(',')?;
-        let b = self.operand()?;
+        let b = self.expression()?;
         self.expect(',')?;
-        let factor = self.operand()?;
+        let factor = self.expression()?;
         self.expect(')')?;
 
         Ok(Operand::Input(Input::Mix {
@@ -347,6 +633,103 @@ impl<'a> Parser<'a> {
             mode,
         }))
     }
+}
+
+/// `a` and `b` under `mode` at a factor of one, worked out on the spot when
+/// both are constants. A scalar and a colour give a colour, as the shader's
+/// broadcast would.
+fn combine(a: Operand, b: Operand, mode: Blend) -> Operand {
+    let apply = |x: f32, y: f32| blend(mode, x, y, 1.0);
+    match (&a, &b) {
+        (Operand::Scalar(x), Operand::Scalar(y)) => Operand::Scalar(apply(*x, *y)),
+        _ => match (a.constant(), b.constant()) {
+            (Some(x), Some(y)) => Operand::Color([0, 1, 2].map(|c| apply(x[c], y[c]))),
+            _ => Operand::Input(Input::Mix {
+                a: Box::new(a),
+                b: Box::new(b),
+                factor: Box::new(Operand::Scalar(1.0)),
+                mode,
+            }),
+        },
+    }
+}
+
+/// `a * -1`, which is how `-a` and the right side of `a - b` are spelled on
+/// the GPU.
+fn negate(operand: Operand) -> Operand {
+    combine(operand, Operand::Scalar(-1.0), Blend::Multiply)
+}
+
+/// `1 / divisor`, which only a constant has: there is no divide node, and a
+/// pattern that passes through zero somewhere would have no answer there.
+fn reciprocal(divisor: &Operand) -> Result<Operand, &'static str> {
+    let Some(value) = divisor.constant() else {
+        return Err("can only divide by a constant, not a pattern");
+    };
+    if value.contains(&0.0) {
+        return Err("division by zero");
+    }
+    Ok(match divisor {
+        Operand::Scalar(x) => Operand::Scalar(1.0 / x),
+        _ => Operand::Color(value.map(|x| 1.0 / x)),
+    })
+}
+
+/// Below this Planck's law puts next to nothing in the visible range, and the
+/// normalization below would be dividing by a luminance f32 cannot tell from
+/// zero. Nothing glows visibly this cold anyway: a stove ring is about 900.
+const MIN_KELVIN: f32 = 500.0;
+
+/// The colour of a black body at `kelvin`, in linear Rec. 709, scaled to a
+/// luminance of one — Blender's convention, so that the temperature says what
+/// colour a light is and a strength says how bright, and `blackbody(t) * 300`
+/// is as bright at any `t`.
+///
+/// Planck's law is integrated against the CIE 1931 2° observer, in the
+/// piecewise-Gaussian fit of Wyman, Sloan and Shirley (2013), every nanometre
+/// from 380 to 780. A temperature far from 6500 lands outside the Rec. 709
+/// gamut in blue (cold) or red (hot); that channel is clamped to zero before
+/// normalizing, since a negative emission is not light.
+fn blackbody(kelvin: f32) -> Option<[f32; 3]> {
+    if kelvin.is_nan() || kelvin < MIN_KELVIN {
+        return None;
+    }
+
+    fn lobe(x: f64, mu: f64, low: f64, high: f64) -> f64 {
+        let t = (x - mu) * if x < mu { low } else { high };
+        (-0.5 * t * t).exp()
+    }
+
+    // Second radiation constant, in nanometre-kelvin. The first constant and
+    // the powers of ten are common to every wavelength and cancel in the
+    // normalization.
+    const C2: f64 = 1.438_776_9e7;
+    let t = f64::from(kelvin);
+
+    let mut xyz = [0.0f64; 3];
+    for nm in 380..=780 {
+        let l = f64::from(nm);
+        let radiance = 1.0 / (l.powi(5) * ((C2 / (l * t)).exp_m1()));
+        let x = 1.056 * lobe(l, 599.8, 0.0264, 0.0323) + 0.362 * lobe(l, 442.0, 0.0624, 0.0374)
+            - 0.065 * lobe(l, 501.1, 0.0490, 0.0382);
+        let y = 0.821 * lobe(l, 568.8, 0.0213, 0.0247) + 0.286 * lobe(l, 530.9, 0.0613, 0.0322);
+        let z = 1.217 * lobe(l, 437.0, 0.0845, 0.0278) + 0.681 * lobe(l, 459.0, 0.0385, 0.0725);
+        xyz[0] += radiance * x;
+        xyz[1] += radiance * y;
+        xyz[2] += radiance * z;
+    }
+
+    let [x, y, z] = xyz;
+    let rgb = [
+        3.240_454_2 * x - 1.537_138_5 * y - 0.498_531_4 * z,
+        -0.969_266_0 * x + 1.876_010_8 * y + 0.041_556_0 * z,
+        0.055_643_4 * x - 0.204_025_9 * y + 1.057_225_2 * z,
+    ]
+    .map(|c| c.max(0.0));
+
+    let luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+    let color = rgb.map(|c| (c / luminance) as f32);
+    color.iter().all(|c| c.is_finite()).then_some(color)
 }
 
 #[cfg(test)]
@@ -511,6 +894,37 @@ mod tests {
             ("remap(uv, 0, 1)", "expected `[`"),
             ("uv uv", "trailing input"),
             ("1e40", "not a finite number"),
+            ("image(wood.jpg)", "expected `\"`"),
+            ("image(\"wood.jpg)", "never closed"),
+            ("image(\"\")", "needs a file name"),
+            ("image(\"a.png\", colour: \"srgb\")", "no keyword `colour`"),
+            (
+                "image(\"a.png\", color: \"rgb\")",
+                "unknown color space `rgb`",
+            ),
+            (
+                "image(\"a.png\", scale: 2, scale: 3)",
+                "`scale` is given twice",
+            ),
+            ("image(\"a.png\", scale 2)", "expected `:`"),
+            ("image(\"a.png\", offset: 0.5)", "expected `[`"),
+            ("image(\"a.png\", )", "expected one of image's keywords"),
+            ("normal_map(uv, strength: -1)", "cannot be negative"),
+            (
+                "normal_map(uv, convention: \"dx\")",
+                "unknown convention `dx`",
+            ),
+            (
+                "normal_map(uv, 0.5)",
+                "expected one of normal_map's keywords",
+            ),
+            ("blackbody(uv.r)", "expected a number"),
+            ("blackbody(100)", "at least 500 kelvin"),
+            ("uv *", "expected a number"),
+            ("(uv + 1", "expected `)`"),
+            ("1 / uv.r", "can only divide by a constant"),
+            ("uv / [1, 0, 1]", "division by zero"),
+            ("1e30 * 1e30", "overflows to infinity"),
         ];
 
         for (source, expected) in cases {
@@ -572,6 +986,91 @@ mod tests {
         parse(&allowed).expect("one under the cap should parse");
     }
 
+    /// An image takes its file positionally and everything else by name, in
+    /// any order, and leaves what it is not told at its default.
+    #[test]
+    fn an_image_takes_its_file_and_then_keywords() {
+        assert_eq!(
+            ok("image(\"wood.jpg\")"),
+            Operand::Input(Input::Image {
+                file: PathBuf::from("wood.jpg"),
+                space: None,
+                scale: [1.0, 1.0],
+                offset: [0.0, 0.0],
+            })
+        );
+        assert_eq!(
+            ok("image(\"maps/wood.jpg\", offset: [0.5, 0], color: \"linear\", scale: [2, 4])"),
+            Operand::Input(Input::Image {
+                file: PathBuf::from("maps/wood.jpg"),
+                space: Some(ColorSpace::Linear),
+                scale: [2.0, 4.0],
+                offset: [0.5, 0.0],
+            })
+        );
+
+        let Operand::Input(Input::Image { scale, space, .. }) =
+            ok("image(\"a.png\", scale: 3, color: \"srgb\")")
+        else {
+            panic!("expected an image");
+        };
+        assert_eq!(scale, [3.0, 3.0], "a single number scales both ways");
+        assert_eq!(space, Some(ColorSpace::Srgb));
+    }
+
+    /// A channel is the suffix it always was, so one channel of a packed map
+    /// needs no keyword of its own.
+    #[test]
+    fn a_channel_comes_off_an_image() {
+        let Operand::Input(Input::Channel { input, channel }) = ok("image(\"orm.png\").g") else {
+            panic!("expected a channel of an image");
+        };
+        assert_eq!(channel, Channel::G);
+        assert!(matches!(*input, Operand::Input(Input::Image { .. })));
+    }
+
+    #[test]
+    fn a_normal_map_takes_its_input_and_then_keywords() {
+        assert_eq!(
+            ok("normal_map(image(\"n.png\"), convention: \"directx\", strength: 0.5)"),
+            Operand::Input(Input::NormalMap {
+                input: boxed(Operand::Input(Input::Image {
+                    file: PathBuf::from("n.png"),
+                    space: None,
+                    scale: [1.0; 2],
+                    offset: [0.0; 2],
+                })),
+                strength: 0.5,
+                convention: Convention::DirectX,
+            })
+        );
+
+        let Operand::Input(Input::NormalMap {
+            strength,
+            convention,
+            ..
+        }) = ok("normal_map([0.5, 0.5, 1])")
+        else {
+            panic!("expected a normal map");
+        };
+        assert_eq!((strength, convention), (1.0, Convention::OpenGl));
+    }
+
+    /// The expression is usually written in a TOML literal string, so the
+    /// quotes around a file name need no escaping at all.
+    #[test]
+    fn an_image_reads_from_a_literal_string() {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            field: Operand,
+        }
+
+        let holder: Holder =
+            toml::from_str(r#"field = 'mix(image("a.png"), [0.25, 0.18, 0.1], 0.5)'"#)
+                .expect("a literal string should hold the quotes as they are");
+        assert!(matches!(holder.field, Operand::Input(Input::Mix { .. })));
+    }
+
     /// A misspelled name is reported where it starts, not where it ends.
     #[test]
     fn a_name_is_reported_where_it_starts() {
@@ -598,10 +1097,105 @@ mod tests {
             "add(invert(uv), multiply(uv, world, 0.5), remap(uv.r, [0, 1], [0.25, 0.75]))",
             "remap(uv, [0, 1], [0, 4]).r",
             "invert(mix(uv, world, 0.5)).g",
+            "image(\"wood.jpg\")",
+            "image(\"maps/wood.jpg\", color: \"linear\", scale: 4, offset: [0.5, 0])",
+            "image(\"wood.jpg\", scale: [2, 3]).g",
+            "mix(image(\"grass.jpg\"), [0.25, 0.18, 0.1], image(\"mask.png\").r)",
+            "normal_map(image(\"n.png\"))",
+            "normal_map(image(\"n.png\"), strength: 0.5, convention: \"directx\")",
+            "multiply(uv, 2, 1)",
         ] {
             let operand = ok(source);
             assert_eq!(operand.to_string(), source, "printed form");
             assert_eq!(ok(&operand.to_string()), operand, "and it parses back");
         }
+    }
+
+    /// The example that asked for this: a colour temperature, made brighter.
+    /// Both sides are constants, so it is one colour and no pattern at all.
+    #[test]
+    fn a_blackbody_times_a_strength_is_a_constant_colour() {
+        let Operand::Color(white) = ok("blackbody(6500)") else {
+            panic!("a blackbody is a colour");
+        };
+        let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        assert!((luminance(white) - 1.0).abs() < 1e-4, "{white:?}");
+        // 6500 K is within a few hundred of D65, which is Rec. 709's white.
+        for channel in white {
+            assert!((channel - 1.0).abs() < 0.1, "{white:?}");
+        }
+
+        let Operand::Color(bright) = ok("blackbody(6500) * 300") else {
+            panic!("a constant times a constant is a constant");
+        };
+        for (b, w) in bright.iter().zip(white) {
+            assert!((b - w * 300.0).abs() < 1e-3, "{bright:?}");
+        }
+    }
+
+    /// Candlelight is red over blue, an overcast sky blue over red, and
+    /// neither goes negative in the channel it runs out of gamut in.
+    #[test]
+    fn a_blackbody_warms_as_it_cools() {
+        let color = |kelvin: u32| match ok(&format!("blackbody({kelvin})")) {
+            Operand::Color(c) => c,
+            other => panic!("{other:?}"),
+        };
+        let [r, _, b] = color(1900);
+        assert!(r > b && b >= 0.0, "{:?}", color(1900));
+        let [r, _, b] = color(12000);
+        assert!(b > r && r >= 0.0, "{:?}", color(12000));
+    }
+
+    /// `*` binds tighter than `+`, both fold to the left, parentheses group,
+    /// and a pattern on either side makes a mix at a factor of one.
+    #[test]
+    fn arithmetic_reads_the_usual_way() {
+        assert_eq!(ok("1 + 2 * 3"), Operand::Scalar(7.0));
+        assert_eq!(ok("(1 + 2) * 3"), Operand::Scalar(9.0));
+        assert_eq!(ok("2 * [1, 2, 3]"), Operand::Color([2.0, 4.0, 6.0]));
+        assert_eq!(ok("1+-2"), Operand::Scalar(-1.0));
+        assert_eq!(ok("1e+1*2"), Operand::Scalar(20.0));
+        assert_eq!(ok("8 - 2 - 1"), Operand::Scalar(5.0));
+        assert_eq!(ok("8 / 2 / 4"), Operand::Scalar(1.0));
+        assert_eq!(ok("1-2"), Operand::Scalar(-1.0));
+        assert_eq!(ok("[2, 4, 8] / [2, 4, 8]"), Operand::Color([1.0; 3]));
+        assert_eq!(ok("-(1 + 2)"), Operand::Scalar(-3.0));
+        assert_eq!(ok("- 2"), Operand::Scalar(-2.0));
+
+        // Subtracting and negating a pattern are adding and multiplying by -1;
+        // dividing one is multiplying by the reciprocal.
+        assert_eq!(ok("1 - uv.r"), ok("add(1, multiply(uv.r, -1, 1), 1)"));
+        assert_eq!(ok("-uv.r"), ok("multiply(uv.r, -1, 1)"));
+        assert_eq!(ok("uv / 4"), ok("multiply(uv, 0.25, 1)"));
+
+        assert_eq!(
+            ok("uv.r * 2 + 1"),
+            Operand::Input(Input::Mix {
+                a: boxed(Operand::Input(Input::Mix {
+                    a: boxed(coordinates(Space::Uv, Some(Channel::R))),
+                    b: boxed(Operand::Scalar(2.0)),
+                    factor: boxed(Operand::Scalar(1.0)),
+                    mode: Blend::Multiply,
+                })),
+                b: boxed(Operand::Scalar(1.0)),
+                factor: boxed(Operand::Scalar(1.0)),
+                mode: Blend::Add,
+            })
+        );
+
+        // Inside a call's arguments too, and a channel off a group.
+        assert_eq!(
+            ok("remap((uv + 1).g * 2, [0, 4])"),
+            ok("remap(multiply(add(uv, 1, 1).g, 2, 1), [0, 4])")
+        );
+    }
+
+    /// A chain of operators nests the tree without nesting the parser, so it
+    /// is counted against the same cap.
+    #[test]
+    fn a_long_chain_is_held_to_the_nesting_cap() {
+        let chain = vec!["uv.r"; MAX_NESTING as usize + 2].join(" * ");
+        assert!(err(&chain).contains("nests deeper"));
     }
 }

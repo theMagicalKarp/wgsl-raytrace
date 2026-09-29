@@ -112,10 +112,17 @@ struct Material {
     // Radiance given off the front face, decided by the geometric normal. Zero
     // for a surface that does not emit.
     emission: vec3f,
+    // The index the opaque part's specular coat reflects with: `ior` moved by
+    // `specular_ior_level`. Exactly `ior` at the default level of one half.
+    // Glass refracts with `ior` and nothing else reads this.
+    specular_ior: f32,
     // Mean free path inside the surface per channel, in world units. The host
     // has already multiplied the scene's radius by its scale, and has zeroed
     // `subsurface_weight` when every channel came out at nothing.
     subsurface_radius: vec3f,
+    // What `specular_ior` was worked out from, for a hit that has to work it
+    // out again because a pattern moved `ior` or the level itself.
+    specular_ior_level: f32,
 }
 
 // One triangle in world space, packed by `GpuTriangle`. A `vec3f` is 12 bytes
@@ -225,6 +232,14 @@ struct Attributes {
 // One buffer of plain words rather than a buffer per thing, because a storage
 // binding is the scarce resource here and a word is not.
 @group(1) @binding(10) var<storage> program: array<u32>;
+// Every image those programs sample, one layer each, uploaded by
+// `render::textures`. Colour maps decode from sRGB as they are sampled, so both
+// arrays hand back linear numbers; which array a layer is in is how the scene
+// said to read it. One unused texel each in a scene that reads no images.
+@group(1) @binding(11) var color_textures: texture_2d_array<f32>;
+@group(1) @binding(12) var data_textures: texture_2d_array<f32>;
+// Repeat on both axes, linear, no mipmaps.
+@group(1) @binding(13) var texture_sampler: sampler;
 // One emissive triangle, as an entry in the distribution the host built over
 // them in `scene/light.rs`.
 struct Light {
@@ -853,7 +868,7 @@ fn scatters(material: Material) -> bool {
     let opaque = dielectric * (1.0 - material.transmission);
     return material.metallic > 0.0
         || dielectric * material.transmission > 0.0
-        || (opaque > 0.0 && (material.ior != 1.0 || luminance(material.color) > 0.0));
+        || (opaque > 0.0 && (material.specular_ior != 1.0 || luminance(material.color) > 0.0));
 }
 
 // Whether the surface has any lobe a light sample could be weighed against.
@@ -1030,7 +1045,7 @@ const MIN_LOBE_SHARE: f32 = 0.05;
 fn lobe_probabilities(material: Material, cos_o: f32) -> Lobes {
     let dielectric = 1.0 - material.metallic;
     let opaque = dielectric * (1.0 - material.transmission);
-    let fresnel = fresnel_dielectric(cos_o, material.ior);
+    let fresnel = fresnel_dielectric(cos_o, material.specular_ior);
     let base = opaque * (1.0 - fresnel) * luminance(material.color);
     let weights = vec4f(
         material.metallic * luminance(fresnel_schlick(material.color, cos_o)),
@@ -1107,7 +1122,7 @@ fn principled_eval(material: Material, lobes: Lobes, eta: f32, wo: vec3f, wi: ve
     }
 
     let opaque = dielectric * (1.0 - material.transmission);
-    let coat = 1.0 - fresnel_dielectric(cos_o, material.ior);
+    let coat = 1.0 - fresnel_dielectric(cos_o, material.specular_ior);
     // What the coat lets through, less the share of it that goes into the
     // surface rather than off its base. The subsurface lobe itself is priced at
     // nothing here and has no density: what it sends back depends on where the
@@ -1133,7 +1148,7 @@ fn principled_eval(material: Material, lobes: Lobes, eta: f32, wo: vec3f, wi: ve
         let microfacet = d * g2 / (4.0 * cos_o);
         let reflectance = fresnel_dielectric(cos_m, eta);
         let fresnel = material.metallic * fresnel_schlick(material.color, cos_m)
-            + vec3f(opaque * fresnel_dielectric(cos_m, material.ior) + glass * reflectance);
+            + vec3f(opaque * fresnel_dielectric(cos_m, material.specular_ior) + glass * reflectance);
         value += fresnel * microfacet;
 
         // The visible normal density `G1(wo) max(0, wo·m) D / cos_o`, through
@@ -1253,7 +1268,7 @@ fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
                 weight = material.metallic * fresnel_schlick(material.color, cos_o) / lobes.metal;
             } else {
                 let opaque = (1.0 - material.metallic) * (1.0 - material.transmission);
-                weight = vec3f(opaque * fresnel_dielectric(cos_o, material.ior) / lobes.specular);
+                weight = vec3f(opaque * fresnel_dielectric(cos_o, material.specular_ior) / lobes.specular);
             }
             return delta_sample(reflect(-wo, normal), weight);
         }
@@ -1303,7 +1318,7 @@ fn bsdf_sample(material: Material, hit: Intersection, wo: vec3f) -> BsdfSample {
         // as the albedo it scatters with.
         let inward = -normalize(normal + sample_sphere() * (1.0 - EPSILON));
         let opaque = (1.0 - material.metallic) * (1.0 - material.transmission);
-        let coat = 1.0 - fresnel_dielectric(cos_o, material.ior);
+        let coat = 1.0 - fresnel_dielectric(cos_o, material.specular_ior);
         let share = opaque * coat * material.subsurface_weight / lobes.subsurface;
         return BsdfSample(inward, vec3f(share), 0.0, false, true, true);
     }
@@ -1602,7 +1617,9 @@ fn exit_surface() -> Material {
         // evaluating anything at.
         NO_PROGRAM,
         vec3f(0.0),
+        1.0,
         vec3f(0.0),
+        0.5,
     );
 }
 
@@ -1645,6 +1662,15 @@ const OP_CHANNEL: u32 = 3u;
 const OP_INVERT: u32 = 4u;
 const OP_REMAP: u32 = 5u;
 const OP_MIX: u32 = 6u;
+const OP_IMAGE: u32 = 7u;
+const OP_NORMAL_MAP: u32 = 8u;
+
+// The two texture arrays, matching `scene::texture`.
+const TEXTURES_COLOR: u32 = 0u;
+const TEXTURES_DATA: u32 = 1u;
+
+// A normal map's green channel: `+v` for OpenGL, `-v` for DirectX.
+const CONVENTION_DIRECTX: u32 = 1u;
 
 const SPACE_UV: u32 = 0u;
 const SPACE_OBJECT: u32 = 1u;
@@ -1663,6 +1689,10 @@ const FIELD_IOR: u32 = 3u;
 const FIELD_TRANSMISSION: u32 = 4u;
 const FIELD_SUBSURFACE_WEIGHT: u32 = 5u;
 const FIELD_EMISSION: u32 = 6u;
+const FIELD_SPECULAR_IOR_LEVEL: u32 = 7u;
+// A tangent-space direction rather than a value: read by `shading_normal`, not
+// by `resolve_material`.
+const FIELD_NORMAL: u32 = 8u;
 
 // How many values a program may have in flight. A fixed array, so this is paid
 // for in occupancy by every thread whether it evaluates anything or not — which
@@ -1777,10 +1807,68 @@ fn evaluate_input(start: u32, coords: Coordinates) -> vec4f {
             let factor = stack[depth - 1u].x;
             stack[depth - 3u] = blend_inputs(mode, stack[depth - 3u], stack[depth - 2u], factor);
             depth -= 2u;
+        } else if code == OP_IMAGE {
+            let array = program[pc];
+            let layer = program[pc + 1u];
+            let scale = vec2f(bitcast<f32>(program[pc + 2u]), bitcast<f32>(program[pc + 3u]));
+            let shift = vec2f(bitcast<f32>(program[pc + 4u]), bitcast<f32>(program[pc + 5u]));
+            pc += 6u;
+
+            stack[depth] = sample_image(array, layer, coords.uv * scale + shift);
+            depth += 1u;
+        } else if code == OP_NORMAL_MAP {
+            let strength = bitcast<f32>(program[pc]);
+            let convention = program[pc + 1u];
+            pc += 2u;
+
+            // From the `[0, 1]` a texel stores to the `[-1, 1]` a direction
+            // spans, then leaned back toward straight up by `strength`, which
+            // is Blender's reading of it: nothing at zero, the map at one, and
+            // an exaggeration of it past that. Left unnormalized, because the
+            // frame it is carried into normalizes anyway.
+            var n = stack[depth - 1u].xyz * 2.0 - 1.0;
+            if convention == CONVENTION_DIRECTX {
+                n.y = -n.y;
+            }
+            n = vec3f(0.0, 0.0, 1.0) + (n - vec3f(0.0, 0.0, 1.0)) * strength;
+            stack[depth - 1u] = vec4f(n, 0.0);
         }
     }
 
     return stack[0];
+}
+
+// One texel of one layer, at a texture coordinate as the `.obj` wrote it.
+//
+// A `.obj` puts `v = 0` at the bottom of the image and a texture's first row is
+// its top, so `v` is turned over here and nowhere else. Past the unit square
+// the sampler repeats, which is what a coordinate there means to every tool
+// that wrote one.
+//
+// Level zero explicitly: a compute shader has no derivatives to choose a mip
+// with, and there are no mips to choose from.
+fn sample_image(array: u32, layer: u32, uv: vec2f) -> vec4f {
+    let at = vec2f(uv.x, 1.0 - uv.y);
+    if array == TEXTURES_COLOR {
+        return textureSampleLevel(color_textures, texture_sampler, at, layer, 0.0);
+    }
+    return textureSampleLevel(data_textures, texture_sampler, at, layer, 0.0);
+}
+
+// The largest `sqrt(F0)` `specular_ior` converts, matching `scene::material`.
+const MAX_SPECULAR_ROOT: f32 = 0.995;
+
+// The index whose reflectance at normal incidence is `ior`'s scaled by twice
+// `level`, which is Blender 4's Specular IOR Level. Converting back to an index
+// rather than scaling the Fresnel term keeps that term exact at every angle.
+// The host's `specular_ior` is the same arithmetic for a constant surface.
+fn specular_ior(ior: f32, level: f32) -> f32 {
+    if level == 0.5 {
+        return ior;
+    }
+    let r = (ior - 1.0) / (ior + 1.0);
+    let root = min(sqrt(r * r * 2.0 * level), MAX_SPECULAR_ROOT);
+    return (1.0 + root) / (1.0 - root);
 }
 
 // Evaluates one slot of a field table, or hands back `fallback` when nothing
@@ -1824,6 +1912,15 @@ fn resolve_material(hit: Intersection, point: vec3f) -> Material {
     material.transmission = clamp(resolve_field(table, FIELD_TRANSMISSION, coords, vec3f(material.transmission)).r, 0.0, 1.0);
     material.subsurface_weight = clamp(resolve_field(table, FIELD_SUBSURFACE_WEIGHT, coords, vec3f(material.subsurface_weight)).r, 0.0, 1.0);
 
+    // The coat's index is worked out from two fields, so it is worked out
+    // again when a pattern moved either of them — and only then, so a surface
+    // with only its colour patterned keeps the host's number to the bit.
+    let level = program[table + FIELD_SPECULAR_IOR_LEVEL];
+    if level != NO_PROGRAM || program[table + FIELD_IOR] != NO_PROGRAM {
+        material.specular_ior_level = clamp(resolve_field(table, FIELD_SPECULAR_IOR_LEVEL, coords, vec3f(material.specular_ior_level)).r, 0.0, 1.0);
+        material.specular_ior = specular_ior(material.ior, material.specular_ior_level);
+    }
+
     // Emission is the one field whose constant is not a placeholder: it is the
     // upper bound the light table was built from, and `light_pdf` still prices
     // a direction by it. What the surface gives off *here* replaces it only for
@@ -1832,6 +1929,115 @@ fn resolve_material(hit: Intersection, point: vec3f) -> Material {
     material.emission = max(resolve_field(table, FIELD_EMISSION, coords, material.emission), vec3f(0.0));
 
     return material;
+}
+
+// The tangent frame a normal map is read in: `t` along increasing `u`, `b`
+// along increasing `v`, `n` the normal given, all three orthonormal.
+//
+// Per triangle, from how its texture coordinates run across its edges, then
+// Gram-Schmidt against the interpolated normal so the frame turns with the
+// smooth shading rather than with the facet. `b` is rebuilt from `n × t` with
+// the handedness the texture has, so a mirrored UV island reads its map the
+// right way round.
+//
+// A triangle whose texture coordinates have no area — every one on a mesh with
+// no `vt` lines — has no direction for `u` to run in, and comes back with `t`
+// zero, which is what the caller checks.
+fn tangent_frame(triangle: u32, n: vec3f) -> Frame {
+    let tri = triangles[triangle];
+    let face = attributes[triangle];
+
+    let e1 = tri.v1 - tri.v0;
+    let e2 = tri.v2 - tri.v0;
+    let d1 = face.uv1 - face.uv0;
+    let d2 = face.uv2 - face.uv0;
+    let det = d1.x * d2.y - d2.x * d1.y;
+    if abs(det) < 1e-12 {
+        return Frame(vec3f(0.0), vec3f(0.0), n);
+    }
+
+    let u = (e1 * d2.y - e2 * d1.y) / det;
+    let v = (e2 * d1.x - e1 * d2.x) / det;
+
+    let along = u - n * dot(n, u);
+    if dot(along, along) < 1e-20 {
+        return Frame(vec3f(0.0), vec3f(0.0), n);
+    }
+    let t = normalize(along);
+    let handed = select(-1.0, 1.0, dot(cross(n, t), v) >= 0.0);
+    return Frame(t, cross(n, t) * handed, n);
+}
+
+// `n`, bent just far enough that a mirror reflection of `wo` about it stays
+// above the true surface: Cycles' `ensure_valid_specular_reflection`.
+//
+// A normal map tilts the shading normal away from the triangle it is painted
+// on, and near a silhouette that tilt puts `wo` below the shading hemisphere, or
+// reflects it into the surface. Absorbing those paths is what makes the dark
+// fringes a normal-mapped sphere is known for; bending the normal back is what
+// Cycles does instead. `ng` is the geometric normal turned to `wo`'s side.
+fn valid_reflection(ng: vec3f, wo: vec3f, n: vec3f) -> vec3f {
+    let reflected = 2.0 * dot(n, wo) * n - wo;
+    let iz = dot(wo, ng);
+    // A reflection may always be at least as shallow as what arrived.
+    let threshold = min(0.9 * iz, 0.01);
+    if dot(ng, reflected) >= threshold {
+        return n;
+    }
+
+    // Ng as z, and `n` in the x-z plane: find the `n` in that plane whose
+    // reflection of `wo` sits exactly at the threshold.
+    let across = n - dot(n, ng) * ng;
+    var x = n;
+    if dot(across, across) > 1e-12 {
+        x = normalize(across);
+    }
+    let ix = dot(wo, x);
+    let a = ix * ix + iz * iz;
+    let b = 2.0 * (a + iz * threshold);
+    let c = (threshold + iz) * (threshold + iz);
+    let root = sqrt(max(b * b - 4.0 * a * c, 0.0));
+    let nz2 = select(0.25 * (b - root) / a, 0.25 * (b + root) / a, ix < 0.0);
+
+    return sqrt(max(1.0 - nz2, 0.0)) * x + sqrt(max(nz2, 0.0)) * ng;
+}
+
+// The normal a hit is shaded with: the interpolated one, or that one bent by a
+// normal map when the surface has one.
+//
+// `table` is the resolved material's `inputs`. A surface with no normal map
+// leaves on the first or second test with `hit.normal` untouched, which is every
+// surface in every scene written before this.
+//
+// The map is read in the frame of the normal as the mesh wrote it, and the
+// answer turned to face the ray the way `hit.normal` is: seen from behind, a
+// bump is a dent, which is what a thin sheet does.
+fn shading_normal(hit: Intersection, table: u32, point: vec3f, wo: vec3f) -> vec3f {
+    if table == NO_PROGRAM {
+        return hit.normal;
+    }
+    let offset = program[table + FIELD_NORMAL];
+    if offset == NO_PROGRAM {
+        return hit.normal;
+    }
+
+    let authored = select(-hit.normal, hit.normal, hit.front_face);
+    let frame = tangent_frame(hit.triangle, authored);
+    if all(frame.t == vec3f(0.0)) {
+        return hit.normal;
+    }
+
+    let coords = surface_coordinates(hit.triangle, hit.material, hit.bary, point);
+    let local = evaluate_input(offset, coords).xyz;
+    let bent = to_world(frame, local);
+    if !(dot(bent, bent) > 1e-12) {
+        return hit.normal;
+    }
+    let mapped = normalize(bent) * select(-1.0, 1.0, hit.front_face);
+
+    let geometric = geometric_normal(triangles[hit.triangle]);
+    let ng = select(-geometric, geometric, dot(geometric, wo) >= 0.0);
+    return normalize(valid_reflection(ng, wo, mapped));
 }
 
 fn primary_ray(pixel: vec2u) -> Ray {
@@ -1910,6 +2116,25 @@ fn luminance(color: vec3f) -> f32 {
 // strategy is claiming a direction the other prices at zero.
 fn geometric_normal(tri: Triangle) -> vec3f {
     return normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+}
+
+// Whether `wi` leaves on the side of the triangle that the shading normal says
+// it does: above the surface for a reflection, below it for anything that goes
+// through. `bsdf_sample` and `bsdf_eval` answer in the shading frame alone, and
+// a bent normal — a normal map's, or an interpolated one near a silhouette —
+// will happily call a direction a reflection when it is headed into the very
+// triangle it is leaving. The ray spawned along it skips that triangle at its
+// origin and comes out the far side carrying light from behind the surface.
+// Cycles makes the same check on the geometric normal alongside
+// `ensure_valid_specular_reflection`, which only fixes the mirror direction.
+//
+// Only the sign matters, so the cross product is not normalised. `wo` is always
+// on the side the ray arrived from, and the face is turned to meet it.
+fn agrees_with_geometry(hit: Intersection, wo: vec3f, wi: vec3f) -> bool {
+    let tri = triangles[hit.triangle];
+    let face = cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
+    let ng = select(-face, face, dot(face, wo) >= 0.0);
+    return (dot(wi, hit.normal) > 0.0) == (dot(wi, ng) > 0.0);
 }
 
 // How foreshortened an emitter is along `direction`, which points from the
@@ -2288,6 +2513,9 @@ fn direct_light(point: vec3f, hit: Intersection, material: Material, wo: vec3f) 
     // Written as the negation of the test that has to pass, the way
     // `bsdf_sample` writes it, so that a NaN density is caught here and not
     // carried into the heuristic — `pdf <= 0.0` is false for one.
+    if !agrees_with_geometry(hit, wo, light.direction) {
+        return vec3f(0.0);
+    }
     let bsdf = bsdf_eval(material, hit, wo, light.direction);
     if !(bsdf.pdf > 0.0) {
         return vec3f(0.0);
@@ -2334,6 +2562,9 @@ fn direct_sky(point: vec3f, hit: Intersection, material: Material, wo: vec3f) ->
 
     // Or one the surface does not scatter into, behind it included. Negated
     // like `direct_light`'s, and for the same reason: a NaN fails it.
+    if !agrees_with_geometry(hit, wo, sky.direction) {
+        return vec3f(0.0);
+    }
     let bsdf = bsdf_eval(material, hit, wo, sky.direction);
     if !(bsdf.pdf > 0.0) {
         return vec3f(0.0);
@@ -2389,7 +2620,7 @@ fn trace_path(primary: Ray) -> Path {
     // spending a bounce.
     var bounce = 0u;
     while bounce <= camera.max_bounces {
-        let hit = intersect_scene(ray);
+        var hit = intersect_scene(ray);
         if hit.t < 0.0 {
             // Nothing was hit, so the path escapes and the sky lights it.
             //
@@ -2440,6 +2671,10 @@ fn trace_path(primary: Ray) -> Path {
         // and cannot tell that any field of it came from a pattern.
         let point = point_on_ray(ray, hit.t);
         let material = resolve_material(hit, point);
+        // And the one place its normal is bent, for the same reason. The
+        // features below take the bent one too: it is the surface the
+        // denoiser is looking at.
+        hit.normal = shading_normal(hit, material.inputs, point, -ray.direction);
 
         // The surface a denoiser gets to steer by, and it is deliberately not
         // the first one the ray met. Following melee's glass torus through to
@@ -2521,6 +2756,12 @@ fn trace_path(primary: Ray) -> Path {
             }
 
             scattered = bsdf_sample(surface, vertex, outgoing);
+            // Absorbed rather than redrawn, the same as a microfacet reflected
+            // below the horizon: the light samplers above price this direction
+            // at nothing, so the two strategies still agree about it.
+            if scattered.valid && !agrees_with_geometry(vertex, outgoing, scattered.wi) {
+                scattered = absorbed();
+            }
             if !scattered.valid || !scattered.subsurface {
                 break;
             }

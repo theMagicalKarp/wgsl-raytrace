@@ -1,0 +1,66 @@
+[camera]
+aspect_ratio = "widescreen"
+image_width = 1200
+samples = 1024
+max_bounces = 16
+fov = 10
+look_from = [3.62, 4.64, 2.45]
+look_at = [-1.84, 0, 1.46]
+vup = [0.0, 1.0, 0.0]
+
+[environment]
+color = [0.0, 0.0, 0.0]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Light1"
+material = "light"
+emit = "blackbody(6500) * 300"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Light2"
+material = "light"
+emit = "blackbody(5000) * 500"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Floor"
+material = "principled"
+base_color = 'image("oak/base.jpg", scale: 2)'
+roughness = 'image("oak/roughness.jpg", scale: 2).r'
+metallic = 'image("oak/metalic.jpg", scale: 2).r'
+normal = 'normal_map(image("oak/normal.png", scale: 2))'
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Cube"
+material = "principled"
+base_color = 'image("metal/base.jpg", scale: 2)'
+roughness = 'image("metal/roughness.jpg", scale: 2).r'
+metallic = 'image("metal/metalic.jpg", scale: 2).r'
+normal = 'normal_map(image("metal/normal.jpg", scale: 2))'
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball"
+material = "principled"
+base_color = 'image("gold/base.jpg", scale: 2)'
+roughness = 'image("gold/roughness.jpg", scale: 2).r'
+metallic = 'image("gold/metalic.jpg", scale: 2).r'
+normal = 'normal_map(image("gold/normal.png", scale: 2))'
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Rug"
+material = "principled"
+base_color = 'image("fabric/base.jpg", scale: 2)'
+roughness = 'image("fabric/roughness.jpg", scale: 2).r'
+metallic = 'image("fabric/metalic.jpg", scale: 2).r'
+normal = 'normal_map(image("fabric/normal.png", scale: 2))'

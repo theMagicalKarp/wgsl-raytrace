@@ -77,16 +77,49 @@ pub struct GpuMaterial {
     /// larger. A bound only makes light sampling noisier, never wrong.
     pub emission: [f32; 3],
 
-    _pad1: f32,
+    /// The index the opaque part's specular coat reflects with: `ior` moved by
+    /// `specular_ior_level`, worked out here so the shader reads one number.
+    /// Exactly `ior` at the default level. Glass keeps `ior`.
+    ///
+    /// In what was padding after `emission`, as `specular_ior_level` is after
+    /// the radius, so the struct is still eighty bytes.
+    pub specular_ior: f32,
 
     /// Mean free path inside the surface per channel, in world units: the
     /// scene's radius times its scale, multiplied out here the way emission is.
     pub subsurface_radius: [f32; 3],
 
-    _pad2: f32,
+    /// The level `specular_ior` was worked out from, kept so that a hit whose
+    /// `ior` is patterned can work it out again with the level it was given.
+    pub specular_ior_level: f32,
 }
 
 const _: () = assert!(size_of::<GpuMaterial>() == 80);
+
+/// The index whose reflectance at normal incidence is `ior`'s, scaled by
+/// `level` the way Blender 4's Specular IOR Level scales it: twice the level,
+/// so 0.5 leaves it alone.
+///
+/// Converting back to an index rather than scaling the Fresnel term keeps the
+/// Fresnel term exact at every angle. The shader's `specular_ior` is the same
+/// arithmetic, for a hit whose `ior` or level is patterned.
+pub fn specular_ior(ior: f32, level: f32) -> f32 {
+    // The default, answered before any arithmetic so that every scene written
+    // before this existed reflects with the index it always did, to the bit.
+    if level == 0.5 {
+        return ior;
+    }
+
+    let r = (ior - 1.0) / (ior + 1.0);
+    // A reflectance of one is an infinite index, and the Fresnel term turns
+    // into a NaN on the way there.
+    let root = (r * r * 2.0 * level).sqrt().min(MAX_SPECULAR_ROOT);
+    (1.0 + root) / (1.0 - root)
+}
+
+/// The largest `sqrt(F0)` [`specular_ior`] converts, matching the shader's: an
+/// index of about 400, a reflectance of 0.99, and a long way from the pole.
+const MAX_SPECULAR_ROOT: f32 = 0.995;
 
 /// Whether the subsurface walk has anywhere to go: some channel of the radius,
 /// scaled, is positive. Asked of the scene's own numbers rather than of
@@ -108,8 +141,15 @@ impl GpuMaterial {
     ) -> Result<GpuMaterial, String> {
         let mut gpu = GpuMaterial::from(material);
 
-        if let Material::Principled(principled) = material {
-            gpu.inputs = programs.compile(principled, walks(principled))?;
+        match material {
+            Material::Principled(principled) => {
+                gpu.inputs = programs.compile(principled, walks(principled))?;
+            }
+            Material::Light { emit } => {
+                let principled = Material::light(emit);
+                gpu.inputs = programs.compile(&principled, walks(&principled))?;
+            }
+            _ => {}
         }
 
         Ok(gpu)
@@ -134,21 +174,24 @@ impl GpuMaterial {
             false => 0.0,
         };
 
+        let ior = constant(&principled.ior, [1.5; 3])[0];
+        let level = constant(&principled.specular_ior_level, [0.5; 3])[0];
+
         GpuMaterial {
             color: constant(&principled.base_color, [0.8; 3]),
             kind: PRINCIPLED,
             roughness: constant(&principled.roughness, [0.5; 3])[0],
             metallic: constant(&principled.metallic, [0.0; 3])[0],
-            ior: constant(&principled.ior, [1.5; 3])[0],
+            ior,
             transmission: constant(&principled.transmission, [0.0; 3])[0],
             alpha: principled.alpha,
             subsurface_weight,
             subsurface_anisotropy: principled.subsurface_anisotropy,
             inputs: NO_PROGRAM,
             emission: emission_constant(principled),
-            _pad1: 0.0,
+            specular_ior: specular_ior(ior, level),
             subsurface_radius: radius,
-            _pad2: 0.0,
+            specular_ior_level: level,
         }
     }
 
@@ -197,18 +240,7 @@ impl From<&Material> for GpuMaterial {
             Material::Glass {} => GpuMaterial::dielectric(1.5),
             Material::Water {} => GpuMaterial::dielectric(1.33),
 
-            // Black, and at an index of one so that there is no specular coat
-            // either: a surface that scatters nothing, and gives off `emit`.
-            // Written as a strength of one on the color rather than the other
-            // way around, so the radiance is `emit` exactly and not a rounding
-            // of it.
-            Material::Light { emit } => GpuMaterial::principled(&Principled {
-                base_color: Operand::Color([0.0; 3]),
-                ior: Operand::Scalar(1.0),
-                emission_color: Operand::Color(*emit),
-                emission_strength: Operand::Scalar(1.0),
-                ..Principled::default()
-            }),
+            Material::Light { emit } => GpuMaterial::principled(&Material::light(emit)),
         }
     }
 }
@@ -227,6 +259,8 @@ mod tests {
             metallic: Operand::Scalar(0.5),
             ior: Operand::Scalar(1.6),
             transmission: Operand::Scalar(0.7),
+            specular_ior_level: Operand::Scalar(0.5),
+            normal: None,
             alpha: 0.8,
             emission_color: Operand::Color([0.5, 1.0, 2.0]),
             emission_strength: Operand::Scalar(3.0),
@@ -250,9 +284,9 @@ mod tests {
                 subsurface_anisotropy: -0.3,
                 inputs: NO_PROGRAM,
                 emission: [1.5, 3.0, 6.0],
-                _pad1: 0.0,
+                specular_ior: 1.6,
                 subsurface_radius: [2.0, 1.0, 0.5],
-                _pad2: 0.0,
+                specular_ior_level: 0.5,
             }
         );
     }
@@ -340,7 +374,9 @@ mod tests {
             },
             Material::Glass {},
             Material::Water {},
-            Material::Light { emit: [1.0; 3] },
+            Material::Light {
+                emit: Operand::Color([1.0; 3]),
+            },
         ] {
             assert_eq!(
                 GpuMaterial::from(&material).subsurface_weight,
@@ -405,9 +441,9 @@ mod tests {
                     subsurface_anisotropy: 0.0,
                     inputs: NO_PROGRAM,
                     emission: [0.0; 3],
-                    _pad1: 0.0,
+                    specular_ior: ior,
                     subsurface_radius: [0.05, 0.010000001, 0.0050000004],
-                    _pad2: 0.0,
+                    specular_ior_level: 0.5,
                 },
                 "{material}"
             );
@@ -423,7 +459,7 @@ mod tests {
     #[test]
     fn a_light_is_a_principled_surface_that_only_emits() {
         let light = GpuMaterial::from(&Material::Light {
-            emit: [1.0, 2.0, 3.0],
+            emit: Operand::Color([1.0, 2.0, 3.0]),
         });
 
         assert_eq!(light.kind, PRINCIPLED);
@@ -433,6 +469,32 @@ mod tests {
         assert_eq!(light.transmission, 0.0);
         assert_eq!(light.ior, 1.0, "no Fresnel reflection at any angle");
         assert_eq!(light.alpha, 1.0);
+    }
+
+    /// The default level is the index as written, to the bit, and the two
+    /// ends are no coat at all and twice the reflectance.
+    #[test]
+    fn the_specular_level_moves_the_coat_and_only_the_coat() {
+        let reflectance = |ior: f32| ((ior - 1.0) / (ior + 1.0)).powi(2);
+
+        assert_eq!(specular_ior(1.5, 0.5), 1.5);
+        assert_eq!(
+            specular_ior(1.5, 0.0),
+            1.0,
+            "no reflectance is an index of one"
+        );
+        assert!((reflectance(specular_ior(1.5, 1.0)) - 2.0 * reflectance(1.5)).abs() < 1e-6);
+        assert!((reflectance(specular_ior(1.5, 0.25)) - 0.5 * reflectance(1.5)).abs() < 1e-6);
+        assert!(specular_ior(1000.0, 1.0).is_finite(), "held off the pole");
+
+        let material = GpuMaterial::from(&Material::Principled(Box::new(Principled {
+            ior: Operand::Scalar(1.45),
+            specular_ior_level: Operand::Scalar(0.0),
+            ..Principled::default()
+        })));
+        assert_eq!(material.ior, 1.45, "glass keeps the index as written");
+        assert_eq!(material.specular_ior, 1.0);
+        assert_eq!(material.specular_ior_level, 0.0);
     }
 
     #[test]

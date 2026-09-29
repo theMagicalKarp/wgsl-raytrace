@@ -172,13 +172,13 @@ into world space at load time.
 
 | `material` | Fields | Notes |
 | --- | --- | --- |
-| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `alpha`, `emission_color = [r, g, b]`, `emission_strength`, `subsurface_weight`, `subsurface_radius = [r, g, b]`, `subsurface_scale`, `subsurface_anisotropy` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). The surface emits `emission_color × emission_strength` from its front face only (the side its winding faces), on top of whatever it reflects, and is sampled as a light. `subsurface_weight` replaces that much of the diffuse base with a random walk under the surface (see below). All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `1.0`, `[1, 1, 1]`, `0.0`, `0.0`, `[1, 0.2, 0.1]`, `0.05`, `0.0`. `roughness`, `metallic`, `transmission`, `alpha` and `subsurface_weight` are in `[0, 1]`; `subsurface_anisotropy` is in `[-1, 1]`; `ior` is at least 1; emission, the radius and the scale are non-negative. Most fields also accept a pattern instead of a number — see [Material inputs](#material-inputs). |
+| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `specular_ior_level`, `normal`, `alpha`, `emission_color = [r, g, b]`, `emission_strength`, `subsurface_weight`, `subsurface_radius = [r, g, b]`, `subsurface_scale`, `subsurface_anisotropy` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). The surface emits `emission_color × emission_strength` from its front face only (the side its winding faces), on top of whatever it reflects, and is sampled as a light. `subsurface_weight` replaces that much of the diffuse base with a random walk under the surface (see below). `specular_ior_level` scales the opaque part's specular reflectance at normal incidence as Blender 4 does (0.5 is exactly what `ior` gives, 0 is no specular coat, 1 doubles it); glass keeps `ior`. `normal` takes a [normal map](#image-maps). All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `0.5`, none, `1.0`, `[1, 1, 1]`, `0.0`, `0.0`, `[1, 0.2, 0.1]`, `0.05`, `0.0`. `roughness`, `metallic`, `transmission`, `specular_ior_level`, `alpha` and `subsurface_weight` are in `[0, 1]`; `subsurface_anisotropy` is in `[-1, 1]`; `ior` is at least 1; emission, the radius and the scale are non-negative. Most fields also accept a pattern instead of a number — see [Material inputs](#material-inputs). |
 | `lambertian` | `albedo = [r, g, b]` | Shorthand for `principled` with `base_color = albedo`, `roughness = 1`, `metallic = 0`, `ior = 1`. Pure diffuse. |
 | `metal` | `albedo`, `roughness` | Shorthand for `principled` with `base_color = albedo`, `metallic = 1`. |
 | `dielectric` | `refraction_index` | Shorthand for `principled` with `base_color = [1, 1, 1]`, `roughness = 0`, `metallic = 0`, `ior = refraction_index`, `transmission = 1`. Clear glass. |
 | `glass` | — | Dielectric with IOR 1.5. |
 | `water` | — | Dielectric with IOR 1.33. |
-| `light` | `emit = [r, g, b]` | Shorthand for `principled` with `base_color = [0, 0, 0]`, `ior = 1`, `emission_color = emit`, `emission_strength = 1`: emits from its front face and reflects nothing. Values above 1 are normal. |
+| `light` | `emit = [r, g, b]` | Shorthand for `principled` with `base_color = [0, 0, 0]`, `ior = 1`, `emission_color = emit`, `emission_strength = 1`: emits from its front face and reflects nothing. Values above 1 are normal. `emit` is patternable like `emission_color`, e.g. `emit = "blackbody(6500) * 300"`. |
 
 #### Material inputs
 
@@ -202,8 +202,10 @@ base_color = "mix([0.75, 0.15, 0.1], [0.1, 0.2, 0.7], remap(object.z, [-6, 6], [
 The whole grammar:
 
 ```text
-operand     := primary {. channel}
-primary     := number | color | coordinates | call
+expression  := term {(+ | -) term}
+term        := operand {(* | /) operand}
+operand     := [-] primary {. channel}
+primary     := number | color | coordinates | call | (expression)
 color       := [r, g, b]
 coordinates := uv | object | world
 channel     := r | g | b | a   (or x | y | z | w, for the same four)
@@ -211,10 +213,18 @@ call        := invert(operand)
              | remap(operand, [to0, to1])
              | remap(operand, [from0, from1], [to0, to1])
              | (mix | multiply | add | overlay)(a, b, factor)
+             | blackbody(kelvin)
+             | image("file", keyword: value, …)
+             | normal_map(operand, keyword: value, …)
 ```
 
+Arguments a call can't do without are positional; optional ones follow as
+`name: value` keywords, in any order.
+
 A blend mode is the name of the call rather than an argument to it, so
-`overlay(a, b, f)` is the overlay mix. Whitespace is free, numbers may be
+`overlay(a, b, f)` is the overlay mix. `+`, `-`, `*` and `/` work with the
+usual precedence and parentheses; between two constants they are worked out
+when the scene loads, so `blackbody(6500) * 300` is just a colour. Whitespace is free, numbers may be
 written any way TOML writes them (`-6`, `0.5`, `1e-3`), and an error names the
 column it stopped at inside the string, on top of the line TOML names.
 
@@ -226,8 +236,9 @@ one component and broadcasts it, which is how a pattern says which of its
 channels a scalar field should read: `remap(uv, [0, 4]).g`.
 
 **Patternable**: `base_color`, `roughness`, `metallic`, `ior`, `transmission`,
-`emission_color`, `emission_strength`, `subsurface_weight`. **Not**: `alpha`,
-`subsurface_radius`, `subsurface_scale`, `subsurface_anisotropy`.
+`specular_ior_level`, `emission_color`, `emission_strength`,
+`subsurface_weight`, a `light`'s `emit`, and `normal` (which only takes a `normal_map`). **Not**:
+`alpha`, `subsurface_radius`, `subsurface_scale`, `subsurface_anisotropy`.
 
 | Expression | What it is |
 | --- | --- |
@@ -236,6 +247,10 @@ channels a scalar field should read: `remap(uv, [0, 4]).g`.
 | `invert(input)` | `1 - input`, per channel. |
 | `remap(input, [from], [to])`, `from` defaulting to `[0, 1]` | `input` taken from one range onto another, **clamped** to `to`. The way to give an unbounded pattern a range. `from` may not have two equal ends; `to` may descend. |
 | `mix(a, b, factor)`, and `multiply`, `add`, `overlay` the same way | `a` and `b` blended by `factor`, which is clamped to `[0, 1]`. Blender's Mix node arithmetic. |
+| `a + b`, `a - b`, `a * b`, `a / b`, `-a` | Arithmetic, per channel. Shorthand for `add(a, b, 1)` and `multiply(a, b, 1)`: `a - b` is `a + b × -1`, `-a` is `a × -1`, and `a / b` is `a × (1 / b)`, so `b` must be a non-zero constant when dividing. |
+| `blackbody(kelvin)` | The colour of a black body at that temperature (at least 500 K), in linear Rec. 709 and scaled to a luminance of 1 as Blender's Blackbody node is, so it sets a light's colour and a strength sets its brightness. A constant: `kelvin` is a number, not a pattern. |
+| `image("file", color:, scale:, offset:)` | An image, sampled at `uv × scale + offset`. See [Image maps](#image-maps). |
+| `normal_map(input, strength:, convention:)` | A tangent-space normal map, for the `normal` field only. See [Image maps](#image-maps). |
 
 Any of `input`, `a`, `b` and `factor` may itself be a plain number, a colour, or
 another pattern, up to eight values in flight and 64 levels of nesting.
@@ -250,6 +265,51 @@ and a half that is constantly zero settles the product whatever the other half
 does. The bound is only used to decide how often to aim at the surface; what it
 actually emits is evaluated at the point that was drawn, so a loose bound costs
 noise and nothing else.
+
+#### Image maps
+
+```toml
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+material = "principled"
+base_color = 'image("oak/base.jpg", scale: 2)'
+roughness = 'image("oak/roughness.jpg", scale: 2).r'
+metallic = 'image("oak/metalic.jpg", scale: 2).r'
+normal = 'normal_map(image("oak/normal.png", scale: 2))'
+```
+
+Write these in TOML literal strings (`'…'`) so the quotes around the file name
+need no escaping.
+
+| Keyword | Default | Meaning |
+| --- | --- | --- |
+| `color` | by field | `"srgb"` decodes the texels as gamma-encoded colour; `"linear"` takes them as the numbers they are. `base_color` and `emission_color` default to `"srgb"`, every other field (and `normal`) to `"linear"`. A roughness map read as sRGB comes out too dark, and a colour map read as linear too bright. |
+| `scale` | `1` | Multiplies the texture coordinates: `4` repeats the image four times each way, `[2, 1]` twice across and once up. |
+| `offset` | `[0, 0]` | Added after the scale. |
+
+- The image is sampled at the mesh's `uv`, so the mesh needs `vt` lines. Past
+  the unit square it repeats. It is bilinearly filtered, with no mipmaps: each
+  sample jitters within its pixel, which antialiases a distant texture over
+  enough samples.
+- A channel is the usual suffix: `image("orm.png").g` reads a packed map's green.
+- Paths are relative to the scene file. PNG, JPEG, EXR and HDR are read, all
+  converted to 8 bits a channel; TIFF is not.
+- Every image is a layer of one of two texture arrays (sRGB and linear), and
+  every layer of an array is resized to the largest image in it, capped at
+  4096 on a side. A file used both ways is loaded twice. Budget about 16 MB per
+  2048² image.
+- An emissive image is bounded by its strength, so it needs no `remap`.
+
+`normal_map(input, strength: 1, convention: "opengl")` bends the shading normal
+by a tangent-space normal map. The tangent follows the direction `u` runs across
+each triangle, so mirrored UV islands read correctly. `convention: "directx"`
+flips green for maps authored the other way up (if a normal-mapped surface
+looks lit from the wrong side, this is why). `strength` leans the result back
+toward the mesh's own normal: `0` is no effect, and values above `1`
+exaggerate the map. Where the bent normal would reflect a ray into the surface,
+near silhouettes, it is bent back as Cycles does, instead of turning black. A
+mesh with no texture coordinates ignores the map.
 
 #### Subsurface scattering
 
@@ -295,7 +355,8 @@ flowchart LR
    its transforms, and builds a binned-SAH BVH (depth-capped to fit the shader's
    fixed traversal stack). It also builds a power-weighted table of emissive
    triangles and, when an HDRI is present, a marginal/conditional CDF over its
-   texels. All of this is uploaded once as storage buffers.
+   texels. All of this is uploaded once as storage buffers, beside the image
+   maps' two texture arrays.
 2. **Trace.** One compute dispatch per sample, with one thread per pixel
    (`shader.wgsl`). Each thread:
    - Casts a stratified, jittered primary ray. With a lens, the ray starts on
@@ -437,7 +498,7 @@ mise run example melee --debug   # also write raw frame + AOVs to examples/melee
 | ![glass](examples/glass/render.png) `glass`: glass monkeys, two lights; the scene with the most fireflies | ![cubes](examples/cubes/render.png) `cubes`: a room of objects lit by one emitter |
 | ![stairs](examples/stairs/render.png) `stairs`: glass orbs and a staircase, two lights | ![tunnel](examples/tunnel/render.png) `tunnel`: coloured walls under an HDRI |
 | ![principled](examples/principled/render.png) `principled`: one row per parameter, back to front: emission, base color, roughness, metallic, IOR, alpha | ![subsurface](examples/subsurface/render.png) `subsurface`: backlit spheres, one row each for weight, scale and radius |
-| ![blob](examples/blob/render.png) `blob`: a waxy subsurface blob in a grey room, lit by one overhead emitter | |
+| ![blob](examples/blob/render.png) `blob`: a waxy subsurface blob in a grey room, lit by one overhead emitter | ![textures](examples/textures/render.png) `textures`: oak floor, fabric rug, metal cube and gold ball, each with colour, roughness, metallic and normal maps, under two blackbody lights |
 
 ## Development
 

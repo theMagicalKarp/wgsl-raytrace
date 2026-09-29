@@ -10,6 +10,8 @@ mod input;
 
 pub use input::Blend;
 pub use input::Channel;
+pub use input::ColorSpace;
+pub use input::Convention;
 pub use input::Input;
 pub use input::MAX_NESTING;
 pub use input::Operand;
@@ -400,6 +402,18 @@ pub struct Principled {
     #[serde_inline_default(Operand::Scalar(0.0))]
     pub transmission: Operand,
 
+    /// How strongly the opaque part's specular coat reflects, as Blender 4
+    /// spells it: 0.5 is exactly what `ior` says, zero is no coat at all, and
+    /// one doubles the reflectance at normal incidence. Glass keeps `ior`.
+    #[serde_inline_default(Operand::Scalar(0.5))]
+    pub specular_ior_level: Operand,
+
+    /// A tangent-space normal map bending the shading normal:
+    /// `normal = 'normal_map(image("wood_nrm.jpg"))'`. Absent, the surface
+    /// shades with the mesh's own normals.
+    #[serde(default)]
+    pub normal: Option<Operand>,
+
     /// Coverage: the chance a ray is stopped by the surface at all. The rest
     /// pass straight through as though it were not there, which is a cutout
     /// rather than a refraction.
@@ -442,6 +456,40 @@ pub struct Principled {
     pub subsurface_anisotropy: f32,
 }
 
+impl Principled {
+    /// Every patternable field that holds a value, with its name. `normal` is
+    /// not one: it holds a direction, and is asked about on its own.
+    pub fn fields(&self) -> [(&'static str, &Operand); 9] {
+        [
+            ("base_color", &self.base_color),
+            ("roughness", &self.roughness),
+            ("metallic", &self.metallic),
+            ("ior", &self.ior),
+            ("transmission", &self.transmission),
+            ("specular_ior_level", &self.specular_ior_level),
+            ("emission_color", &self.emission_color),
+            ("emission_strength", &self.emission_strength),
+            ("subsurface_weight", &self.subsurface_weight),
+        ]
+    }
+
+    fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
+        [
+            &mut self.base_color,
+            &mut self.roughness,
+            &mut self.metallic,
+            &mut self.ior,
+            &mut self.transmission,
+            &mut self.specular_ior_level,
+            &mut self.emission_color,
+            &mut self.emission_strength,
+            &mut self.subsurface_weight,
+        ]
+        .into_iter()
+        .chain(self.normal.as_mut())
+    }
+}
+
 impl Default for Principled {
     fn default() -> Self {
         Principled {
@@ -450,6 +498,8 @@ impl Default for Principled {
             metallic: Operand::Scalar(0.0),
             ior: Operand::Scalar(1.5),
             transmission: Operand::Scalar(0.0),
+            specular_ior_level: Operand::Scalar(0.5),
+            normal: None,
             alpha: 1.0,
             emission_color: Operand::Color([1.0, 1.0, 1.0]),
             emission_strength: Operand::Scalar(0.0),
@@ -487,8 +537,9 @@ pub enum Material {
     #[serde(rename = "water")]
     Water {},
 
+    /// Patternable, as `emission_color` is: `emit = "blackbody(6500) * 300"`.
     #[serde(rename = "light")]
-    Light { emit: [f32; 3] },
+    Light { emit: Operand },
 }
 
 impl fmt::Display for Material {
@@ -496,13 +547,15 @@ impl fmt::Display for Material {
         match self {
             Material::Principled(p) => write!(
                 f,
-                "principled[{}] roughness {} metallic {} ior {} transmission {} alpha {} \
-                 emission[{}] strength {} subsurface {} radius{:?} scale {} anisotropy {}",
+                "principled[{}] roughness {} metallic {} ior {} transmission {} \
+                 specular {} alpha {} emission[{}] strength {} subsurface {} radius{:?} \
+                 scale {} anisotropy {}{}",
                 p.base_color,
                 p.roughness,
                 p.metallic,
                 p.ior,
                 p.transmission,
+                p.specular_ior_level,
                 p.alpha,
                 p.emission_color,
                 p.emission_strength,
@@ -510,6 +563,10 @@ impl fmt::Display for Material {
                 p.subsurface_radius,
                 p.subsurface_scale,
                 p.subsurface_anisotropy,
+                match &p.normal {
+                    Some(normal) => format!(" normal {normal}"),
+                    None => String::new(),
+                },
             ),
             Material::Lambertian { albedo } => write!(f, "lambertian{:?}", albedo),
             Material::Metal { albedo, roughness } => {
@@ -520,7 +577,25 @@ impl fmt::Display for Material {
             }
             Material::Glass {} => write!(f, "glass"),
             Material::Water {} => write!(f, "water"),
-            Material::Light { emit } => write!(f, "light{:?}", emit),
+            Material::Light { emit } => write!(f, "light {emit}"),
+        }
+    }
+}
+
+impl Material {
+    /// The [`Principled`] surface a light is shorthand for: black, and at an
+    /// index of one so there is no specular coat either — a surface that
+    /// scatters nothing and gives off `emit`. Written as a strength of one on
+    /// the colour rather than the other way around, so the radiance is `emit`
+    /// exactly and not a rounding of it, and so an image in it is read as the
+    /// colour it is.
+    pub fn light(emit: &Operand) -> Principled {
+        Principled {
+            base_color: Operand::Color([0.0; 3]),
+            ior: Operand::Scalar(1.0),
+            emission_color: emit.clone(),
+            emission_strength: Operand::Scalar(1.0),
+            ..Principled::default()
         }
     }
 }
@@ -648,6 +723,31 @@ impl Material {
                 non_negative("subsurface_scale", p.subsurface_scale)?;
                 asymmetry("subsurface_anisotropy", p.subsurface_anisotropy)?;
                 operand("ior", &p.ior, &channels(&ior))?;
+                operand(
+                    "specular_ior_level",
+                    &p.specular_ior_level,
+                    &channels(&unit),
+                )?;
+
+                // A normal map is a direction, and the shading frame is the one
+                // place that knows what to do with one: anywhere else it would
+                // be read as a colour, and in `normal` as anything else it
+                // would be a colour read as a direction.
+                for (name, field) in p.fields() {
+                    if field.has_normal_map() {
+                        return Err(format!(
+                            "{name} cannot take a normal_map; only `normal` does"
+                        ));
+                    }
+                }
+                if let Some(normal) = &p.normal {
+                    let Operand::Input(Input::NormalMap { input, .. }) = normal else {
+                        return Err(format!("normal must be a normal_map(…), not `{normal}`"));
+                    };
+                    if input.has_normal_map() {
+                        return Err(String::from("a normal_map cannot hold another one"));
+                    }
+                }
 
                 // Emission is the one field the host has to know a number for
                 // before the render starts: the light table weights every
@@ -661,7 +761,15 @@ impl Material {
                 color("albedo", *albedo)?;
                 unit("roughness", *roughness)
             }
-            Material::Light { emit } => color("emit", *emit),
+            Material::Light { emit } => {
+                operand("emit", emit, &color)?;
+                if emit.has_normal_map() {
+                    return Err(String::from(
+                        "emit cannot take a normal_map; only `normal` does",
+                    ));
+                }
+                emissive_bound(&Material::light(emit))
+            }
             Material::Dielectric { refraction_index } => ior("refraction_index", *refraction_index),
             Material::Glass {} | Material::Water {} => Ok(()),
         }
@@ -775,6 +883,17 @@ impl Config {
                 return Err(
                     format!("Object file does not exist: {}", wavefront.file.display()).into(),
                 );
+            }
+
+            let operands: Vec<&mut Operand> = match &mut wavefront.material {
+                Material::Principled(principled) => principled.operands_mut().collect(),
+                Material::Light { emit } => vec![emit],
+                _ => Vec::new(),
+            };
+            for operand in operands {
+                operand
+                    .resolve_images(config_dir)
+                    .map_err(|error| format!("Object {index} material: {error}"))?;
             }
 
             wavefront
@@ -1221,10 +1340,10 @@ emit = [3.0, 3.0, 3.0]"#,
         assert_eq!(
             wavefront.material,
             Material::Light {
-                emit: [3.0, 3.0, 3.0]
+                emit: Operand::Color([3.0, 3.0, 3.0])
             }
         );
-        assert_eq!(wavefront.material.to_string(), "light[3.0, 3.0, 3.0]");
+        assert_eq!(wavefront.material.to_string(), "light [3, 3, 3]");
 
         assert!(
             toml::from_str::<Config>(&source.replace(
@@ -1258,6 +1377,8 @@ emit = [3.0, 3.0, 3.0]"#,
                 metallic: Operand::Scalar(0.0),
                 ior: Operand::Scalar(1.5),
                 transmission: Operand::Scalar(0.0),
+                specular_ior_level: Operand::Scalar(0.5),
+                normal: None,
                 alpha: 1.0,
                 emission_color: Operand::Color([1.0, 1.0, 1.0]),
                 emission_strength: Operand::Scalar(0.0),
@@ -1275,6 +1396,7 @@ emit = [3.0, 3.0, 3.0]"#,
         let source = with_material(
             "material = \"principled\"\nbase_color = [0.1, 0.2, 0.3]\n\
              roughness = 0.25\nmetallic = 1.0\nior = 1.33\ntransmission = 0.75\nalpha = 0.4\n\
+             specular_ior_level = 0.7\n\
              emission_color = [0.5, 0.6, 0.7]\nemission_strength = 2.5\n\
              subsurface_weight = 0.6\nsubsurface_radius = [0.9, 0.3, 0.15]\n\
              subsurface_scale = 0.2\nsubsurface_anisotropy = -0.4",
@@ -1290,6 +1412,8 @@ emit = [3.0, 3.0, 3.0]"#,
                 metallic: Operand::Scalar(1.0),
                 ior: Operand::Scalar(1.33),
                 transmission: Operand::Scalar(0.75),
+                specular_ior_level: Operand::Scalar(0.7),
+                normal: None,
                 alpha: 0.4,
                 emission_color: Operand::Color([0.5, 0.6, 0.7]),
                 emission_strength: Operand::Scalar(2.5),
@@ -1410,6 +1534,31 @@ emit = [3.0, 3.0, 3.0]"#,
                 "material = \"dielectric\"\nrefraction_index = nan",
                 "refraction_index",
             ),
+            (
+                "material = \"principled\"\nspecular_ior_level = 1.5",
+                "specular_ior_level",
+            ),
+            // A direction is only read where a direction is wanted, and the
+            // one field that wants one wants nothing else.
+            ("material = \"principled\"\nnormal = 0.5", "normal must be"),
+            (
+                "material = \"principled\"\nnormal = 'image(\"lit.png\")'",
+                "normal must be",
+            ),
+            (
+                "material = \"principled\"\nbase_color = 'normal_map(uv)'",
+                "base_color cannot take a normal_map",
+            ),
+            (
+                "material = \"principled\"\nnormal = 'normal_map(normal_map(uv))'",
+                "cannot hold another",
+            ),
+            // An image is resolved against the scene the way a mesh is, and
+            // one that is not there is named before any GPU work starts.
+            (
+                "material = \"principled\"\nnormal = 'normal_map(image(\"missing.png\"))'",
+                "missing.png",
+            ),
         ] {
             let mut config: Config = toml::from_str(&with_material(material)).unwrap();
             let error = config
@@ -1427,6 +1576,9 @@ emit = [3.0, 3.0, 3.0]"#,
             "material = \"principled\"\nalpha = 0.0",
             "material = \"principled\"\nalpha = 1.0",
             "material = \"dielectric\"\nrefraction_index = 1.0",
+            "material = \"principled\"\nbase_color = 'image(\"lit.png\")'\n\
+             roughness = 'image(\"lit.png\", color: \"linear\", scale: 4).g'\n\
+             normal = 'normal_map(image(\"lit.png\"), strength: 0.5)'",
         ] {
             let mut config: Config = toml::from_str(&with_material(material)).unwrap();
             config
