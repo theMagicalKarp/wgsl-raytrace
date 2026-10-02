@@ -9,20 +9,26 @@ mod expression;
 mod input;
 
 pub use input::Blend;
+pub use input::Cell;
 pub use input::Channel;
 pub use input::ColorSpace;
 pub use input::Convention;
 pub use input::Input;
 pub use input::MAX_NESTING;
+pub use input::MAX_NOISE_DETAIL;
+pub use input::MAX_RAMP_STOPS;
 pub use input::Operand;
 pub use input::Space;
 #[cfg(test)]
 pub use input::blend;
+#[cfg(test)]
+pub use input::{MAX_CELL_DISTANCE, MAX_CELL_EDGE_DISTANCE};
 
 use clap::Parser;
 use colored::Colorize;
 use serde::Deserialize;
 use serde_inline_default::serde_inline_default;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
@@ -729,23 +735,29 @@ impl Material {
                     &channels(&unit),
                 )?;
 
-                // A normal map is a direction, and the shading frame is the one
-                // place that knows what to do with one: anywhere else it would
-                // be read as a colour, and in `normal` as anything else it
-                // would be a colour read as a direction.
+                // A normal map or a bump is a direction, and the shading frame
+                // is the one place that knows what to do with one: anywhere
+                // else it would be read as a colour, and in `normal` as
+                // anything else it would be a colour read as a direction.
                 for (name, field) in p.fields() {
-                    if field.has_normal_map() {
+                    if field.has_normal() {
                         return Err(format!(
-                            "{name} cannot take a normal_map; only `normal` does"
+                            "{name} cannot take a normal_map or a bump; only `normal` does"
                         ));
                     }
                 }
                 if let Some(normal) = &p.normal {
-                    let Operand::Input(Input::NormalMap { input, .. }) = normal else {
-                        return Err(format!("normal must be a normal_map(…), not `{normal}`"));
+                    let (Operand::Input(Input::NormalMap { input, .. })
+                    | Operand::Input(Input::Bump { input, .. })) = normal
+                    else {
+                        return Err(format!(
+                            "normal must be a normal_map(…) or a bump(…), not `{normal}`"
+                        ));
                     };
-                    if input.has_normal_map() {
-                        return Err(String::from("a normal_map cannot hold another one"));
+                    if input.has_normal() {
+                        return Err(String::from(
+                            "a normal_map or a bump cannot hold another one",
+                        ));
                     }
                 }
 
@@ -763,9 +775,9 @@ impl Material {
             }
             Material::Light { emit } => {
                 operand("emit", emit, &color)?;
-                if emit.has_normal_map() {
+                if emit.has_normal() {
                     return Err(String::from(
-                        "emit cannot take a normal_map; only `normal` does",
+                        "emit cannot take a normal_map or a bump; only `normal` does",
                     ));
                 }
                 emissive_bound(&Material::light(emit))
@@ -863,6 +875,14 @@ pub struct Config {
     #[serde(skip)]
     pub seed: u32,
 
+    /// Patterns with names, for a field to use by name: `dirt = "noise(…)"`
+    /// here, and `roughness = "mix(0.9, 0.6, dirt)"` on the surface. What lets
+    /// one mask drive several fields, and several surfaces, without being
+    /// written out in each. Written into every field that names one by
+    /// [`Config::validate`], so nothing past it ever sees a name.
+    #[serde(default)]
+    pub patterns: BTreeMap<String, Operand>,
+
     #[serde(default)]
     pub objects: Vec<Object>,
 }
@@ -875,6 +895,8 @@ impl Config {
     /// the parse pure and puts a clear error in front of the user before any
     /// GPU work starts.
     pub fn validate(&mut self, config_dir: &Path) -> Result<(), Box<dyn Error>> {
+        self.validate_patterns()?;
+
         for (index, object) in self.objects.iter_mut().enumerate() {
             let Object::Wavefront(wavefront) = object;
 
@@ -891,8 +913,12 @@ impl Config {
                 _ => Vec::new(),
             };
             for operand in operands {
+                // Names first: an image inside a named pattern is written into
+                // this field as a copy, and resolved against the scene's
+                // directory along with every other.
                 operand
-                    .resolve_images(config_dir)
+                    .resolve_patterns(&self.patterns)
+                    .and_then(|()| operand.resolve_images(config_dir))
                     .map_err(|error| format!("Object {index} material: {error}"))?;
             }
 
@@ -970,6 +996,36 @@ impl Config {
             .into());
         }
 
+        Ok(())
+    }
+}
+
+impl Config {
+    /// Every entry of `[patterns]` is checked whether anything uses it or not:
+    /// its name has to be one a pattern can be referred to by, and it has to
+    /// write out, which is where a loop or a misspelling is caught.
+    fn validate_patterns(&self) -> Result<(), String> {
+        for name in self.patterns.keys() {
+            let mut chars = name.chars();
+            let starts = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_');
+            if !starts || !chars.all(|c| c.is_alphanumeric() || c == '_') {
+                return Err(format!(
+                    "pattern name `{name}` must be letters, digits and underscores, \
+                     starting with a letter"
+                ));
+            }
+            if expression::is_reserved(name) {
+                return Err(format!(
+                    "pattern name `{name}` is already a word in the pattern language"
+                ));
+            }
+
+            // From the name rather than the definition, so a loop through it
+            // is reported starting where the scene's entry does.
+            Operand::Input(Input::Pattern { name: name.clone() })
+                .resolve_patterns(&self.patterns)
+                .map_err(|error| format!("Pattern `{name}`: {error}"))?;
+        }
         Ok(())
     }
 }
@@ -1585,6 +1641,135 @@ emit = [3.0, 3.0, 3.0]"#,
                 .validate(Path::new("tests/golden"))
                 .unwrap_or_else(|error| panic!("{material:?} is legal: {error}"));
         }
+    }
+
+    /// A scene with named patterns in it, and one surface using them.
+    fn patterned(patterns: &str, surface: &str) -> Result<Config, String> {
+        let source = format!(
+            r#"
+[camera]
+aspect_ratio = "square"
+image_width = 8
+samples = 1
+max_bounces = 1
+fov = 45
+look_from = [0.0, 0.0, 1.0]
+look_at = [0.0, 0.0, 0.0]
+
+[patterns]
+{patterns}
+
+[[objects]]
+shape = "wavefront"
+file = "teapot.obj"
+material = "principled"
+{surface}
+"#
+        );
+        let mut config: Config = toml::from_str(&source).map_err(|error| error.to_string())?;
+        config
+            .validate(Path::new("tests/golden"))
+            .map_err(|error| error.to_string())?;
+        Ok(config)
+    }
+
+    fn principled(config: &Config) -> &Principled {
+        let Object::Wavefront(wavefront) = &config.objects[0];
+        let Material::Principled(principled) = &wavefront.material else {
+            panic!("expected a principled surface");
+        };
+        principled
+    }
+
+    /// One mask, two fields: each gets its own copy of it, and neither has a
+    /// name left in it by the time anything compiles it.
+    #[test]
+    fn a_named_pattern_drives_every_field_that_names_it() {
+        let config = patterned(
+            r#"dirt = "remap(noise(object, scale: 4, detail: 5), [0.45, 0.55], [0, 1])""#,
+            r#"base_color = "mix([0.2, 0.5, 0.1], [0.25, 0.18, 0.1], dirt)"
+roughness = "mix(0.9, 0.6, dirt)"
+normal = "bump(dirt, distance: 0.01)""#,
+        )
+        .expect("should validate");
+
+        let surface = principled(&config);
+        let dirt = "remap(noise(object, scale: 4, detail: 5), [0.45, 0.55], [0, 1])";
+        assert_eq!(
+            surface.roughness.to_string(),
+            format!("mix(0.9, 0.6, {dirt})")
+        );
+        assert_eq!(
+            surface.base_color.to_string(),
+            format!("mix([0.2, 0.5, 0.1], [0.25, 0.18, 0.1], {dirt})")
+        );
+        assert_eq!(
+            surface.normal.as_ref().map(ToString::to_string),
+            Some(format!("bump({dirt}, distance: 0.01)"))
+        );
+    }
+
+    /// Every entry is checked, used or not: a pattern that is wrong is wrong
+    /// before anyone reaches for it.
+    #[test]
+    fn a_named_pattern_is_checked_whether_it_is_used_or_not() {
+        let error = patterned(r#"dirt = "mix(0, 1, grit)""#, "").expect_err("grit is undefined");
+        assert!(error.contains("Pattern `dirt`"), "{error}");
+        assert!(error.contains("unknown name `grit`"), "{error}");
+
+        let error = patterned("a = \"b\"\nb = \"a\"", "").expect_err("a loop");
+        assert!(error.contains("a -> b -> a"), "{error}");
+
+        let error = patterned(r#"noise = "uv.r""#, "").expect_err("a reserved word");
+        assert!(error.contains("already a word"), "{error}");
+
+        let error = patterned(r#""2dirt" = "uv.r""#, "").expect_err("not an identifier");
+        assert!(error.contains("letters, digits and underscores"), "{error}");
+    }
+
+    /// A field that names nothing in the table is named in the error, with the
+    /// object it is on.
+    #[test]
+    fn a_field_naming_no_pattern_is_an_error() {
+        let error =
+            patterned(r#"dirt = "uv.r""#, r#"roughness = "drit""#).expect_err("a misspelling");
+        assert!(error.contains("Object 0"), "{error}");
+        assert!(error.contains("unknown name `drit`"), "{error}");
+    }
+
+    /// Emission through a name is bounded by what the name holds, so a noise
+    /// needs no remap to light a scene.
+    #[test]
+    fn an_emission_through_a_named_pattern_is_bounded_by_it() {
+        let config = patterned(
+            r#"glow = "noise(world, scale: 3)""#,
+            "emission_strength = 4\nemission_color = \"glow\"",
+        )
+        .expect("a noise is bounded");
+        assert_eq!(emission_bound(principled(&config)), Some([4.0; 3]));
+
+        let error = patterned(r#"glow = "world.x""#, "emission_strength = \"glow\"")
+            .expect_err("a coordinate is not");
+        assert!(error.contains("needs a bound"), "{error}");
+    }
+
+    /// A bump is a direction, like a normal map: `normal` takes one at its
+    /// root, and nothing else takes one anywhere.
+    #[test]
+    fn a_bump_only_drives_the_normal() {
+        patterned("", r#"normal = "bump(noise(object))""#).expect("a bump is a normal");
+
+        let error =
+            patterned("", r#"roughness = "bump(uv.r).r""#).expect_err("a bump is not a value");
+        assert!(error.contains("roughness cannot take"), "{error}");
+
+        let error =
+            patterned("", r#"normal = "noise(object)""#).expect_err("a noise is not a normal");
+        assert!(error.contains("normal must be"), "{error}");
+
+        let error = patterned("", r#"normal = "bump(normal_map(uv).r)""#)
+            .expect_err("one direction inside another");
+        assert!(error.contains("cannot hold another"), "{error}");
     }
 
     #[test]
