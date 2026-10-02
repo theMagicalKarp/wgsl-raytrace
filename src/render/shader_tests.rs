@@ -2562,6 +2562,46 @@ fn the_program_evaluator_agrees_with_the_reference() {
             "a normal map in DirectX, at half strength, off a coordinate",
             "normal_map(uv, strength: 0.5, convention: \"directx\")",
         ),
+        ("noise at its defaults", "noise(object)"),
+        (
+            "noise with every knob turned",
+            "noise(world, scale: 2.5, detail: 4, roughness: 0.7, lacunarity: 2.3)",
+        ),
+        (
+            "noise with a fractional detail",
+            "noise(object, scale: 1.5, detail: 2.5)",
+        ),
+        (
+            "noise with no octaves past the first",
+            "noise(world, detail: 0)",
+        ),
+        ("distorted noise", "noise(object, distortion: 1.5)"),
+        ("noise off a texture coordinate", "noise(uv, scale: 3)"),
+        ("voronoi at its defaults", "voronoi(object)"),
+        (
+            "voronoi's colour, on a regular lattice",
+            "voronoi(world, scale: 1.5, randomness: 0, output: \"color\")",
+        ),
+        (
+            "voronoi's colour, jittered",
+            "voronoi(object, scale: 0.75, output: \"color\")",
+        ),
+        (
+            "voronoi's distance to an edge",
+            "voronoi(object, scale: 1.5, output: \"edge\")",
+        ),
+        (
+            "a ramp over two stops",
+            "ramp(uv.r, 0.2, [1.0, 0.0, 0.0], 0.8, [0.0, 0.0, 1.0])",
+        ),
+        (
+            "a ramp over four, with a hard edge",
+            "ramp(remap(world.x, [-4, 4]), 0.1, 0.0, 0.5, [0.2, 0.9, 0.1], 0.5, [0.9, 0.2, 0.1], 0.9, 1.0)",
+        ),
+        (
+            "a ramp over a noise",
+            "ramp(noise(object, scale: 2), 0.3, [0.2, 0.15, 0.1], 0.7, [0.4, 0.5, 0.2])",
+        ),
         (
             "a nest of all of them",
             "remap(multiply(invert(uv), object, remap(world.y, [0.0, 12.0], [0.0, 1.0])), \
@@ -2624,20 +2664,284 @@ fn test(input: Input, index: u32) -> Output {
         return;
     };
 
+    let source_of = |name: &str| {
+        trees
+            .iter()
+            .find(|(tree, _)| *tree == name)
+            .map(|(_, source)| *source)
+            .unwrap_or_default()
+    };
     let mut output = outputs.iter();
     for (name, operand, _) in &compiled {
         for (at, _) in &points {
             let actual = output.next().expect("one output per evaluation");
             let expected = crate::scene::program::evaluate(operand, *at);
 
+            // A noise is a few hundred operations deep, and the GPU is free
+            // to fuse any pair of them; everything else is a handful.
+            let tolerance = match source_of(name).contains("noise") {
+                true => 1e-4,
+                false => 1e-5,
+            };
             for channel in 0..4 {
                 assert!(
-                    (actual[channel] - expected[channel]).abs() < 1e-5,
+                    (actual[channel] - expected[channel]).abs() < tolerance,
                     "{name} at {at:?}: got {actual:?}, the reference says {expected:?}",
                 );
             }
         }
     }
+}
+
+/// Runs the pattern `source` at every world position in `points` on the GPU
+/// and hands back its first channel at each.
+fn pattern_at(source: &str, points: &[Vec3]) -> Option<Vec<f32>> {
+    use crate::config::Operand;
+    use crate::scene::Programs;
+
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        field: Operand,
+    }
+    let operand = toml::from_str::<Holder>(&format!("field = {source:?}"))
+        .unwrap_or_else(|error| panic!("{source} should parse: {error}"))
+        .field;
+    let mut programs = Programs::default();
+    let offset = programs
+        .compile_one(&operand)
+        .unwrap_or_else(|error| panic!("{source} should compile: {error}"));
+
+    let inputs: Vec<ProgramInput> = points
+        .iter()
+        .map(|&world| ProgramInput {
+            uv: [0.0; 2],
+            offset,
+            _pad: 0,
+            object: world,
+            world,
+        })
+        .collect();
+    let shader = r#"
+struct Input {
+    uv: vec2f,
+    offset: u32,
+    _pad: u32,
+    object: vec3f,
+    world: vec3f,
+}
+
+struct Output {
+    value: vec4f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    return Output(evaluate_input(input.offset, Coordinates(input.uv, input.object, input.world)));
+}
+"#;
+    let words: Vec<u8> = cast_slice(programs.words()).to_vec();
+    let textures = programs.images().load().expect("no images to read");
+    let outputs: Vec<[f32; 4]> = run_with_textures(shader, &inputs, &[(10, words)], &textures)?;
+    Some(outputs.iter().map(|value| value[0]).collect())
+}
+
+/// Points scattered through a box `extent` wide around the origin, the same
+/// ones every run.
+fn scattered(count: usize, extent: f32) -> Vec<Vec3> {
+    let mut rng = Rng(0x5eed);
+    (0..count)
+        .map(|_| {
+            Vec3::new(
+                (rng.next() - 0.5) * extent,
+                (rng.next() - 0.5) * extent,
+                (rng.next() - 0.5) * extent,
+            )
+        })
+        .collect()
+}
+
+/// A noise stays in the unit range whatever its knobs, and is not flat inside
+/// it: it averages a half and strays well to either side.
+///
+/// Not at every setting: sixteen octaves of equal weight average each other
+/// back toward a half, which is what fBm does in Blender too, so the knobs
+/// here are ones that still reach out.
+#[test]
+fn a_noise_stays_in_the_unit_range_and_fills_it() {
+    let points = scattered(4096, 40.0);
+    for source in [
+        "noise(world)",
+        "noise(world, detail: 0)",
+        "noise(world, detail: 15, roughness: 0.6, lacunarity: 1.5)",
+        "noise(world, scale: 0.3, detail: 6.5, roughness: 0.8)",
+        "noise(world, distortion: 8)",
+        "noise(world, scale: 1000)",
+    ] {
+        let Some(values) = pattern_at(source, &points) else {
+            return;
+        };
+
+        let count = values.len() as f32;
+        let mean = values.iter().sum::<f32>() / count;
+        let deviation =
+            (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / count).sqrt();
+        let (low, high) = values
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+
+        assert!(
+            low >= 0.0 && high <= 1.0,
+            "{source}: {low} to {high} is outside the unit range"
+        );
+        assert!((mean - 0.5).abs() < 0.05, "{source}: averages {mean}");
+        assert!(deviation > 0.03, "{source}: deviates by only {deviation}");
+        assert!(
+            low < 0.35 && high > 0.65,
+            "{source}: only spans {low} to {high}"
+        );
+    }
+}
+
+/// Noise has no seam where the lattice does. Every octave's cells meet at the
+/// integers, so a point a hair either side of one is read off two different
+/// cells' corners — and has to come out the same to within the hair.
+#[test]
+fn a_noise_is_continuous_across_its_lattice() {
+    let hair = 1e-4;
+    let mut points = Vec::new();
+    for k in [-3.0, -1.0, 0.0, 2.0, 17.0] {
+        for (y, z) in [(0.3, 0.7), (0.55, -2.2), (-4.1, 9.45)] {
+            for axis in 0..3 {
+                for side in [-hair, hair] {
+                    let mut p = [y, z, 0.35];
+                    p.rotate_right(axis);
+                    p[axis] = k + side;
+                    points.push(Vec3::new(p[0], p[1], p[2]));
+                }
+            }
+        }
+    }
+
+    for source in [
+        "noise(world, scale: 1, detail: 0)",
+        "noise(world, scale: 1, detail: 3)",
+        "noise(world, scale: 1, distortion: 0.5)",
+        "voronoi(world, scale: 1)",
+    ] {
+        let Some(values) = pattern_at(source, &points) else {
+            return;
+        };
+        for (pair, at) in values.chunks(2).zip(points.chunks(2)) {
+            // The slope of fBm at detail 3 is a few units across a cell, so
+            // two hairs apart is a few thousandths at most.
+            assert!(
+                (pair[0] - pair[1]).abs() < 2e-3,
+                "{source}: {} at {:?} but {} at {:?}",
+                pair[0],
+                at[0],
+                pair[1],
+                at[1]
+            );
+        }
+    }
+}
+
+/// The same point is the same value, on every thread that asks and every
+/// dispatch, and a different point is a different one: nothing here draws
+/// from the random stream a path uses.
+#[test]
+fn a_noise_is_the_same_wherever_it_is_asked() {
+    let base = scattered(64, 20.0);
+    let points: Vec<Vec3> = base.iter().chain(base.iter()).copied().collect();
+
+    for source in [
+        "noise(world, detail: 4, distortion: 1)",
+        "voronoi(world, output: \"color\")",
+    ] {
+        let (Some(first), Some(second)) =
+            (pattern_at(source, &points), pattern_at(source, &points))
+        else {
+            return;
+        };
+        let (front, back) = first.split_at(base.len());
+        assert_eq!(front, back, "{source}: two threads, one point");
+        assert_eq!(first, second, "{source}: two dispatches");
+
+        let distinct = front
+            .iter()
+            .filter(|v| (**v - front[0]).abs() > 1e-3)
+            .count();
+        assert!(distinct > base.len() / 2, "{source}: {front:?}");
+    }
+}
+
+/// On a regular lattice the feature points are the integers, so the distance
+/// is known in closed form: nothing at a corner, half a diagonal at a centre,
+/// and never more than a whole one however jittered.
+#[test]
+fn a_voronoi_measures_the_distance_to_its_nearest_point() {
+    let points = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(3.0, -2.0, 5.0),
+        Vec3::new(0.5, 0.5, 0.5),
+        Vec3::new(-1.5, 2.5, -3.5),
+        Vec3::new(0.25, 0.0, 0.0),
+        Vec3::new(4.0, 4.0, 4.9),
+    ];
+    let Some(regular) = pattern_at("voronoi(world, scale: 1, randomness: 0)", &points) else {
+        return;
+    };
+    let expected = [0.0, 0.0, 0.8660254, 0.8660254, 0.25, 0.1];
+    for ((value, expected), at) in regular.iter().zip(expected).zip(&points) {
+        assert!(
+            (value - expected).abs() < 1e-5,
+            "at {at:?}: {value}, not {expected}"
+        );
+    }
+
+    let jittered = scattered(4096, 30.0);
+    let Some(values) = pattern_at("voronoi(world, scale: 2)", &jittered) else {
+        return;
+    };
+    let high = values.iter().fold(0.0f32, |h, v| h.max(*v));
+    assert!(
+        values.iter().all(|v| *v >= 0.0) && high <= crate::config::MAX_CELL_DISTANCE,
+        "the farthest is {high}"
+    );
+}
+
+/// On a regular lattice every cell is a unit cube around an integer, so the
+/// distance to its edge is the distance to the nearest half-integer plane.
+#[test]
+fn a_voronoi_measures_the_distance_to_its_nearest_edge() {
+    let points = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.25, 0.1, -0.2),
+        Vec3::new(4.0, 4.0, 4.9),
+        Vec3::new(-2.3, 1.05, 7.0),
+    ];
+    let Some(regular) = pattern_at(
+        "voronoi(world, scale: 1, randomness: 0, output: \"edge\")",
+        &points,
+    ) else {
+        return;
+    };
+    let expected = [0.5, 0.25, 0.4, 0.2];
+    for ((value, expected), at) in regular.iter().zip(expected).zip(&points) {
+        assert!(
+            (value - expected).abs() < 1e-5,
+            "at {at:?}: {value}, not {expected}"
+        );
+    }
+
+    let jittered = scattered(4096, 30.0);
+    let Some(values) = pattern_at("voronoi(world, scale: 2, output: \"edge\")", &jittered) else {
+        return;
+    };
+    let high = values.iter().fold(0.0f32, |h, v| h.max(*v));
+    assert!(
+        values.iter().all(|v| *v >= 0.0) && high <= crate::config::MAX_CELL_EDGE_DISTANCE,
+        "the farthest is {high}"
+    );
 }
 
 /// Texture coordinates across a triangle, against the interpolation written out
@@ -3252,6 +3556,136 @@ fn test(input: Input, index: u32) -> Output {
                     "case {index}: {normal:?} reflects {wo:?} to {reflected:?}"
                 );
             }
+        }
+    }
+}
+
+/// What a bump does to the shading normal on a flat triangle whose texture is
+/// stretched twice as far along `u` as along `x`: the slope of a height that
+/// ramps along one axis tilts the normal against it by exactly the angle
+/// Blender's node would, whether the height is read off a position or off the
+/// texture — which is what says the barycentric step went the right way.
+#[test]
+fn a_bump_tilts_the_normal_down_the_slope() {
+    use crate::scene::Programs;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Input {
+        // A `u32` packs into a `vec3f`'s last four bytes.
+        wo: [f32; 3],
+        table: u32,
+        front_face: u32,
+        _pad: [u32; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+    struct Output {
+        normal: Vec3,
+    }
+
+    let mut programs = Programs::default();
+    let mut table = |normal: &str| {
+        let material: crate::config::Principled =
+            toml::from_str(&format!("normal = {normal:?}")).expect("should parse");
+        programs.compile(&material, true).expect("should compile")
+    };
+    let flat = table("bump(0.5)");
+    let along_x = table("bump(world.x, distance: 0.5)");
+    let along_y = table("bump(object.y * 0.25, distance: 2)");
+    // `u` is twice `x` on this triangle, so this is `along_x` again.
+    let along_u = table("bump(uv.r, distance: 0.25)");
+    let off = table("bump(world.x, strength: 0, distance: 0.5)");
+    let half = table("bump(world.x, strength: 0.5, distance: 0.5)");
+    let noisy = table("bump(noise(world, scale: 4, detail: 3), distance: 0.1)");
+
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let down = Vec3::new(0.0, 0.0, -1.0);
+    let tilted = Vec3::new(-0.5, 0.0, 1.0).normalized();
+    let cases = [
+        (flat, up, true, Some(up)),
+        (along_x, up, true, Some(tilted)),
+        (
+            along_y,
+            up,
+            true,
+            Some(Vec3::new(0.0, -0.5, 1.0).normalized()),
+        ),
+        (along_u, up, true, Some(tilted)),
+        (off, up, true, Some(up)),
+        (half, up, true, Some(up.add(tilted).normalized())),
+        // Seen from behind, a slope up is a slope down.
+        (along_x, down, false, Some(tilted.scale(-1.0))),
+        (noisy, up, true, None),
+    ];
+
+    let inputs: Vec<Input> = cases
+        .iter()
+        .map(|(table, wo, front, _)| Input {
+            wo: [wo.x, wo.y, wo.z],
+            table: *table,
+            front_face: *front as u32,
+            _pad: [0; 3],
+        })
+        .collect();
+
+    let source = r#"
+struct Input {
+    wo: vec3f,
+    table: u32,
+    front_face: u32,
+}
+
+struct Output {
+    normal: vec3f,
+}
+
+fn test(input: Input, index: u32) -> Output {
+    let front = input.front_face != 0u;
+    let normal = select(vec3f(0.0, 0.0, -1.0), vec3f(0.0, 0.0, 1.0), front);
+    let hit = Intersection(normal, 1.0, 0u, front, 0u, vec2f(0.25, 0.25));
+    return Output(shading_normal(hit, input.table, vec3f(0.25, 0.25, 0.0), input.wo));
+}
+"#;
+    let (triangle, attributes) = flat_triangle(2.0);
+    let textures = programs.images().load().expect("no images to read");
+    let Some(outputs): Option<Vec<Output>> = run_with_textures(
+        source,
+        &inputs,
+        &[
+            (1, cast_slice(&[triangle]).to_vec()),
+            (8, cast_slice(&[attributes]).to_vec()),
+            (9, cast_slice(&[crate::math::IDENTITY]).to_vec()),
+            (10, cast_slice(programs.words()).to_vec()),
+        ],
+        &textures,
+    ) else {
+        return;
+    };
+
+    for (index, (output, (_, wo, _, expected))) in outputs.iter().zip(&cases).enumerate() {
+        let normal = output.normal;
+        assert!(
+            (normal.dot(normal) - 1.0).abs() < 1e-5,
+            "case {index}: unit length, not {normal:?}"
+        );
+        assert!(
+            normal.dot(*wo) > 0.0,
+            "case {index}: facing the ray, not {normal:?}"
+        );
+        match expected {
+            // A finite difference of a linear height is exact up to the
+            // rounding of the step, which is a thousandth of a unit.
+            Some(expected) => assert!(
+                normal.distance(*expected) < 1e-3,
+                "case {index}: got {normal:?}, expected {expected:?}"
+            ),
+            // A noise moves it, somewhere.
+            None => assert!(
+                normal.distance(up) > 1e-3,
+                "case {index}: a noise left it at {normal:?}"
+            ),
         }
     }
 }

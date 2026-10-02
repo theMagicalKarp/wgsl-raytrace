@@ -3,6 +3,8 @@ mod environment;
 mod geometry;
 mod light;
 mod material;
+#[cfg(test)]
+mod noise;
 pub mod program;
 mod sky;
 pub mod texture;

@@ -1,0 +1,94 @@
+[camera]
+aspect_ratio = "widescreen"
+image_width = 1200
+samples = 2048
+max_bounces = 16
+fov = 13
+look_from = [4.76, 6.30, 3.50]
+look_at = [-0.495, 0.0, -1.46]
+vup = [0.0, 1.0, 0.0]
+
+[environment]
+color = [0.0, 0.0, 0.0]
+
+[patterns]
+frosted = "noise(object, scale: 20, detail: 4)"
+pitted = "noise(object, scale: 40, detail: 4) * ramp(noise(object, scale: 10, detail: 2), 0.441, 1, 0.468, 0)"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Floor"
+material = "lambertian"
+albedo = [0.73, 0.73, 0.73]
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Light"
+material = "light"
+emit = "blackbody(6500) * 300"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball1"
+material = "principled"
+base_color = 'voronoi(ramp(noise(object, scale: 0.2, detail: 4), 0.364, 0, 0.795, 1), scale: 100, output: "color")'
+roughness = 0.25
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball2"
+material = "principled"
+base_color = "ramp(noise(object, scale: 10, detail: 8, distortion: 3), 0.459, 0, 0.723, 1)"
+roughness = 0.5
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball3"
+material = "principled"
+base_color = [0.909, 0.0015, 0.0]
+roughness = 0.386
+normal = "bump(voronoi(object, scale: 18), distance: -0.025)"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball4"
+material = "principled"
+base_color = "ramp(frosted, 0.395, [0.0131, 1, 0.00033], 0.482, [1, 1, 1])"
+roughness = 0.1
+transmission = "ramp(frosted, 0.395, 0, 0.482, 1)"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball5"
+material = "principled"
+base_color = [0.602, 0.0356, 0.909]
+metallic = 1
+roughness = 'ramp(voronoi(object, scale: 80, output: "edge"), 0, 1, 0.0545, 0.0849)'
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball6"
+material = "principled"
+base_color = [0.69, 0.723, 1.0]
+roughness = 0.01
+ior = 1.33
+transmission = 1
+normal = "bump(noise(object, scale: 20, detail: 4), distance: 0.01)"
+
+[[objects]]
+shape = "wavefront"
+file = "scene.obj"
+group = "Ball7"
+material = "principled"
+base_color = "ramp(pitted, 0, [0.0086, 0.00047, 1], 0.236, [0.0085, 1, 0.00032])"
+roughness = "ramp(pitted, 0, 0.00077, 0.427, 0.214)"
+ior = 1.33
+normal = "bump(pitted, distance: 0.01)"

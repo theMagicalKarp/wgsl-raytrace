@@ -19,7 +19,7 @@
 //! expression  := term {('+' | '-') term}
 //! term        := operand {('*' | '/') operand}
 //! operand     := ['-'] primary {'.' channel}
-//! primary     := number | color | coordinates | call | '(' expression ')'
+//! primary     := number | color | coordinates | call | pattern | '(' expression ')'
 //! number      := -1.5, 2, 1e-3 …
 //! color       := '[' number ',' number ',' number ']'
 //! coordinates := 'uv' | 'object' | 'world'
@@ -31,6 +31,10 @@
 //!              | 'blackbody' '(' number ')'
 //!              | 'image' '(' string {',' keyword} ')'
 //!              | 'normal_map' '(' expression {',' keyword} ')'
+//!              | ('noise' | 'voronoi' | 'bump') '(' expression {',' keyword} ')'
+//!              | 'ramp' '(' expression stop stop [stop [stop]] ')'
+//! stop        := ',' constant ',' constant
+//! pattern     := a name from the scene's [patterns] table
 //! range       := '[' number ',' number ']'
 //! string      := '"' any character but '"' … '"'
 //! keyword     := name ':' (number | range | string)
@@ -46,7 +50,26 @@
 //!             offset: range               [0, 0]
 //! normal_map  strength: number            1
 //!             convention: "opengl" | "directx"   "opengl"
+//! noise       scale: number               5
+//!             detail: number in [0, 15]   2
+//!             roughness: number in [0, 1] 0.5
+//!             lacunarity: number          2
+//!             distortion: number          0
+//! voronoi     scale: number               5
+//!             randomness: number in [0, 1]   1
+//!             output: "distance" | "color" | "edge"   "distance"
+//! bump        strength: number in [0, 1]  1
+//!             distance: number            1
 //! ```
+//!
+//! A ramp's stops are a position and then a colour, each an expression that
+//! works out to a constant — `ramp(dirt, 0.3, blackbody(2000) * 0.2, 0.7,
+//! [0.4, 0.5, 0.2])` — with the positions in ascending order.
+//!
+//! Any other name is a reference to an entry of the scene's `[patterns]`
+//! table, which [`Config::validate`](super::Config::validate) writes in place of
+//! it. A name followed by `(` is always a call, so a misspelled one is still
+//! reported as the unknown call it is.
 //!
 //! A channel is still the `.r` suffix rather than a keyword, so the roughness
 //! in the green of a packed map is `image("orm.png").g`.
@@ -72,15 +95,47 @@
 //! colour, and is printed as one.
 
 use super::input::Blend;
+use super::input::Cell;
 use super::input::Channel;
 use super::input::ColorSpace;
 use super::input::Convention;
 use super::input::Input;
 use super::input::MAX_NESTING;
+use super::input::MAX_NOISE_DETAIL;
+use super::input::MAX_RAMP_STOPS;
+use super::input::NOISE_DEFAULTS;
 use super::input::Operand;
 use super::input::Space;
+use super::input::VORONOI_DEFAULTS;
 use super::input::blend;
 use std::path::PathBuf;
+
+/// Every name the grammar already gives a meaning to, which a pattern in
+/// `[patterns]` cannot be called: a reference to it would read as the call or
+/// the space instead.
+const RESERVED: [&str; 16] = [
+    "uv",
+    "object",
+    "world",
+    "invert",
+    "remap",
+    "mix",
+    "multiply",
+    "add",
+    "overlay",
+    "blackbody",
+    "image",
+    "normal_map",
+    "noise",
+    "voronoi",
+    "ramp",
+    "bump",
+];
+
+/// Whether `name` means something in the grammar already.
+pub fn is_reserved(name: &str) -> bool {
+    RESERVED.contains(&name)
+}
 
 /// Parses a whole expression, which must be all of `source`.
 pub fn parse(source: &str) -> Result<Operand, String> {
@@ -364,16 +419,25 @@ impl<'a> Parser<'a> {
             "blackbody" => self.blackbody(),
             "image" => self.image(),
             "normal_map" => self.normal_map(),
+            "noise" => self.noise(),
+            "voronoi" => self.voronoi(),
+            "ramp" => self.ramp(),
+            "bump" => self.bump(),
             // A misspelling is reported where the name started rather than
             // where it ended, which is where the eye is.
-            _ => {
+            _ if self.peek() == Some('(') => {
                 self.at = start;
                 Err(self.error(&format!(
-                    "unknown pattern `{name}`; expected uv, object, world, \
-                     invert, remap, mix, multiply, add, overlay, blackbody, image \
-                     or normal_map"
+                    "unknown pattern `{name}`; expected invert, remap, mix, \
+                     multiply, add, overlay, blackbody, image, normal_map, noise, \
+                     voronoi, ramp or bump"
                 )))
             }
+            // Not a call, so a name: one of the scene's own patterns, or a
+            // misspelling of a space that validation will say is neither.
+            _ => Ok(Operand::Input(Input::Pattern {
+                name: name.to_string(),
+            })),
         }
     }
 
@@ -525,6 +589,176 @@ impl<'a> Parser<'a> {
             input: Box::new(input),
             strength,
             convention,
+        }))
+    }
+
+    /// A keyword's number, held to `range` inclusive, with the message placed
+    /// at the number.
+    fn bounded(&mut self, what: &str, low: f32, high: f32) -> Result<f32, String> {
+        self.space();
+        let start = self.at;
+        let value = self.number()?;
+        if !(low..=high).contains(&value) {
+            self.at = start;
+            let range = match high == f32::INFINITY {
+                true => format!("at least {low}"),
+                false => format!("between {low} and {high}"),
+            };
+            return Err(self.error(&format!("{what} must be {range}, not {value}")));
+        }
+        Ok(value)
+    }
+
+    /// `noise(input, …)`. See the module's table for the keywords.
+    fn noise(&mut self) -> Result<Operand, String> {
+        self.expect('(')?;
+        let input = self.expression()?;
+
+        let defaults = NOISE_DEFAULTS;
+        let (mut scale, mut detail, mut roughness) =
+            (defaults.scale, defaults.detail, defaults.roughness);
+        let (mut lacunarity, mut distortion) = (defaults.lacunarity, defaults.distortion);
+        self.keywords(
+            "noise",
+            "scale, detail, roughness, lacunarity or distortion",
+            |parser, name| {
+                match name {
+                    "scale" => scale = parser.number()?,
+                    "detail" => {
+                        detail = parser.bounded("a noise's detail", 0.0, MAX_NOISE_DETAIL)?
+                    }
+                    "roughness" => roughness = parser.bounded("a noise's roughness", 0.0, 1.0)?,
+                    "lacunarity" => {
+                        lacunarity = parser.bounded("a noise's lacunarity", 0.0, f32::INFINITY)?
+                    }
+                    "distortion" => distortion = parser.number()?,
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            },
+        )?;
+
+        Ok(Operand::Input(Input::Noise {
+            input: Box::new(input),
+            scale,
+            detail,
+            roughness,
+            lacunarity,
+            distortion,
+        }))
+    }
+
+    /// `voronoi(input, …)`. See the module's table for the keywords.
+    fn voronoi(&mut self) -> Result<Operand, String> {
+        self.expect('(')?;
+        let input = self.expression()?;
+
+        let mut scale = VORONOI_DEFAULTS.scale;
+        let mut randomness = VORONOI_DEFAULTS.randomness;
+        let mut output = Cell::Distance;
+        self.keywords("voronoi", "scale, randomness or output", |parser, name| {
+            match name {
+                "scale" => scale = parser.number()?,
+                "randomness" => randomness = parser.bounded("a voronoi's randomness", 0.0, 1.0)?,
+                "output" => {
+                    let start = parser.at;
+                    output = match parser.string()?.as_str() {
+                        "distance" => Cell::Distance,
+                        "color" => Cell::Color,
+                        "edge" => Cell::Edge,
+                        other => {
+                            parser.at = start;
+                            return Err(parser.error(&format!(
+                                "unknown output `{other}`; expected \"distance\", \"color\" or \"edge\""
+                            )));
+                        }
+                    };
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+
+        Ok(Operand::Input(Input::Voronoi {
+            input: Box::new(input),
+            scale,
+            randomness,
+            output,
+        }))
+    }
+
+    /// An expression that has to work out to a constant, placed where it
+    /// started when it does not.
+    fn constant(&mut self, what: &str) -> Result<Operand, String> {
+        self.space();
+        let start = self.at;
+        let operand = self.expression()?;
+        if operand.is_input() {
+            self.at = start;
+            return Err(self.error(&format!("{what} must be a constant, not a pattern")));
+        }
+        Ok(operand)
+    }
+
+    /// `ramp(input, position, colour, …)`: two to four stops, in order.
+    fn ramp(&mut self) -> Result<Operand, String> {
+        self.expect('(')?;
+        let input = self.expression()?;
+
+        let mut stops: Vec<(f32, [f32; 3])> = Vec::new();
+        while self.peek() == Some(',') {
+            self.at += 1;
+            self.space();
+            let start = self.at;
+            if stops.len() == MAX_RAMP_STOPS {
+                return Err(self.error(&format!("a ramp takes at most {MAX_RAMP_STOPS} stops")));
+            }
+
+            let Operand::Scalar(at) = self.constant("a ramp stop's position")? else {
+                self.at = start;
+                return Err(self.error("a ramp stop's position is one number, not a colour"));
+            };
+            if stops.last().is_some_and(|(previous, _)| at < *previous) {
+                self.at = start;
+                return Err(self.error("a ramp's stops must be in ascending order"));
+            }
+
+            self.expect(',')?;
+            let color = self.constant("a ramp stop's colour")?;
+            let color = color.constant().expect("a constant has a value");
+            stops.push((at, color));
+        }
+        if stops.len() < 2 {
+            return Err(self.error("a ramp takes at least two stops, each a position and a colour"));
+        }
+        self.expect(')')?;
+
+        Ok(Operand::Input(Input::Ramp {
+            input: Box::new(input),
+            stops,
+        }))
+    }
+
+    /// `bump(height, …)`. See the module's table for the keywords.
+    fn bump(&mut self) -> Result<Operand, String> {
+        self.expect('(')?;
+        let input = self.expression()?;
+
+        let mut strength = 1.0;
+        let mut distance = 1.0;
+        self.keywords("bump", "strength or distance", |parser, name| {
+            match name {
+                "strength" => strength = parser.bounded("a bump's strength", 0.0, 1.0)?,
+                "distance" => distance = parser.number()?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+
+        Ok(Operand::Input(Input::Bump {
+            input: Box::new(input),
+            strength,
+            distance,
         }))
     }
 
@@ -925,6 +1159,40 @@ mod tests {
             ("1 / uv.r", "can only divide by a constant"),
             ("uv / [1, 0, 1]", "division by zero"),
             ("1e30 * 1e30", "overflows to infinity"),
+            (
+                "noise(object, detail: 16)",
+                "detail must be between 0 and 15",
+            ),
+            (
+                "noise(object, roughness: 2)",
+                "roughness must be between 0 and 1",
+            ),
+            (
+                "noise(object, lacunarity: -1)",
+                "lacunarity must be at least 0",
+            ),
+            (
+                "noise(object, octaves: 3)",
+                "noise has no keyword `octaves`",
+            ),
+            ("noise(object, 4.0, 5)", "expected one of noise's keywords"),
+            ("voronoi(object, randomness: 1.5)", "between 0 and 1"),
+            ("voronoi(object, output: \"f2\")", "unknown output `f2`"),
+            ("ramp(uv.r, 0, [1, 0, 0])", "at least two stops"),
+            ("ramp(uv.r)", "at least two stops"),
+            ("ramp(uv.r, 0.5, 0, 0.25, 1)", "ascending order"),
+            ("ramp(uv.r, uv.g, 0, 1, 1)", "position must be a constant"),
+            ("ramp(uv.r, 0, uv, 1, 1)", "colour must be a constant"),
+            ("ramp(uv.r, [0, 0, 0], 0, 1, 1)", "position is one number"),
+            (
+                "ramp(uv.r, 0, 0, 0.25, 0, 0.5, 0, 0.75, 0, 1, 1)",
+                "at most 4 stops",
+            ),
+            (
+                "bump(uv.r, strength: 2)",
+                "strength must be between 0 and 1",
+            ),
+            ("nosie(object)", "unknown pattern `nosie`"),
         ];
 
         for (source, expected) in cases {
@@ -1104,6 +1372,17 @@ mod tests {
             "normal_map(image(\"n.png\"))",
             "normal_map(image(\"n.png\"), strength: 0.5, convention: \"directx\")",
             "multiply(uv, 2, 1)",
+            "noise(object)",
+            "noise(uv, scale: 4, detail: 5.5, roughness: 0.75, lacunarity: 3, distortion: 0.5)",
+            "voronoi(world)",
+            "voronoi(object, scale: 2, randomness: 0.5, output: \"color\")",
+            "voronoi(object, scale: 40, output: \"edge\")",
+            "ramp(noise(object), 0.3, [0.2, 0.15, 0.1], 0.7, [0.4, 0.5, 0.2])",
+            "ramp(uv.r, 0, [0, 0, 0], 0.5, [1, 0, 0], 0.5, [0, 1, 0], 1, [1, 1, 1])",
+            "bump(noise(object, scale: 40))",
+            "bump(dirt, strength: 0.5, distance: 0.02)",
+            "mix(image(\"grass.jpg\"), [0.25, 0.18, 0.1], dirt)",
+            "remap(dirt, [0.45, 0.55], [0, 1])",
         ] {
             let operand = ok(source);
             assert_eq!(operand.to_string(), source, "printed form");
@@ -1189,6 +1468,91 @@ mod tests {
             ok("remap((uv + 1).g * 2, [0, 4])"),
             ok("remap(multiply(add(uv, 1, 1).g, 2, 1), [0, 4])")
         );
+    }
+
+    /// Every knob of a noise is a keyword, left at Blender's default when it
+    /// is not given.
+    #[test]
+    fn a_noise_takes_its_coordinates_and_then_keywords() {
+        assert_eq!(
+            ok("noise(object)"),
+            Operand::Input(Input::Noise {
+                input: boxed(coordinates(Space::Object, None)),
+                scale: 5.0,
+                detail: 2.0,
+                roughness: 0.5,
+                lacunarity: 2.0,
+                distortion: 0.0,
+            })
+        );
+        assert_eq!(
+            ok("noise(world * 2, distortion: 0.25, detail: 5, scale: 4)"),
+            Operand::Input(Input::Noise {
+                input: boxed(ok("world * 2")),
+                scale: 4.0,
+                detail: 5.0,
+                roughness: 0.5,
+                lacunarity: 2.0,
+                distortion: 0.25,
+            })
+        );
+    }
+
+    #[test]
+    fn a_voronoi_says_which_answer_it_reads() {
+        let Operand::Input(Input::Voronoi { output, .. }) = ok("voronoi(object)") else {
+            panic!("expected a voronoi");
+        };
+        assert_eq!(output, Cell::Distance);
+
+        let Operand::Input(Input::Voronoi {
+            output, randomness, ..
+        }) = ok("voronoi(object, output: \"color\", randomness: 0.25)")
+        else {
+            panic!("expected a voronoi");
+        };
+        assert_eq!((output, randomness), (Cell::Color, 0.25));
+
+        let Operand::Input(Input::Voronoi { output, .. }) = ok("voronoi(object, output: \"edge\")")
+        else {
+            panic!("expected a voronoi");
+        };
+        assert_eq!(output, Cell::Edge);
+    }
+
+    /// A stop's position and colour are anything that works out to a
+    /// constant, so a colour temperature or a grey written as one number is a
+    /// stop like any other.
+    #[test]
+    fn a_ramp_folds_its_stops_to_constants() {
+        let Operand::Input(Input::Ramp { stops, .. }) =
+            ok("ramp(uv.r, 0.1 * 2, 0.5, 1 - 0.2, blackbody(6500) * 0)")
+        else {
+            panic!("expected a ramp");
+        };
+        assert_eq!(stops, vec![(0.2, [0.5; 3]), (0.8, [0.0; 3])]);
+    }
+
+    /// A name that is not a call is a reference to `[patterns]`, and one that
+    /// is followed by `(` is still an unknown call.
+    #[test]
+    fn a_bare_name_is_a_pattern() {
+        assert_eq!(
+            ok("dirt"),
+            Operand::Input(Input::Pattern {
+                name: String::from("dirt")
+            })
+        );
+        let Operand::Input(Input::Mix { factor, .. }) = ok("mix(0.9, 0.6, dirt_2.r)") else {
+            panic!("expected a mix");
+        };
+        assert!(matches!(*factor, Operand::Input(Input::Channel { .. })));
+
+        assert!(err("dirt(uv)").contains("unknown pattern `dirt`"));
+        for name in RESERVED {
+            assert!(is_reserved(name), "{name}");
+        }
+        assert!(!is_reserved("dirt"));
     }
 
     /// A chain of operators nests the tree without nesting the parser, so it

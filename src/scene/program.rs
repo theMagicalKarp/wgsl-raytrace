@@ -14,11 +14,14 @@
 //! trees through both.
 
 use crate::config::Blend;
+use crate::config::Cell;
 use crate::config::Channel;
 use crate::config::ColorSpace;
 use crate::config::Convention;
 use crate::config::Input;
 use crate::config::MAX_NESTING;
+use crate::config::MAX_NOISE_DETAIL;
+use crate::config::MAX_RAMP_STOPS;
 use crate::config::Operand;
 use crate::config::Principled;
 use crate::config::Space;
@@ -39,6 +42,13 @@ const OP_REMAP: u32 = 5;
 const OP_MIX: u32 = 6;
 const OP_IMAGE: u32 = 7;
 const OP_NORMAL_MAP: u32 = 8;
+const OP_NOISE: u32 = 9;
+const OP_VORONOI: u32 = 10;
+const OP_RAMP: u32 = 11;
+/// Not an op the evaluator runs but a header in front of a height program:
+/// only ever the first word of a `normal` field, where `shading_normal` reads
+/// it, and followed by the bump's strength and distance.
+const OP_BUMP: u32 = 12;
 
 /// How deep the register stack is, on the host and on the GPU. Eight is
 /// generous — the deepest tree anyone writes by hand is three or four — and it
@@ -166,9 +176,30 @@ impl Programs {
     }
 
     /// One field's program: its ops, then [`OP_END`].
+    ///
+    /// A bump is the one root that is not an op: it is a header naming how
+    /// to turn a height into a normal, and the height's own program after it,
+    /// which `shading_normal` runs three times over to find the slope.
     fn program(&mut self, operand: &Operand) -> Result<u32, String> {
         let start = self.words.len() as u32;
-        let depth = self.push(operand, 0, 0)?;
+        let depth = match operand {
+            Operand::Input(Input::Bump {
+                input,
+                strength,
+                distance,
+            }) => {
+                if !strength.is_finite() || !distance.is_finite() {
+                    return Err(format!(
+                        "a bump's strength and distance must be finite, not {strength} and {distance}"
+                    ));
+                }
+                self.words.push(OP_BUMP);
+                self.words.push(strength.to_bits());
+                self.words.push(distance.to_bits());
+                self.push(input, 0, 1)?
+            }
+            _ => self.push(operand, 0, 0)?,
+        };
         self.words.push(OP_END);
 
         debug_assert_eq!(depth, 1, "a program leaves exactly its answer behind");
@@ -305,6 +336,87 @@ impl Programs {
                     Convention::OpenGl => 0,
                     Convention::DirectX => 1,
                 });
+            }
+
+            Operand::Input(Input::Noise {
+                input,
+                scale,
+                detail,
+                roughness,
+                lacunarity,
+                distortion,
+            }) => {
+                let knobs = [*scale, *detail, *roughness, *lacunarity, *distortion];
+                if !knobs.iter().all(|knob| knob.is_finite()) {
+                    return Err(format!("a noise's settings must be finite, not {knobs:?}"));
+                }
+                // The shader loops once per octave, so this is the one number
+                // here that is also a running time.
+                if !(0.0..=MAX_NOISE_DETAIL).contains(detail) {
+                    return Err(format!(
+                        "a noise's detail must be between 0 and {MAX_NOISE_DETAIL}, not {detail}"
+                    ));
+                }
+                self.push(input, depth, nesting + 1)?;
+                self.words.push(OP_NOISE);
+                self.words.extend(knobs.map(f32::to_bits));
+            }
+
+            Operand::Input(Input::Voronoi {
+                input,
+                scale,
+                randomness,
+                output,
+            }) => {
+                if !scale.is_finite() || !(0.0..=1.0).contains(randomness) {
+                    return Err(format!(
+                        "a voronoi's scale must be finite and its randomness in [0, 1], \
+                         not {scale} and {randomness}"
+                    ));
+                }
+                self.push(input, depth, nesting + 1)?;
+                self.words.push(OP_VORONOI);
+                self.words.push(scale.to_bits());
+                self.words.push(randomness.to_bits());
+                self.words.push(match output {
+                    Cell::Distance => 0,
+                    Cell::Color => 1,
+                    Cell::Edge => 2,
+                });
+            }
+
+            Operand::Input(Input::Ramp { input, stops }) => {
+                if !(2..=MAX_RAMP_STOPS).contains(&stops.len()) {
+                    return Err(format!(
+                        "a ramp takes two to {MAX_RAMP_STOPS} stops, not {}",
+                        stops.len()
+                    ));
+                }
+                let finite = stops
+                    .iter()
+                    .all(|(at, color)| at.is_finite() && color.iter().all(|c| c.is_finite()));
+                let ascending = stops.windows(2).all(|pair| pair[0].0 <= pair[1].0);
+                if !finite || !ascending {
+                    return Err(format!(
+                        "a ramp's stops must be finite and in ascending order, not {stops:?}"
+                    ));
+                }
+                self.push(input, depth, nesting + 1)?;
+                self.words.push(OP_RAMP);
+                self.words.push(stops.len() as u32);
+                for (at, color) in stops {
+                    self.words
+                        .extend([*at, color[0], color[1], color[2]].map(f32::to_bits));
+                }
+            }
+
+            // Validation writes every name out and holds a bump to the root of
+            // `normal`, so either one here is a tree built in code.
+            Operand::Input(Input::Pattern { name }) => {
+                return Err(format!("the pattern name `{name}` was never written out"));
+            }
+            Operand::Input(Input::Bump { .. }) => {
+                return Err(String::from("a bump can only be the whole of `normal`"));
             }
         }
 
@@ -689,6 +801,33 @@ emission_strength = 5.0
         );
     }
 
+    /// A bump's field is a header the shading frame reads — its strength and
+    /// distance — with the height's own program behind it, and a bump is
+    /// that header nowhere but at the root of `normal`.
+    #[test]
+    fn a_bump_is_a_header_in_front_of_its_height() {
+        let mut programs = Programs::default();
+        let material = principled(r#"normal = "bump(uv.r, strength: 0.5, distance: 0.25)""#);
+        let table = programs.compile(&material, true).expect("should compile");
+
+        let start = super::table(&programs, table, FIELD_NORMAL) as usize;
+        let words = &programs.words()[start..];
+        assert_eq!(words[..3], [OP_BUMP, 0.5f32.to_bits(), 0.25f32.to_bits()]);
+        assert_eq!(words[3..6], [OP_COORDINATES, 0, OP_CHANNEL]);
+
+        let nested = Operand::Input(Input::Invert {
+            input: Box::new(Operand::Input(Input::Bump {
+                input: Box::new(Operand::Scalar(0.5)),
+                strength: 1.0,
+                distance: 1.0,
+            })),
+        });
+        let error = programs
+            .compile_one(&nested)
+            .expect_err("a bump inside anything is a direction read as a value");
+        assert!(error.contains("whole of `normal`"), "{error}");
+    }
+
     /// The stack is one measure of a tree and the recursion here is another: an
     /// `invert` chain leaves the stack where it found it and still costs a
     /// frame a level, so a tree built in code rather than parsed is capped
@@ -791,6 +930,50 @@ pub fn evaluate(operand: &Operand, at: Coordinates) -> [f32; 4] {
         Operand::Input(Input::Image { file, .. }) => {
             panic!("the reference cannot read {}", file.display())
         }
+
+        Operand::Input(Input::Noise {
+            input,
+            scale,
+            detail,
+            roughness,
+            lacunarity,
+            distortion,
+        }) => {
+            let p = evaluate(input, at);
+            let value = super::noise::noise(
+                [p[0], p[1], p[2]],
+                *scale,
+                *detail,
+                *roughness,
+                *lacunarity,
+                *distortion,
+            );
+            [value; 4]
+        }
+
+        Operand::Input(Input::Voronoi {
+            input,
+            scale,
+            randomness,
+            output,
+        }) => {
+            let p = evaluate(input, at);
+            let p = [p[0], p[1], p[2]];
+            let (distance, color) = super::noise::voronoi(p, *scale, *randomness);
+            match output {
+                Cell::Distance => [distance; 4],
+                Cell::Color => [color[0], color[1], color[2], 1.0],
+                Cell::Edge => [super::noise::voronoi_edge(p, *scale, *randomness); 4],
+            }
+        }
+
+        Operand::Input(Input::Ramp { input, stops }) => {
+            let color = super::noise::ramp(evaluate(input, at)[0], stops);
+            [color[0], color[1], color[2], 1.0]
+        }
+
+        Operand::Input(Input::Pattern { name }) => panic!("`{name}` was never written out"),
+        Operand::Input(Input::Bump { .. }) => panic!("a bump is a direction, not a value"),
 
         Operand::Input(Input::NormalMap {
             input,

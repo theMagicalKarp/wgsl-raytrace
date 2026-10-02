@@ -23,6 +23,7 @@ use serde::de;
 use serde::de::SeqAccess;
 use serde::de::Visitor;
 use serde::de::value::SeqAccessDeserializer;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -152,6 +153,12 @@ pub enum Blend {
 /// rather than an abort with a stack trace.
 pub const MAX_NESTING: u32 = 64;
 
+/// How many nodes one field may come to once its named patterns are written
+/// out. Far past anything written by hand — the densest field in the examples
+/// is a few dozen — and here so that a handful of patterns each using the one
+/// before twice is an error rather than a tree that doubles with every name.
+pub const MAX_PATTERN_NODES: u32 = 4096;
+
 /// A material field: a number, a color, or a pattern.
 ///
 /// Untagged, so a field reads the way it always has when it holds a constant —
@@ -265,11 +272,15 @@ impl Operand {
             return Vec::new();
         };
         match input {
-            Input::Coordinates { .. } | Input::Image { .. } => Vec::new(),
+            Input::Coordinates { .. } | Input::Image { .. } | Input::Pattern { .. } => Vec::new(),
             Input::Channel { input, .. }
             | Input::Invert { input }
             | Input::Remap { input, .. }
-            | Input::NormalMap { input, .. } => vec![input.as_mut()],
+            | Input::Noise { input, .. }
+            | Input::Voronoi { input, .. }
+            | Input::Ramp { input, .. }
+            | Input::NormalMap { input, .. }
+            | Input::Bump { input, .. } => vec![input.as_mut()],
             Input::Mix { a, b, factor, .. } => vec![a.as_mut(), b.as_mut(), factor.as_mut()],
         }
     }
@@ -279,11 +290,15 @@ impl Operand {
             return Vec::new();
         };
         match input {
-            Input::Coordinates { .. } | Input::Image { .. } => Vec::new(),
+            Input::Coordinates { .. } | Input::Image { .. } | Input::Pattern { .. } => Vec::new(),
             Input::Channel { input, .. }
             | Input::Invert { input }
             | Input::Remap { input, .. }
-            | Input::NormalMap { input, .. } => vec![input.as_ref()],
+            | Input::Noise { input, .. }
+            | Input::Voronoi { input, .. }
+            | Input::Ramp { input, .. }
+            | Input::NormalMap { input, .. }
+            | Input::Bump { input, .. } => vec![input.as_ref()],
             Input::Mix { a, b, factor, .. } => vec![a.as_ref(), b.as_ref(), factor.as_ref()],
         }
     }
@@ -321,10 +336,80 @@ impl Operand {
         }
     }
 
-    /// Whether a `normal_map` appears anywhere in this.
-    pub fn has_normal_map(&self) -> bool {
-        matches!(self, Operand::Input(Input::NormalMap { .. }))
-            || self.children().into_iter().any(Operand::has_normal_map)
+    /// Whether a `normal_map` or a `bump` appears anywhere in this: the two
+    /// inputs that produce a direction rather than a value.
+    pub fn has_normal(&self) -> bool {
+        matches!(
+            self,
+            Operand::Input(Input::NormalMap { .. } | Input::Bump { .. })
+        ) || self.children().into_iter().any(Operand::has_normal)
+    }
+
+    /// Replaces every reference to a named pattern with a copy of the pattern
+    /// it names, recursively, so what is left is a tree with no names in it —
+    /// the only kind `scene::program` compiles.
+    ///
+    /// A pattern that reaches itself, however far round, is an error naming
+    /// the loop, and so is a name nothing defines. Inlining copies, so a
+    /// pattern used twice is two subtrees, and [`MAX_PATTERN_NODES`] caps
+    /// how many nodes the copies may add up to.
+    pub fn resolve_patterns(&mut self, patterns: &BTreeMap<String, Operand>) -> Result<(), String> {
+        let mut budget = MAX_PATTERN_NODES;
+        self.inline(patterns, &mut Vec::new(), &mut budget, 0)
+    }
+
+    fn inline(
+        &mut self,
+        patterns: &BTreeMap<String, Operand>,
+        within: &mut Vec<String>,
+        budget: &mut u32,
+        nesting: u32,
+    ) -> Result<(), String> {
+        if nesting > MAX_NESTING {
+            return Err(format!(
+                "a pattern nests deeper than the {MAX_NESTING} levels this compiles \
+                 once its named patterns are written out"
+            ));
+        }
+        *budget = budget.checked_sub(1).ok_or_else(|| {
+            String::from(
+                "the named patterns write out to more nodes than a field may hold; \
+                 a pattern that uses another more than once copies it each time",
+            )
+        })?;
+
+        if let Operand::Input(Input::Pattern { name }) = self {
+            if let Some(start) = within.iter().position(|seen| seen == name) {
+                let cycle = within[start..]
+                    .iter()
+                    .chain([&*name])
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                return Err(format!("pattern `{name}` refers to itself: {cycle}"));
+            }
+            let Some(definition) = patterns.get(name.as_str()) else {
+                return Err(format!(
+                    "unknown name `{name}`: not a coordinate space, and no entry \
+                     in [patterns] is called that"
+                ));
+            };
+
+            let name = name.clone();
+            *self = definition.clone();
+            within.push(name);
+            // The copy is itself a tree of names, and is not counted twice:
+            // this node became its root.
+            *budget += 1;
+            let inlined = self.inline(patterns, within, budget, nesting);
+            within.pop();
+            return inlined;
+        }
+
+        for child in self.children_mut() {
+            child.inline(patterns, within, budget, nesting + 1)?;
+        }
+        Ok(())
     }
 }
 
@@ -404,7 +489,138 @@ pub enum Input {
         strength: f32,
         convention: Convention,
     },
+
+    /// Gradient noise in `[0, 1]`: Perlin's improved noise summed over
+    /// octaves (fBm), read at `input`'s first three channels times `scale`.
+    ///
+    /// The knobs are Blender's Noise Texture's and mean what they mean there —
+    /// `detail` is how many octaves past the first, fractional ones blending
+    /// the last in; `roughness` how much each octave keeps of the one before;
+    /// `lacunarity` how much finer each is; `distortion` how far the lookup is
+    /// pushed around by three more noises first — but the lattice hash is not
+    /// Blender's, so the same numbers draw a different pattern of the same
+    /// character.
+    Noise {
+        input: Box<Operand>,
+        scale: f32,
+        detail: f32,
+        roughness: f32,
+        lacunarity: f32,
+        distortion: f32,
+    },
+
+    /// Worley's cellular pattern: feature points jittered by `randomness`
+    /// inside a lattice of cells `scale` to the unit, and either the distance
+    /// to the nearest one or a random colour for the cell it belongs to.
+    Voronoi {
+        input: Box<Operand>,
+        scale: f32,
+        randomness: f32,
+        output: Cell,
+    },
+
+    /// `input`'s first channel mapped through two to four colour stops,
+    /// linearly between them and held flat past either end. How a scalar
+    /// pattern — a noise, most often — becomes a colour.
+    Ramp {
+        input: Box<Operand>,
+        stops: Vec<(f32, [f32; 3])>,
+    },
+
+    /// A reference to an entry of `[patterns]`, by name. Only ever seen between
+    /// parsing and [`Operand::resolve_patterns`], which writes the definition
+    /// in its place; nothing downstream of `Config::validate` meets one.
+    Pattern { name: String },
+
+    /// The shading normal tilted to follow the slope of a height field, as
+    /// Blender's Bump node does: `input`'s first channel is the height,
+    /// `distance` scales it into world units, and `strength` blends the result
+    /// with the unbumped normal.
+    ///
+    /// Like a normal map, a direction and not a value, and only the root of
+    /// `normal` takes one.
+    Bump {
+        input: Box<Operand>,
+        strength: f32,
+        distance: f32,
+    },
 }
+
+/// Which of a Voronoi cell's three answers a pattern reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cell {
+    /// The distance to the nearest feature point, in cells.
+    #[default]
+    Distance,
+    /// A colour fixed per cell, each channel uniform in `[0, 1)`.
+    Color,
+    /// The distance to the nearest edge of the cell the point is in, in cells:
+    /// Blender's Distance to Edge. Zero along every border, so a ramp over it
+    /// draws the cells' outlines.
+    Edge,
+}
+
+impl Cell {
+    pub fn name(self) -> &'static str {
+        match self {
+            Cell::Distance => "distance",
+            Cell::Color => "color",
+            Cell::Edge => "edge",
+        }
+    }
+}
+
+/// The farthest a point can be from the nearest of its Voronoi feature points,
+/// in cells: the diagonal of one. The feature point of the point's own cell is
+/// somewhere inside that cell whatever the randomness, and the nearest one is at
+/// least that near.
+pub const MAX_CELL_DISTANCE: f32 = 1.732_050_8;
+
+/// The farthest a point can be from the nearest edge of its Voronoi cell, in
+/// cells. The edge between the nearest point and any other is no farther than
+/// half their two distances added, and the points of the point's own lattice
+/// cell and of its neighbour across the nearer face are both within
+/// `sqrt(1.5² + 1 + 1)`, so one of them is not the nearest and the edge is
+/// within `(√3 + √4.25) / 2`, under two.
+pub const MAX_CELL_EDGE_DISTANCE: f32 = 2.0;
+
+/// The most stops a ramp holds. Each is four words the shader walks, and four
+/// is Blender's default ramp with two to spare.
+pub const MAX_RAMP_STOPS: usize = 4;
+
+/// A noise's knobs when a scene does not turn them: Blender's Noise Texture's
+/// defaults.
+pub struct NoiseDefaults {
+    pub scale: f32,
+    pub detail: f32,
+    pub roughness: f32,
+    pub lacunarity: f32,
+    pub distortion: f32,
+}
+
+pub const NOISE_DEFAULTS: NoiseDefaults = NoiseDefaults {
+    scale: 5.0,
+    detail: 2.0,
+    roughness: 0.5,
+    lacunarity: 2.0,
+    distortion: 0.0,
+};
+
+/// The most octaves past the first a noise sums, which is Blender's ceiling.
+/// Each is a lattice lookup per hit, and past this they are finer than a pixel
+/// at any scale worth rendering.
+pub const MAX_NOISE_DETAIL: f32 = 15.0;
+
+/// A Voronoi pattern's, likewise Blender's.
+pub struct VoronoiDefaults {
+    pub scale: f32,
+    pub randomness: f32,
+}
+
+pub const VORONOI_DEFAULTS: VoronoiDefaults = VoronoiDefaults {
+    scale: 5.0,
+    randomness: 1.0,
+};
 
 impl ColorSpace {
     /// What an image in `field` is read as when the scene does not say: a
@@ -461,7 +677,35 @@ impl Input {
             Input::Image { .. } => Some(([0.0; 3], [1.0; 3])),
 
             // A direction, which is not a thing a bound is asked of.
-            Input::NormalMap { .. } => None,
+            Input::NormalMap { .. } | Input::Bump { .. } => None,
+
+            // Clamped onto the unit range by the shader, which is what makes a
+            // noise a thing emission can be driven by without a remap.
+            Input::Noise { .. } => Some(([0.0; 3], [1.0; 3])),
+
+            Input::Voronoi { output, .. } => match output {
+                Cell::Distance => Some(([0.0; 3], [MAX_CELL_DISTANCE; 3])),
+                Cell::Color => Some(([0.0; 3], [1.0; 3])),
+                Cell::Edge => Some(([0.0; 3], [MAX_CELL_EDGE_DISTANCE; 3])),
+            },
+
+            // Piecewise linear between the stops and flat past them, so every
+            // value it takes is between two stops' and the extremes are stops.
+            Input::Ramp { stops, .. } => {
+                let mut low = [f32::INFINITY; 3];
+                let mut high = [f32::NEG_INFINITY; 3];
+                for (_, color) in stops {
+                    for channel in 0..3 {
+                        low[channel] = low[channel].min(color[channel]);
+                        high[channel] = high[channel].max(color[channel]);
+                    }
+                }
+                Some((low, high))
+            }
+
+            // Written out before anything asks; a name still standing here has
+            // no definition to be bounded by.
+            Input::Pattern { .. } => None,
 
             Input::Channel { input, channel } => {
                 let (low, high) = input.range()?;
@@ -588,6 +832,69 @@ impl fmt::Display for Input {
                 }
                 if *convention != Convention::OpenGl {
                     write!(f, ", convention: \"{}\"", convention.name())?;
+                }
+                f.write_str(")")
+            }
+            Input::Noise {
+                input,
+                scale,
+                detail,
+                roughness,
+                lacunarity,
+                distortion,
+            } => {
+                write!(f, "noise({input}")?;
+                let defaults = NOISE_DEFAULTS;
+                for (name, value, default) in [
+                    ("scale", scale, defaults.scale),
+                    ("detail", detail, defaults.detail),
+                    ("roughness", roughness, defaults.roughness),
+                    ("lacunarity", lacunarity, defaults.lacunarity),
+                    ("distortion", distortion, defaults.distortion),
+                ] {
+                    if *value != default {
+                        write!(f, ", {name}: {value}")?;
+                    }
+                }
+                f.write_str(")")
+            }
+            Input::Voronoi {
+                input,
+                scale,
+                randomness,
+                output,
+            } => {
+                write!(f, "voronoi({input}")?;
+                if *scale != VORONOI_DEFAULTS.scale {
+                    write!(f, ", scale: {scale}")?;
+                }
+                if *randomness != VORONOI_DEFAULTS.randomness {
+                    write!(f, ", randomness: {randomness}")?;
+                }
+                if *output != Cell::Distance {
+                    write!(f, ", output: \"{}\"", output.name())?;
+                }
+                f.write_str(")")
+            }
+            Input::Ramp { input, stops } => {
+                write!(f, "ramp({input}")?;
+                for (at, [r, g, b]) in stops {
+                    write!(f, ", {at}, [{r}, {g}, {b}]")?;
+                }
+                f.write_str(")")
+            }
+            Input::Pattern { name } => f.write_str(name),
+            Input::Bump {
+                input,
+                strength,
+                distance,
+            } => {
+                write!(f, "bump({input}")?;
+                if *strength != 1.0 {
+                    write!(f, ", strength: {strength}")?;
+                }
+                if *distance != 1.0 {
+                    write!(f, ", distance: {distance}")?;
                 }
                 f.write_str(")")
             }
@@ -827,6 +1134,110 @@ mod tests {
             error(r#"field = { type = "remap", input = 0.5 }"#).contains("pattern expression"),
             "and a table says what a field does take"
         );
+    }
+
+    /// A noise is clamped into the unit range, and a voronoi's distance is at
+    /// most a cell's diagonal, so either can drive emission unwrapped.
+    #[test]
+    fn a_generated_pattern_is_bounded() {
+        assert_eq!(
+            pattern("noise(world, scale: 400)").range(),
+            Some(([0.0; 3], [1.0; 3]))
+        );
+        assert_eq!(
+            pattern("voronoi(world)").range(),
+            Some(([0.0; 3], [MAX_CELL_DISTANCE; 3]))
+        );
+        assert_eq!(
+            pattern(r#"voronoi(world, output: "color")"#).range(),
+            Some(([0.0; 3], [1.0; 3]))
+        );
+        assert_eq!(
+            pattern(r#"voronoi(world, output: "edge")"#).range(),
+            Some(([0.0; 3], [MAX_CELL_EDGE_DISTANCE; 3]))
+        );
+    }
+
+    /// A ramp only ever takes values between two of its stops, per channel,
+    /// however wide its input.
+    #[test]
+    fn a_ramp_is_bounded_by_its_stops() {
+        assert_eq!(
+            pattern("ramp(world.x, 0, [0.2, 0.9, 0.5], 0.5, [0.8, 0.1, 0.5], 1, 0.4)").range(),
+            Some(([0.2, 0.1, 0.4], [0.8, 0.9, 0.5]))
+        );
+    }
+
+    fn patterns(entries: &[(&str, &str)]) -> BTreeMap<String, Operand> {
+        entries
+            .iter()
+            .map(|(name, source)| (name.to_string(), pattern(source)))
+            .collect()
+    }
+
+    /// A name is replaced by what it names, all the way down, so a field that
+    /// uses one is the tree it would have been written out by hand.
+    #[test]
+    fn a_pattern_name_is_written_out_where_it_is_used() {
+        let table = patterns(&[
+            (
+                "dirt",
+                "remap(noise(object, scale: 4), [0.45, 0.55], [0, 1])",
+            ),
+            ("patchy", "mix(0.9, 0.6, dirt)"),
+        ]);
+        let mut field = pattern("invert(patchy)");
+        field.resolve_patterns(&table).expect("should resolve");
+
+        assert_eq!(
+            field,
+            pattern("invert(mix(0.9, 0.6, remap(noise(object, scale: 4), [0.45, 0.55], [0, 1])))")
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_reaches_itself_is_named_with_its_loop() {
+        let table = patterns(&[("a", "invert(b)"), ("b", "mix(0, 1, c)"), ("c", "a.r")]);
+        let error = pattern("a")
+            .resolve_patterns(&table)
+            .expect_err("a loop never ends");
+        assert!(error.contains("a -> b -> c -> a"), "{error}");
+
+        let error = pattern("invert(me)")
+            .resolve_patterns(&patterns(&[("me", "me")]))
+            .expect_err("nor does a pattern that is itself");
+        assert!(error.contains("me -> me"), "{error}");
+    }
+
+    #[test]
+    fn a_name_nothing_defines_is_an_error() {
+        let error = pattern("mix(0, 1, drit)")
+            .resolve_patterns(&patterns(&[("dirt", "uv.r")]))
+            .expect_err("a misspelling");
+        assert!(error.contains("unknown name `drit`"), "{error}");
+    }
+
+    /// Each pattern using the one before twice doubles the tree every name,
+    /// which is a tree the size of memory by the thirtieth.
+    #[test]
+    fn a_pattern_that_writes_out_too_large_is_an_error() {
+        let mut entries = vec![(String::from("p0"), String::from("uv.r"))];
+        for level in 1..30 {
+            let previous = &entries[level - 1].0;
+            entries.push((
+                format!("p{level}"),
+                format!("mix({previous}, {previous}, 0.5)"),
+            ));
+        }
+        let table: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .collect();
+
+        let error = pattern("p29")
+            .resolve_patterns(&patterns(&table))
+            .expect_err("too large to write out");
+        assert!(error.contains("more nodes"), "{error}");
     }
 
     /// The factor is clamped, so a pattern that wanders outside the unit range

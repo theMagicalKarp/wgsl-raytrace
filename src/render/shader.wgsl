@@ -1664,6 +1664,16 @@ const OP_REMAP: u32 = 5u;
 const OP_MIX: u32 = 6u;
 const OP_IMAGE: u32 = 7u;
 const OP_NORMAL_MAP: u32 = 8u;
+const OP_NOISE: u32 = 9u;
+const OP_VORONOI: u32 = 10u;
+const OP_RAMP: u32 = 11u;
+// Not an op: the header of a `normal` field that bumps rather than maps, read by
+// `shading_normal` and never reached by `evaluate_input`.
+const OP_BUMP: u32 = 12u;
+
+// A Voronoi pattern's three answers, matching `config::input::Cell`.
+const CELL_COLOR: u32 = 1u;
+const CELL_EDGE: u32 = 2u;
 
 // The two texture arrays, matching `scene::texture`.
 const TEXTURES_COLOR: u32 = 0u;
@@ -1736,6 +1746,241 @@ fn blend_inputs(mode: u32, a: vec4f, b: vec4f, factor: f32) -> vec4f {
     }
 
     return a + (mixed - a) * clamp(factor, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Procedural patterns
+//
+// Everything here is a pure function of where it is asked: no state, no random
+// stream, so a pattern is the same on every sample, every bounce and every run.
+// `scene::noise` is the same arithmetic in Rust, which the evaluator's tests
+// hold this against.
+// ---------------------------------------------------------------------------
+
+// PCG3D: Jarzynski and Olano, "Hash Functions for GPU Rendering" (JCGT 2020).
+// Three words in, three out, every output bit depending on every input bit —
+// which is what a lattice indexed by three integers needs and what a one-word
+// hash of a combined index is not.
+fn pcg3d(seed: vec3u) -> vec3u {
+    var v = seed * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> vec3u(16u);
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return v;
+}
+
+// `a` to `b` by `t`, spelled out rather than as `mix` so the reference can be
+// written the same way to the rounding.
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    return a + t * (b - a);
+}
+
+// Perlin's quintic: zero first and second derivatives at both ends, so the
+// noise has no crease along the lattice.
+fn fade(t: vec3f) -> vec3f {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// One lattice corner's gradient, dotted with the offset to it: one of Perlin's
+// twelve cube edges, picked by the hash's top four bits (the four spare codes
+// repeat four of them, as his 2002 table does).
+fn lattice_gradient(corner: vec3i, offset: vec3f) -> f32 {
+    let h = pcg3d(bitcast<vec3u>(corner)).x >> 28u;
+    let u = select(offset.y, offset.x, h < 8u);
+    let v = select(select(offset.z, offset.x, h == 12u || h == 14u), offset.y, h < 4u);
+    return select(u, -u, (h & 1u) != 0u) + select(v, -v, (h & 2u) != 0u);
+}
+
+// Perlin's improved noise (2002), in roughly `[-1, 1]`: the scale is Blender's,
+// which is what takes the true extremes of these gradients out to one.
+const PERLIN_SCALE: f32 = 0.982;
+
+fn perlin(p: vec3f) -> f32 {
+    let floor_p = floor(p);
+    let cell = vec3i(floor_p);
+    let f = p - floor_p;
+    let u = fade(f);
+
+    let n000 = lattice_gradient(cell, f);
+    let n100 = lattice_gradient(cell + vec3i(1, 0, 0), f - vec3f(1.0, 0.0, 0.0));
+    let n010 = lattice_gradient(cell + vec3i(0, 1, 0), f - vec3f(0.0, 1.0, 0.0));
+    let n110 = lattice_gradient(cell + vec3i(1, 1, 0), f - vec3f(1.0, 1.0, 0.0));
+    let n001 = lattice_gradient(cell + vec3i(0, 0, 1), f - vec3f(0.0, 0.0, 1.0));
+    let n101 = lattice_gradient(cell + vec3i(1, 0, 1), f - vec3f(1.0, 0.0, 1.0));
+    let n011 = lattice_gradient(cell + vec3i(0, 1, 1), f - vec3f(0.0, 1.0, 1.0));
+    let n111 = lattice_gradient(cell + vec3i(1, 1, 1), f - vec3f(1.0, 1.0, 1.0));
+
+    let near = lerp(lerp(n000, n100, u.x), lerp(n010, n110, u.x), u.y);
+    let far = lerp(lerp(n001, n101, u.x), lerp(n011, n111, u.x), u.y);
+    return PERLIN_SCALE * lerp(near, far, u.z);
+}
+
+// Octaves of `perlin`, each `lacunarity` times finer and `roughness` times
+// fainter than the last, normalized back into `[0, 1]`: Blender's `noise_fbm`.
+// A fractional `detail` blends the last octave in rather than stepping to it,
+// so the knob is continuous.
+fn fbm(p: vec3f, detail: f32, roughness: f32, lacunarity: f32) -> f32 {
+    var frequency = 1.0;
+    var amplitude = 1.0;
+    var total = 0.0;
+    var sum = 0.0;
+    let octaves = u32(detail);
+    for (var octave = 0u; octave <= octaves; octave++) {
+        sum += perlin(p * frequency) * amplitude;
+        total += amplitude;
+        amplitude *= roughness;
+        frequency *= lacunarity;
+    }
+
+    let coarse = 0.5 * sum / total + 0.5;
+    let rest = detail - f32(octaves);
+    if rest == 0.0 {
+        return coarse;
+    }
+    let fine = sum + perlin(p * frequency) * amplitude;
+    return lerp(coarse, 0.5 * fine / (total + amplitude) + 0.5, rest);
+}
+
+// Where the three distortion noises are read from: far enough apart that they
+// are unrelated, and not on the lattice.
+const DISTORT_X: vec3f = vec3f(17.13, 3.71, 91.37);
+const DISTORT_Y: vec3f = vec3f(-43.7, 61.9, 7.3);
+const DISTORT_Z: vec3f = vec3f(29.3, -83.1, 51.7);
+
+// Blender's Noise Texture, in three dimensions: the lookup pushed about by
+// three more noises when `distortion` asks, then fBm, clamped into the unit
+// range. The clamp is what bounds it for the light table; fBm only reaches past
+// it at the rare point every octave lines up.
+fn noise_texture(input: vec3f, scale: f32, detail: f32, roughness: f32, lacunarity: f32, distortion: f32) -> f32 {
+    var p = input * scale;
+    if distortion != 0.0 {
+        p += vec3f(perlin(p + DISTORT_X), perlin(p + DISTORT_Y), perlin(p + DISTORT_Z)) * distortion;
+    }
+    return clamp(fbm(p, detail, roughness, lacunarity), 0.0, 1.0);
+}
+
+// Three numbers in `[0, 1)` fixed to a lattice cell. The top 24 bits of each
+// word, so every one of them is exact in an f32. `salt` gives a cell a second,
+// unrelated triple.
+fn cell_random(cell: vec3i, salt: u32) -> vec3f {
+    let h = pcg3d(bitcast<vec3u>(cell) ^ vec3u(salt));
+    return vec3f(h >> vec3u(8u)) * (1.0 / 16777216.0);
+}
+
+// A cell's colour is not its feature point's position: with the same hash for
+// both, a cell's colour would say which way its point leans.
+const CELL_COLOR_SALT: u32 = 0x9e3779b9u;
+
+// Worley's F1, Blender's Voronoi Texture: one feature point per unit cell,
+// jittered from the corner by up to `randomness`, and the distance to the
+// nearest — or a random colour for the cell that owns it. The nearest point is
+// always in the 27 cells around this one, because the point in this cell is
+// already nearer than any cell past them can be.
+fn voronoi(input: vec3f, scale: f32, randomness: f32, output: u32) -> vec4f {
+    let p = input * scale;
+    let floor_p = floor(p);
+    let cell = vec3i(floor_p);
+    let local = p - floor_p;
+
+    var nearest = FLT_MAX;
+    var owner = vec3i(0);
+    for (var z = -1; z <= 1; z++) {
+        for (var y = -1; y <= 1; y++) {
+            for (var x = -1; x <= 1; x++) {
+                let offset = vec3i(x, y, z);
+                let point = vec3f(offset) + cell_random(cell + offset, 0u) * randomness;
+                let d = point - local;
+                let squared = dot(d, d);
+                if squared < nearest {
+                    nearest = squared;
+                    owner = offset;
+                }
+            }
+        }
+    }
+
+    if output == CELL_COLOR {
+        return vec4f(cell_random(cell + owner, CELL_COLOR_SALT), 1.0);
+    }
+    return vec4f(sqrt(nearest));
+}
+
+// Blender's Distance to Edge: how far the point is from the nearest face of the
+// Voronoi cell it is in. Each face is the plane halfway between the nearest
+// feature point and another, so a second walk over the 27 cells measures the
+// distance to each of those planes and keeps the least. A point too near the
+// nearest one to give its plane a direction is the nearest one itself.
+fn voronoi_edge(input: vec3f, scale: f32, randomness: f32) -> f32 {
+    let p = input * scale;
+    let floor_p = floor(p);
+    let cell = vec3i(floor_p);
+    let local = p - floor_p;
+
+    var nearest = FLT_MAX;
+    var closest = vec3f(0.0);
+    for (var z = -1; z <= 1; z++) {
+        for (var y = -1; y <= 1; y++) {
+            for (var x = -1; x <= 1; x++) {
+                let offset = vec3i(x, y, z);
+                let d = vec3f(offset) + cell_random(cell + offset, 0u) * randomness - local;
+                let squared = dot(d, d);
+                if squared < nearest {
+                    nearest = squared;
+                    closest = d;
+                }
+            }
+        }
+    }
+
+    var edge = FLT_MAX;
+    for (var z = -1; z <= 1; z++) {
+        for (var y = -1; y <= 1; y++) {
+            for (var x = -1; x <= 1; x++) {
+                let offset = vec3i(x, y, z);
+                let d = vec3f(offset) + cell_random(cell + offset, 0u) * randomness - local;
+                let across = d - closest;
+                let squared = dot(across, across);
+                if squared > 1e-4 {
+                    edge = min(edge, dot((closest + d) * 0.5, across) / sqrt(squared));
+                }
+            }
+        }
+    }
+    return edge;
+}
+
+// `t` through a ramp of `count` stops starting at word `at`, each a position
+// and a colour: flat before the first and after the last, linear between. Two
+// stops at one position are a hard edge, and the segment between them is never
+// the one `t` lands in, so nothing divides by its width.
+fn ramp(at: u32, count: u32, t: f32) -> vec3f {
+    var color = ramp_color(at);
+    for (var i = 1u; i < count; i++) {
+        let before = bitcast<f32>(program[at + 4u * (i - 1u)]);
+        let after = bitcast<f32>(program[at + 4u * i]);
+        if t <= before {
+            break;
+        }
+        if t >= after {
+            color = ramp_color(at + 4u * i);
+            continue;
+        }
+        let previous = ramp_color(at + 4u * (i - 1u));
+        let next = ramp_color(at + 4u * i);
+        let f = (t - before) / (after - before);
+        color = vec3f(lerp(previous.x, next.x, f), lerp(previous.y, next.y, f), lerp(previous.z, next.z, f));
+        break;
+    }
+    return color;
+}
+
+// The colour of the stop at word `at`, which follows its position.
+fn ramp_color(at: u32) -> vec3f {
+    return vec3f(bitcast<f32>(program[at + 1u]), bitcast<f32>(program[at + 2u]), bitcast<f32>(program[at + 3u]));
 }
 
 // Runs one field's program and returns what it left on the stack.
@@ -1832,6 +2077,33 @@ fn evaluate_input(start: u32, coords: Coordinates) -> vec4f {
             }
             n = vec3f(0.0, 0.0, 1.0) + (n - vec3f(0.0, 0.0, 1.0)) * strength;
             stack[depth - 1u] = vec4f(n, 0.0);
+        } else if code == OP_NOISE {
+            let scale = bitcast<f32>(program[pc]);
+            let detail = bitcast<f32>(program[pc + 1u]);
+            let roughness = bitcast<f32>(program[pc + 2u]);
+            let lacunarity = bitcast<f32>(program[pc + 3u]);
+            let distortion = bitcast<f32>(program[pc + 4u]);
+            pc += 5u;
+
+            // Read at the first three channels of whatever is underneath: a
+            // position, usually, and `uv`'s third is zero.
+            let value = noise_texture(stack[depth - 1u].xyz, scale, detail, roughness, lacunarity, distortion);
+            stack[depth - 1u] = vec4f(value);
+        } else if code == OP_VORONOI {
+            let scale = bitcast<f32>(program[pc]);
+            let randomness = bitcast<f32>(program[pc + 1u]);
+            let output = program[pc + 2u];
+            pc += 3u;
+
+            if output == CELL_EDGE {
+                stack[depth - 1u] = vec4f(voronoi_edge(stack[depth - 1u].xyz, scale, randomness));
+            } else {
+                stack[depth - 1u] = voronoi(stack[depth - 1u].xyz, scale, randomness, output);
+            }
+        } else if code == OP_RAMP {
+            let count = program[pc];
+            stack[depth - 1u] = vec4f(ramp(pc + 1u, count, stack[depth - 1u].x), 1.0);
+            pc += 1u + 4u * count;
         }
     }
 
@@ -2022,14 +2294,18 @@ fn shading_normal(hit: Intersection, table: u32, point: vec3f, wo: vec3f) -> vec
     }
 
     let authored = select(-hit.normal, hit.normal, hit.front_face);
-    let frame = tangent_frame(hit.triangle, authored);
-    if all(frame.t == vec3f(0.0)) {
-        return hit.normal;
-    }
+    var bent: vec3f;
+    if program[offset] == OP_BUMP {
+        bent = bump_normal(hit, offset, point, authored);
+    } else {
+        let frame = tangent_frame(hit.triangle, authored);
+        if all(frame.t == vec3f(0.0)) {
+            return hit.normal;
+        }
 
-    let coords = surface_coordinates(hit.triangle, hit.material, hit.bary, point);
-    let local = evaluate_input(offset, coords).xyz;
-    let bent = to_world(frame, local);
+        let coords = surface_coordinates(hit.triangle, hit.material, hit.bary, point);
+        bent = to_world(frame, evaluate_input(offset, coords).xyz);
+    }
     if !(dot(bent, bent) > 1e-12) {
         return hit.normal;
     }
@@ -2038,6 +2314,67 @@ fn shading_normal(hit: Intersection, table: u32, point: vec3f, wo: vec3f) -> vec
     let geometric = geometric_normal(triangles[hit.triangle]);
     let ng = select(-geometric, geometric, dot(geometric, wo) >= 0.0);
     return normalize(valid_reflection(ng, wo, mapped));
+}
+
+// How far along the surface a bump's slope is measured, in world units per
+// unit of the largest coordinate — so a scene built a hundred units from the
+// origin still differences numbers that are not the same float.
+const BUMP_STEP: f32 = 1e-3;
+
+// The normal `n` tilted to follow the slope of the height program behind the
+// bump header at `offset`: Blender's Bump node, with the screen-space
+// differentials it takes the slope over replaced by two steps along the
+// surface, since a compute shader has none.
+//
+// The height is read three times — here, a step along `t` and a step along `b`
+// — and the slope is those differences over the step. Blender's arithmetic
+// with `dPdx = t`, `dPdy = b` is exactly `n - distance * slope`, then a blend
+// back toward `n` by `strength`. Any frame around `n` will do: the slope in the
+// tangent plane does not depend on which two axes it is measured along.
+//
+// Each step moves the point in world space, and its barycentrics by whatever
+// moves the point by that much across the triangle, so a height read off `uv`
+// slopes the same way as one read off a position.
+fn bump_normal(hit: Intersection, offset: u32, point: vec3f, n: vec3f) -> vec3f {
+    let strength = bitcast<f32>(program[offset + 1u]);
+    let distance = bitcast<f32>(program[offset + 2u]);
+    let height = offset + 3u;
+
+    let frame = orthonormal_basis(n);
+    let tri = triangles[hit.triangle];
+    let e1 = tri.v1 - tri.v0;
+    let e2 = tri.v2 - tri.v0;
+    let g11 = dot(e1, e1);
+    let g12 = dot(e1, e2);
+    let g22 = dot(e2, e2);
+    let gram = g11 * g22 - g12 * g12;
+    let reach = max(1.0, max(abs(point.x), max(abs(point.y), abs(point.z))));
+    let step = BUMP_STEP * reach;
+
+    // One loop rather than three calls, so the evaluator is inlined once.
+    var heights: array<f32, 3>;
+    for (var i = 0u; i < 3u; i++) {
+        var along = vec3f(0.0);
+        if i == 1u {
+            along = frame.t * step;
+        } else if i == 2u {
+            along = frame.b * step;
+        }
+        // The barycentric step whose move across the triangle is nearest
+        // `along`: the least-squares solution against its two edges.
+        var shift = vec2f(0.0);
+        if gram > 0.0 {
+            let r1 = dot(e1, along);
+            let r2 = dot(e2, along);
+            shift = vec2f(g22 * r1 - g12 * r2, g11 * r2 - g12 * r1) / gram;
+        }
+        let coords = surface_coordinates(hit.triangle, hit.material, hit.bary + shift, point + along);
+        heights[i] = evaluate_input(height, coords).x;
+    }
+
+    let slope = ((heights[1] - heights[0]) * frame.t + (heights[2] - heights[0]) * frame.b) / step;
+    let bumped = normalize(n - distance * slope);
+    return mix(n, bumped, strength);
 }
 
 fn primary_ray(pixel: vec2u) -> Ray {
