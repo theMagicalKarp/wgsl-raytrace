@@ -49,9 +49,9 @@ rotation = -90.0
 | `rotation`  | `0.0`       | Yaw about +Y in degrees, for moving the sun.                                                                                                |
 
 When `file` is set, the tracer builds a brightness-weighted distribution over
-the map's texels and samples it directly (see [Render pipeline](rendering.md)).
-A flat `color` is not importance-sampled, because cosine-weighted bounces
-already sample a uniform sky exactly.
+the map's texels and samples it directly (see
+[Rendering pipeline](rendering.md)). A flat `color` is not importance-sampled,
+because cosine-weighted bounces already sample a uniform sky exactly.
 
 ## `[denoise]`
 

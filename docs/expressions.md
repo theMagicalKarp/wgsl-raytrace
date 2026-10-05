@@ -51,9 +51,9 @@ A blend mode is the name of the call rather than an argument to it, so
 `overlay(a, b, f)` is the overlay mix. `+`, `-`, `*` and `/` work with the usual
 precedence and parentheses; between two constants they are worked out when the
 scene loads, so `blackbody(6500) * 300` is just a colour. Whitespace is free,
-numbers may be written any way TOML writes them (`-6`, `0.5`, `1e-3`), and an
-error names the column it stopped at inside the string, on top of the line TOML
-names.
+numbers are plain decimals, optionally signed or with an exponent (`-6`, `0.5`,
+`1e-3`), and an error names the column it stopped at inside the string, on top
+of the line TOML names.
 
 A pattern **replaces** the field it is written in place of; it does not multiply
 it. Where a pattern produces three channels and the field wants one, the first
@@ -182,10 +182,10 @@ read along the diagonal, and `uv` is read at `z = 0`.
 | `distortion` | `0`     | How far three more noises push the lookup around first: swirls.                                                     |
 
 `voronoi(input, …)` is Worley's cellular pattern (F1): one feature point per
-cell of a lattice `scale` to the unit, jittered by `randomness` (`0` to `1`,
-default `1`; `0` is a regular grid). `output: "distance"` (the default) is the
-distance to the nearest point, in cells, at most `√3`; `output: "color"` is a
-random colour fixed per cell; `output: "edge"` is the distance to the nearest
+cell, `scale` cells per unit (default `5`), jittered by `randomness` (`0` to
+`1`, default `1`; `0` is a regular grid). `output: "distance"` (the default) is
+the distance to the nearest point, in cells, at most `√3`; `output: "color"` is
+a random colour fixed per cell; `output: "edge"` is the distance to the nearest
 border between two cells, in cells, which is zero along every border — a ramp
 over it outlines the cells.
 
@@ -199,9 +199,9 @@ fine, a pattern is not).
 slope of `height`'s first channel, as Blender's Bump node does: `distance` is
 how many world units a height of one stands for (negative inverts it), and
 `strength` (`0` to `1`) blends the result back toward the unbumped normal. The
-slope is a finite difference over a thousandth of a unit, so the height is
-evaluated three times per hit. Only `normal` takes one, and unlike a normal map
-it needs no texture coordinates.
+slope is a finite difference, so the height is evaluated three times per hit.
+Its step is a thousandth of a unit, scaled up for hits far from the origin. Only
+`normal` takes one, and unlike a normal map it needs no texture coordinates.
 
 Each of these is bounded — a noise by `[0, 1]`, a distance by `√3`, an edge
 distance by `2`, a ramp by its stops — so any of them can drive emission without
@@ -236,3 +236,6 @@ normal = "bump(dirt, distance: 0.004)"
   which is still the field's. It is evaluated once per field that uses it.
 - A loop (`a` using `b` using `a`), or a name nothing defines, is an error, as
   is any entry that is wrong whether or not anything uses it.
+- A field may come to at most 4096 nodes once its names are written out, so a
+  chain of patterns that each use the one before twice is an error rather than a
+  tree that doubles with every name.
