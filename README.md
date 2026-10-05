@@ -18,558 +18,19 @@ mise run release             # build target/release/wgsl-raytrace
 target/release/wgsl-raytrace --config examples/teapot/render.toml --denoise --preview
 ```
 
-## Command line
-
-```
-wgsl-raytrace [OPTIONS] --config <CONFIG>
-```
-
-| Flag | Description |
-| --- | --- |
-| `-c, --config <FILE>` | Scene TOML. Required. |
-| `-o, --output <FILE>` | Where to write the PNG. Default `render.png`. |
-| `-s, --samples <N>` | Override `camera.samples`. |
-| `-p, --preview` | Draw the frame in the terminal as it converges (Kitty graphics protocol). Ctrl-C stops early and keeps what has been traced. |
-| `--denoise` | Run the [à-trous filter](#denoising) over the finished frame. `--output` gets the filtered frame. |
-| `--debug <DIR>` | Write `raw.png` (the unfiltered frame) and the `normal.png`, `albedo.png` and `depth.png` feature buffers to an existing directory. |
-| `--variance <FILE>` | Write a heatmap of per-pixel variance, normalised to the frame's peak. |
-| `--outlier-k <K>` | Override `outliers.k`. `0` is off. |
-| `--seed <N>` | Draw an independent sample sequence, e.g. for a bias reference that shares no noise with the render. Default `0`. |
-
-### Console output
-
-| Line | Meaning |
-| --- | --- |
-| `scene:` | Triangle, material and BVH node counts, and tree depth. |
-| `render:` | Wall time, covering the mesh load, BVH build, uploads and host stalls. |
-| `denoise:` | Filter settings and wall time. Only shown with `--denoise`. |
-| `noise:` | Mean per-pixel standard error, mean linear luminance, and peak variance. Use the standard error to compare runs of the same scene at the same sample count. |
-| `gpu:` | Per-dispatch GPU time from timestamp queries. Use this when judging a shader change. Missing on adapters that can't write timestamps. |
-
-## Scene configuration
-
-A scene is one TOML file. Paths inside it are resolved relative to the file
-itself. Unknown keys are rejected.
-
-### `[camera]`
-
-```toml
-[camera]
-aspect_ratio = "standard"
-image_width = 800
-samples = 1000
-max_bounces = 64
-fov = 30
-look_from = [-1.89, 2.29, 10.68]
-look_at = [-1.68, 2.39, 4.63]
-```
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `aspect_ratio` | required | `widescreen` (16:9), `square` (1:1), `smartphone` (9:16), `standard` (4:3), `cinema` (1.85:1). |
-| `image_width` | required | Width in pixels. Height comes from the aspect ratio. |
-| `samples` | required | Samples per pixel. Each sample is one GPU dispatch. |
-| `max_bounces` | required | Path length cap. Russian roulette usually ends paths earlier. |
-| `fov` | required | Vertical field of view, in degrees. |
-| `look_from` | required | Camera position. |
-| `look_at` | required | Point the camera faces. |
-| `vup` | `[0, 1, 0]` | Up vector. |
-| `defocus_angle` | `0.0` | Lens cone angle in degrees. `0` is a pinhole (everything in focus). |
-| `focus_dist` | `1.0` | Distance to the plane of perfect focus. |
-| `exposure` | `1.0` | Linear gain applied just before tone mapping (`2.0` = +1 stop). It has no effect on convergence, the denoiser or the `noise:` figures. |
-
-### `[environment]`
-
-Controls the sky. Rays that escape the scene pick up this radiance. The table is
-optional, and without it the sky is black.
-
-```toml
-[environment]
-file = "sky.exr"
-rotation = -90.0
-```
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `color` | `[0, 0, 0]` | A flat sky colour. |
-| `file` | — | Equirectangular map (`.exr`, `.hdr`, `.jpg`, `.png`). Overrides `color`. Use HDR formats for real lighting, because LDR maps clip at white. |
-| `intensity` | `1.0` | Multiplier on whichever of `color` or `file` is in use. |
-| `rotation` | `0.0` | Yaw about +Y in degrees, for moving the sun. |
-
-When `file` is set, the tracer builds a brightness-weighted distribution over
-the map's texels and samples it directly (see [Render pipeline](#render-pipeline)).
-A flat `color` is not importance-sampled, because cosine-weighted bounces
-already sample a uniform sky exactly.
-
-### `[denoise]`
-
-These settings only take effect with `--denoise`. For how each one is used, see
-[Denoising](#denoising).
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `iterations` | `5` | Number of à-trous passes. Each pass doubles the tap stride. Maximum `16`. |
-| `sigma_normal` | `128.0` | Exponent on the normal similarity. Larger is **stricter**. |
-| `sigma_depth` | `1.0` | Depth tolerance, as a multiple of the local depth gradient. Larger is looser. |
-| `sigma_luminance` | `4.0` | Brightness tolerance, as a multiple of the pixel's standard error. Larger is looser. |
-
-### `[outliers]`
-
-Firefly rejection, applied during tracing. Each sample is checked as it goes
-into the accumulator. This is the only setting that can bias the image.
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `k` | `0.0` | A sample whose luminance exceeds `mean + k · max(σ, mean) · n^¼` is scaled down to that threshold, keeping its hue. `0` is off. |
-| `warmup` | `32` | Number of samples a pixel must gather before `k` applies. |
-
-Because the threshold widens as `n^¼`, the render still converges to the
-unbiased result. It is off by default because testing showed it wasn't worth
-it. On `examples/glass` it cut raw error by about 20% but tripled the bias.
-With `--denoise`, `k = 0` had both the lowest error and the lowest bias.
-
-### `[[objects]]`
-
-Each object pairs a mesh with a material. Wavefront `.obj` is the only geometry,
-and triangles are the only primitive.
-
-```toml
-[[objects]]
-shape = "wavefront"
-file = "scene.obj"
-group = "Teapot"
-material = "metal"
-albedo = [0.7, 0.7, 0.7]
-roughness = 0.13
-
-[[objects.transform]]
-type = "rotate"
-axis = "y"
-degrees = 31.5
-```
-
-| Key | Description |
-| --- | --- |
-| `shape` | Always `"wavefront"`. |
-| `file` | Path to the `.obj`. |
-| `group` | Optional name of one `o`/`g` block. Leave it out to load the whole file. To give one file several materials, list it once per group. Group names can't contain spaces. |
-
-Faces with more than three vertices are split into triangles, and vertices
-without normals get the face normal.
-
-#### Transforms
-
-`[[objects.transform]]` entries are applied in order, first to last, and baked
-into world space at load time.
-
-| `type` | Fields |
-| --- | --- |
-| `scale` | `scalar = [x, y, z]` |
-| `rotate` | `axis = "x" \| "y" \| "z"`, `degrees` |
-| `translate` | `offset = [x, y, z]` |
-
-#### Materials
-
-| `material` | Fields | Notes |
-| --- | --- | --- |
-| `principled` | `base_color = [r, g, b]`, `roughness`, `metallic`, `ior`, `transmission`, `specular_ior_level`, `normal`, `alpha`, `emission_color = [r, g, b]`, `emission_strength`, `subsurface_weight`, `subsurface_radius = [r, g, b]`, `subsurface_scale`, `subsurface_anisotropy` | Physically based surface modelled on Blender's Principled BSDF: GGX microfacet reflection over a diffuse base, blended toward rough or smooth glass by `transmission`. Transmitted light is tinted by `base_color`; reflections are not. `alpha` is coverage, not refraction: a ray passes straight through with probability `1 - alpha` (at most 32 such passes per path). The surface emits `emission_color × emission_strength` from its front face only (the side its winding faces), on top of whatever it reflects, and is sampled as a light. `subsurface_weight` replaces that much of the diffuse base with a random walk under the surface (see below). `specular_ior_level` scales the opaque part's specular reflectance at normal incidence as Blender 4 does (0.5 is exactly what `ior` gives, 0 is no specular coat, 1 doubles it); glass keeps `ior`. `normal` takes a [normal map](#image-maps). All fields are optional and default to Blender's: `[0.8, 0.8, 0.8]`, `0.5`, `0.0`, `1.5`, `0.0`, `0.5`, none, `1.0`, `[1, 1, 1]`, `0.0`, `0.0`, `[1, 0.2, 0.1]`, `0.05`, `0.0`. `roughness`, `metallic`, `transmission`, `specular_ior_level`, `alpha` and `subsurface_weight` are in `[0, 1]`; `subsurface_anisotropy` is in `[-1, 1]`; `ior` is at least 1; emission, the radius and the scale are non-negative. Most fields also accept a pattern instead of a number — see [Material inputs](#material-inputs). |
-| `lambertian` | `albedo = [r, g, b]` | Shorthand for `principled` with `base_color = albedo`, `roughness = 1`, `metallic = 0`, `ior = 1`. Pure diffuse. |
-| `metal` | `albedo`, `roughness` | Shorthand for `principled` with `base_color = albedo`, `metallic = 1`. |
-| `dielectric` | `refraction_index` | Shorthand for `principled` with `base_color = [1, 1, 1]`, `roughness = 0`, `metallic = 0`, `ior = refraction_index`, `transmission = 1`. Clear glass. |
-| `glass` | — | Dielectric with IOR 1.5. |
-| `water` | — | Dielectric with IOR 1.33. |
-| `light` | `emit = [r, g, b]` | Shorthand for `principled` with `base_color = [0, 0, 0]`, `ior = 1`, `emission_color = emit`, `emission_strength = 1`: emits from its front face and reflects nothing. Values above 1 are normal. `emit` is patternable like `emission_color`, e.g. `emit = "blackbody(6500) * 300"`. |
-
-#### Material inputs
-
-Every field marked patternable below takes a number, *or* a pattern evaluated
-at every hit, written as an expression in a string:
-
-```toml
-[[objects]]
-shape = "wavefront"
-file = "scene.obj"
-material = "principled"
-
-# Polished at one edge of the mesh's texture coordinates, rough at the other.
-roughness = "remap(uv.r, [0.05, 1.0])"
-
-# Red at the front of the object, blue at the back, in the object's own space
-# so it does not slide about when the object is moved.
-base_color = "mix([0.75, 0.15, 0.1], [0.1, 0.2, 0.7], remap(object.z, [-6, 6], [0, 1]))"
-```
-
-The whole grammar:
-
-```text
-expression  := term {(+ | -) term}
-term        := operand {(* | /) operand}
-operand     := [-] primary {. channel}
-primary     := number | color | coordinates | call | name | (expression)
-color       := [r, g, b]
-coordinates := uv | object | world
-channel     := r | g | b | a   (or x | y | z | w, for the same four)
-call        := invert(operand)
-             | remap(operand, [to0, to1])
-             | remap(operand, [from0, from1], [to0, to1])
-             | (mix | multiply | add | overlay)(a, b, factor)
-             | blackbody(kelvin)
-             | image("file", keyword: value, …)
-             | normal_map(operand, keyword: value, …)
-             | noise(operand, keyword: value, …)
-             | voronoi(operand, keyword: value, …)
-             | ramp(operand, position, color, position, color, …)
-             | bump(operand, keyword: value, …)
-name        := an entry of [patterns]
-```
-
-Arguments a call can't do without are positional; optional ones follow as
-`name: value` keywords, in any order.
-
-A blend mode is the name of the call rather than an argument to it, so
-`overlay(a, b, f)` is the overlay mix. `+`, `-`, `*` and `/` work with the
-usual precedence and parentheses; between two constants they are worked out
-when the scene loads, so `blackbody(6500) * 300` is just a colour. Whitespace is free, numbers may be
-written any way TOML writes them (`-6`, `0.5`, `1e-3`), and an error names the
-column it stopped at inside the string, on top of the line TOML names.
-
-A pattern **replaces** the field it is written in place of; it does not
-multiply it. Where a pattern produces three channels and the field wants one,
-the first is used; where it produces one and the field wants three, it is
-broadcast. `.channel` after any operand — not only after a coordinate — picks
-one component and broadcasts it, which is how a pattern says which of its
-channels a scalar field should read: `remap(uv, [0, 4]).g`.
-
-**Patternable**: `base_color`, `roughness`, `metallic`, `ior`, `transmission`,
-`specular_ior_level`, `emission_color`, `emission_strength`,
-`subsurface_weight`, a `light`'s `emit`, and `normal` (which only takes a `normal_map` or a `bump`). **Not**:
-`alpha`, `subsurface_radius`, `subsurface_scale`, `subsurface_anisotropy`.
-
-| Expression | What it is |
-| --- | --- |
-| `uv`, `object`, `world` | Where the hit is. `uv` is the mesh's own texture coordinates, zero on a `.obj` with no `vt` lines. `object` is the space the file was authored in, recovered by undoing the object's transform, so a pattern written in it stays put when the object moves. `world` is fixed to the scene instead. |
-| `.r`/`.g`/`.b`/`.a` (or `.x`/`.y`/`.z`/`.w`) after any operand | Keeps that one component and broadcasts it to the rest. |
-| `invert(input)` | `1 - input`, per channel. |
-| `remap(input, [from], [to])`, `from` defaulting to `[0, 1]` | `input` taken from one range onto another, **clamped** to `to`. The way to give an unbounded pattern a range. `from` may not have two equal ends; `to` may descend. |
-| `mix(a, b, factor)`, and `multiply`, `add`, `overlay` the same way | `a` and `b` blended by `factor`, which is clamped to `[0, 1]`. Blender's Mix node arithmetic. |
-| `a + b`, `a - b`, `a * b`, `a / b`, `-a` | Arithmetic, per channel. Shorthand for `add(a, b, 1)` and `multiply(a, b, 1)`: `a - b` is `a + b × -1`, `-a` is `a × -1`, and `a / b` is `a × (1 / b)`, so `b` must be a non-zero constant when dividing. |
-| `blackbody(kelvin)` | The colour of a black body at that temperature (at least 500 K), in linear Rec. 709 and scaled to a luminance of 1 as Blender's Blackbody node is, so it sets a light's colour and a strength sets its brightness. A constant: `kelvin` is a number, not a pattern. |
-| `image("file", color:, scale:, offset:)` | An image, sampled at `uv × scale + offset`. See [Image maps](#image-maps). |
-| `normal_map(input, strength:, convention:)` | A tangent-space normal map, for the `normal` field only. See [Image maps](#image-maps). |
-| `noise(input, scale:, detail:, roughness:, lacunarity:, distortion:)` | Gradient noise in `[0, 1]`, read at `input`'s first three channels. See [Generated patterns](#generated-patterns). |
-| `voronoi(input, scale:, randomness:, output:)` | Cells: the distance to the nearest feature point or to the nearest border, or a random colour per cell. See [Generated patterns](#generated-patterns). |
-| `ramp(input, position, color, …)` | `input`'s first channel through two to four colour stops. See [Generated patterns](#generated-patterns). |
-| `bump(height, strength:, distance:)` | The normal tilted along the slope of a height, for the `normal` field only. See [Generated patterns](#generated-patterns). |
-| a name | An entry of the scene's `[patterns]` table. See [Named patterns](#named-patterns). |
-
-Any of `input`, `a`, `b` and `factor` may itself be a plain number, a colour, or
-another pattern, up to eight values in flight and 64 levels of nesting.
-
-Emission is the one field with a rule of its own. Emissive surfaces are sampled
-as lights, and the light table has to weigh each one before the render starts —
-so a patterned emission needs an **upper bound** the host can compute. Every op
-above has one except a bare `coordinates`, so an emission driven directly by a
-coordinate is a scene error naming the fix: wrap it in a `remap`. The rule only
-applies where the surface can emit at all: `emission_strength` defaults to zero,
-and a half that is constantly zero settles the product whatever the other half
-does. The bound is only used to decide how often to aim at the surface; what it
-actually emits is evaluated at the point that was drawn, so a loose bound costs
-noise and nothing else.
-
-#### Image maps
-
-```toml
-[[objects]]
-shape = "wavefront"
-file = "scene.obj"
-material = "principled"
-base_color = 'image("oak/base.jpg", scale: 2)'
-roughness = 'image("oak/roughness.jpg", scale: 2).r'
-metallic = 'image("oak/metalic.jpg", scale: 2).r'
-normal = 'normal_map(image("oak/normal.png", scale: 2))'
-```
-
-Write these in TOML literal strings (`'…'`) so the quotes around the file name
-need no escaping.
-
-| Keyword | Default | Meaning |
-| --- | --- | --- |
-| `color` | by field | `"srgb"` decodes the texels as gamma-encoded colour; `"linear"` takes them as the numbers they are. `base_color` and `emission_color` default to `"srgb"`, every other field (and `normal`) to `"linear"`. A roughness map read as sRGB comes out too dark, and a colour map read as linear too bright. |
-| `scale` | `1` | Multiplies the texture coordinates: `4` repeats the image four times each way, `[2, 1]` twice across and once up. |
-| `offset` | `[0, 0]` | Added after the scale. |
-
-- The image is sampled at the mesh's `uv`, so the mesh needs `vt` lines. Past
-  the unit square it repeats. It is bilinearly filtered, with no mipmaps: each
-  sample jitters within its pixel, which antialiases a distant texture over
-  enough samples.
-- A channel is the usual suffix: `image("orm.png").g` reads a packed map's green.
-- Paths are relative to the scene file. PNG, JPEG, EXR and HDR are read, all
-  converted to 8 bits a channel; TIFF is not.
-- Every image is a layer of one of two texture arrays (sRGB and linear), and
-  every layer of an array is resized to the largest image in it, capped at
-  4096 on a side. A file used both ways is loaded twice. Budget about 16 MB per
-  2048² image.
-- An emissive image is bounded by its strength, so it needs no `remap`.
-
-`normal_map(input, strength: 1, convention: "opengl")` bends the shading normal
-by a tangent-space normal map. The tangent follows the direction `u` runs across
-each triangle, so mirrored UV islands read correctly. `convention: "directx"`
-flips green for maps authored the other way up (if a normal-mapped surface
-looks lit from the wrong side, this is why). `strength` leans the result back
-toward the mesh's own normal: `0` is no effect, and values above `1`
-exaggerate the map. Where the bent normal would reflect a ray into the surface,
-near silhouettes, it is bent back as Cycles does, instead of turning black. A
-mesh with no texture coordinates ignores the map.
-
-#### Generated patterns
-
-```toml
-# Marble: a distorted noise, dark only in a thin band around the middle.
-base_color = "ramp(noise(object, scale: 5, detail: 8, distortion: 3), 0.42, [0.92, 0.9, 0.86], 0.5, [0.3, 0.28, 0.33], 0.58, [0.92, 0.9, 0.86])"
-
-# Cobbles: a shade of stone per cell, each cell domed.
-base_color = 'ramp(voronoi(object, scale: 9, output: "color").r, 0, [0.22, 0.2, 0.18], 1, [0.6, 0.55, 0.47])'
-normal = "bump(voronoi(object, scale: 9), distance: -0.025)"
-```
-
-`noise(input, …)` is Perlin's improved gradient noise summed over octaves
-(fBm), in `[0, 1]`. Its knobs are Blender's Noise Texture's and mean the same
-thing, but the lattice hash is not Blender's, so the same numbers draw a
-different pattern of the same character. `input` is usually `object`; a scalar
-input is read along the diagonal, and `uv` is read at `z = 0`.
-
-| Keyword | Default | Meaning |
-| --- | --- | --- |
-| `scale` | `5` | Multiplies `input`: features per unit. |
-| `detail` | `2` | Octaves past the first, `0` to `15`. A fraction blends the last one in. |
-| `roughness` | `0.5` | How much of the one before each octave keeps, `0` to `1`. At `1` many octaves average each other back toward `0.5`. |
-| `lacunarity` | `2` | How much finer each octave is than the one before. |
-| `distortion` | `0` | How far three more noises push the lookup around first: swirls. |
-
-`voronoi(input, …)` is Worley's cellular pattern (F1): one feature point per
-cell of a lattice `scale` to the unit, jittered by `randomness` (`0` to `1`,
-default `1`; `0` is a regular grid). `output: "distance"` (the default) is the
-distance to the nearest point, in cells, at most `√3`; `output: "color"` is a
-random colour fixed per cell; `output: "edge"` is the distance to the nearest
-border between two cells, in cells, which is zero along every border — a ramp
-over it outlines the cells.
-
-`ramp(input, position, color, …)` takes two to four stops, each a position and a
-colour, positions ascending. Between two stops it is linear, and past either end
-it holds the end's colour; two stops at one position make a hard edge. Every
-position and colour has to work out to a constant (`blackbody(2000) * 0.5` is
-fine, a pattern is not).
-
-`bump(height, strength: 1, distance: 1)` tilts the shading normal along the
-slope of `height`'s first channel, as Blender's Bump node does: `distance` is
-how many world units a height of one stands for (negative inverts it), and
-`strength` (`0` to `1`) blends the result back toward the unbumped normal. The
-slope is a finite difference over a thousandth of a unit, so the height is
-evaluated three times per hit. Only `normal` takes one, and unlike a normal map
-it needs no texture coordinates.
-
-Each of these is bounded — a noise by `[0, 1]`, a distance by `√3`, an edge distance by `2`, a ramp by
-its stops — so any of them can drive emission without a `remap`. All of them
-are pure functions of where they are asked: the same on every sample, bounce
-and run.
-
-#### Named patterns
-
-A pattern that drives several fields, or several objects, can be written once
-under `[patterns]` and used by name:
-
-```toml
-[patterns]
-ground = "noise(object, scale: 1.4, detail: 6, roughness: 0.6)"
-dirt = "remap(ground, [0.47, 0.55], [0, 1])"
-
-[[objects]]
-shape = "wavefront"
-file = "scene.obj"
-material = "principled"
-base_color = 'mix(image("oak/base.jpg"), [0.07, 0.05, 0.035], dirt)'
-roughness = "mix(0.4, 0.9, dirt)"
-normal = "bump(dirt, distance: 0.004)"
-```
-
-- A name is anything a pattern can't otherwise mean: letters, digits and
-  underscores, starting with a letter, and not one of the grammar's own words
-  (`uv`, `noise`, …). Names may use other names.
-- A name is written out in full wherever it is used, before anything else about
-  the scene is checked, so a field using a name is exactly the field with the
-  pattern pasted in — including the colour space an image inside it defaults to,
-  which is still the field's. It is evaluated once per field that uses it.
-- A loop (`a` using `b` using `a`), or a name nothing defines, is an error, as
-  is any entry that is wrong whether or not anything uses it.
-
-#### Subsurface scattering
-
-`subsurface_weight` above zero turns that much of the diffuse base into light
-that goes *into* the surface instead of bouncing off it — skin, wax, marble,
-milk. It is a volumetric random walk, the same one Cycles runs by default, and
-not a diffusion profile: the path really does step around inside the object
-until it finds a way out, through the real geometry, so a thin edge glows and a
-thick middle does not without either being written down anywhere.
-
-- `subsurface_radius × subsurface_scale` is the mean free path per channel, in
-  world units — how far light of that channel travels inside before it
-  scatters. Blender's default `[1, 0.2, 0.1]` lets red travel ten times as far
-  as blue, which is what makes skin red at its edges. At a scale of zero the
-  walk has nowhere to go and the surface is the plain diffuse it replaced.
-- `base_color` is the colour the surface has to end up, not the medium's own:
-  the shader inverts it (Chiang et al. 2016) to find what the walk has to
-  scatter with, because a medium loses a great deal over the dozens of
-  scattering events one path takes.
-- `subsurface_anisotropy` leans each of those events: back the way it came at
-  -1, every direction alike at 0, straight on at 1.
-
-Two limits worth knowing. The mesh has to be **closed** — a path that dives into
-an open surface walks away under it and never comes back, so an open mesh loses
-what goes in (it never gains any). And a walk is given 256 steps, so a mean free
-path far smaller than the object is biased dark; the fix is a larger
-`subsurface_scale`, which is also faster.
-
-## Render pipeline
-
-```mermaid
-flowchart LR
-    toml[render.toml] --> load["Scene::load<br/>meshes · transforms · BVH<br/>light table · sky distribution"]
-    load --> trace["shader.wgsl × samples<br/>one dispatch per sample"]
-    trace --> buffers[("accum · moments<br/>normals · albedos")]
-    buffers --> resolve["resolve<br/>exposure → ACES → sRGB"]
-    buffers -- "--denoise" --> denoise["denoise.wgsl<br/>prepare → à-trous ×N → remodulate"]
-    denoise --> resolve
-    resolve --> png[render.png]
-```
-
-1. **Load.** The host parses and validates the config, loads each mesh, applies
-   its transforms, and builds a binned-SAH BVH (depth-capped to fit the shader's
-   fixed traversal stack). It also builds a power-weighted table of emissive
-   triangles and, when an HDRI is present, a marginal/conditional CDF over its
-   texels. All of this is uploaded once as storage buffers, beside the image
-   maps' two texture arrays.
-2. **Trace.** One compute dispatch per sample, with one thread per pixel
-   (`shader.wgsl`). Each thread:
-   - Casts a stratified, jittered primary ray. With a lens, the ray starts on
-     the lens disk.
-   - Walks the BVH to find the nearest hit and resolves its material: a
-     surface with patterned fields has each one evaluated at that hit, and
-     everything downstream sees a plain material either way.
-   - Adds the surface's emission if
-     the front face was hit (weighed by MIS against the emitter sample from the
-     previous bounce). A surface that scatters nothing, like a `light`, ends
-     the path there.
-   - At surfaces with a non-mirror lobe (diffuse, or rough microfacet), sends
-     shadow rays to one sampled emitter and one sampled sky direction (next
-     event estimation). These are combined with the BSDF sample using the power
-     heuristic (MIS), so no light is counted twice.
-   - Samples the BSDF: picks one lobe (metal, specular, glass, diffuse or
-     subsurface), draws a direction from it (GGX visible normals for the
-     microfacet lobes), and weighs it against every lobe's density. Applies
-     Russian roulette after bounce 4.
-   - On the subsurface lobe the direction points *into* the surface: the path
-     walks the medium until it reaches the boundary again, and the exit point —
-     a white Lambertian facing out — becomes the vertex that sends the shadow
-     rays and chooses the next direction. The entry sends none: what it would
-     reflect depends on where the walk comes out.
-   - Drops non-finite samples, and applies outlier rejection if `k > 0`.
-3. **Accumulate.** Each sample adds to four per-pixel buffers:
-   - `accum`: radiance sum and sample count.
-   - `moments`: sum of luminance and of luminance², used to recover per-pixel
-     variance. Kept twice: once over every sample as drawn (for outlier
-     rejection) and once over what `accum` kept (for the denoiser and the
-     `noise:` figures).
-   - `normals` and `albedos`: feature sums for the denoiser (normal, depth,
-     albedo), plus a majority vote for the object id.
-
-   Because everything is stored as a sum, `sum / n` is a finished frame at any
-   point. That is how `--preview` works without a separate code path.
-4. **Denoise** (optional). See below.
-5. **Resolve** (`render/tonemap.rs`). The pixel is averaged, multiplied by
-   `exposure`, tone mapped with an ACES fit in ACEScg primaries, and
-   gamma-encoded to 8-bit sRGB. The filmic curve compresses highlights instead
-   of clipping them. Applying it in ACEScg stops saturated highlights from
-   shifting hue. This is the only non-linear step; everything before it works in
-   linear radiance.
-
-## Denoising
-
-`--denoise` runs an edge-avoiding à-trous wavelet filter: the spatial half of
-[SVGF](https://research.nvidia.com/publication/2017-07_spatiotemporal-variance-guided-filtering-real-time-reconstruction-path-traced).
-It runs once, after the last sample, on the GPU (`render/denoise.wgsl`). It only
-reads the tracer's buffers and never writes to them, so the unfiltered frame is
-still available through `--debug`. On `examples/melee` it takes 500 samples from
-4.02 to 1.24 mean error against a 10 000-sample reference, and adds about 10 ms.
-
-### Feature buffers
-
-As each path is traced, the shader records features of the **first opaque
-surface** it reaches (diffuse or emissive). It records the first hit instead
-only when a path never reaches an opaque surface. Glass and metal are passed
-through, so a floor seen through a glass torus keeps its own edges instead of
-taking on the torus's silhouette. The features are:
-
-| Feature | Use |
-| --- | --- |
-| normal | Tells apart surfaces facing different directions. Zero normal means a miss, and those pixels are not filtered. |
-| depth | Distance along the whole path, so it stays continuous through refraction. |
-| albedo | Surface colour, divided out before filtering and multiplied back after. |
-| object id | Pixels are only blended with others from the same object. Voted rather than averaged, so an edge pixel gets the object most of its samples saw. |
-
-These features barely change from sample to sample, so they are almost free of
-noise. That makes them reliable for deciding which neighbouring pixels show the
-same surface.
-
-### Passes
-
-All three passes share one entry point and ping-pong between two scratch
-buffers.
-
-1. **Prepare.**
-   - Demodulate: `irradiance = radiance / max(albedo, 0.01)`. Texture and colour
-     detail stays in the noise-free albedo, so the filter only smooths lighting.
-   - Estimate the variance of each pixel's *mean* from the moments:
-     `(E[x²] − E[x]²) / n`, divided by the albedo luminance squared to match the
-     demodulated signal.
-   - Blur that variance with a 3×3 binomial kernel. Without this, pixels with a
-     variance of exactly zero would reject every neighbour and stay as isolated
-     speckles.
-2. **Filter** × `iterations`. Each pass is a 5×5 B3-spline kernel
-   (`1/16, 1/4, 3/8, 1/4, 1/16`) with taps `2^i` pixels apart. Strides of
-   1, 2, 4, 8 and 16 give a 125-pixel footprint for 125 taps per pixel. Each
-   tap `q` around pixel `p` is weighted by:
-
-   ```
-   w = kernel
-     · max(0, n_p · n_q) ^ sigma_normal                               normal
-     · exp(−|d_p − d_q| / (sigma_depth · |∇d · offset|))              depth
-     · exp(−|l_p − l_q| / (sigma_luminance · √var_p))                 luminance
-     · [id_p == id_q]                                                 object
-   ```
-
-   The luminance term does the actual smoothing. It blends away differences
-   that the pixel's own noise can explain and keeps differences it can't. The
-   other terms decide *where* smoothing is allowed. Variance is carried forward
-   with squared weights (`Σw²·var / (Σw)²`), so each wider pass knows how much
-   noise the previous one left. Taps outside the frame are dropped and the
-   remaining weights renormalised.
-3. **Remodulate.** Multiply by the same clamped albedo. The result then goes
-   through the same resolve step as an unfiltered frame. With `iterations = 0`,
-   the output matches the input to within one 8-bit step, and the test suite
-   checks this.
-
-### Tuning
-
-Render with `--denoise --debug <dir>` and compare `render.png` with
-`<dir>/raw.png`.
-
-| Symptom | Adjust |
-| --- | --- |
-| Lighting detail or soft shadows smeared | Lower `sigma_luminance` |
-| Noise left everywhere | Raise `sigma_luminance` or `iterations`, or add samples |
-| Noise left on curved surfaces | Lower `sigma_normal` |
-| Light bleeding across creases | Raise `sigma_normal` |
-| Noise left on sloped or distant surfaces | Raise `sigma_depth` |
+`--preview` draws the image in your terminal as it renders, and `--denoise`
+cleans up the leftover noise. The result is written to `render.png`.
+
+To make your own scene, copy one of the [examples](#examples) and edit its
+`render.toml`. For everything else, see the docs:
+
+- [CLI reference](docs/cli.md): every flag, and what the console output means.
+- [Config reference](docs/config.md): the scene file: camera, sky, objects and
+  materials.
+- [Expression reference](docs/expressions.md): patterns and image textures for
+  material inputs.
+- [Rendering pipeline](docs/rendering.md): how a frame is traced, and how the
+  denoiser works and is tuned.
 
 ## Examples
 
@@ -582,34 +43,36 @@ mise run example melee       # render one
 mise run example melee --debug   # also write raw frame + AOVs to examples/melee/debug
 ```
 
-| | |
-| --- | --- |
-| ![teapot](examples/teapot/render.png) `teapot`: lit only by a flat sky | ![field](examples/field/render.png) `field`: lit only by an HDRI with an importance-sampled sun |
-| ![normals](examples/normals/render.png) `normals`: smooth vs. per-face normals | ![melee](examples/melee/render.png) `melee`: mixed materials, one emitter |
-| ![glass](examples/glass/render.png) `glass`: glass monkeys, two lights; the scene with the most fireflies | ![cubes](examples/cubes/render.png) `cubes`: a room of objects lit by one emitter |
-| ![stairs](examples/stairs/render.png) `stairs`: glass orbs and a staircase, two lights | ![tunnel](examples/tunnel/render.png) `tunnel`: coloured walls under an HDRI |
-| ![principled](examples/principled/render.png) `principled`: one row per parameter, back to front: emission, base color, roughness, metallic, IOR, alpha | ![subsurface](examples/subsurface/render.png) `subsurface`: backlit spheres, one row each for weight, scale and radius |
-| ![blob](examples/blob/render.png) `blob`: a waxy subsurface blob in a grey room, lit by one overhead emitter | ![textures](examples/textures/render.png) `textures`: oak floor, fabric rug, metal cube and gold ball, each with colour, roughness, metallic and normal maps, under two blackbody lights |
-| ![noise](examples/noise/render.png) `noise`: seven balls on a pool of water, each a Blender node tree written as expressions: noise and Voronoi through ramps, a Voronoi read at a noise, bumped cells, cell edges as roughness, and named masks shared between fields | |
+|                                                                                                                                                                                                                                                                        |                                                                                                                                                                                          |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ![teapot](examples/teapot/render.png) `teapot`: lit only by a flat sky                                                                                                                                                                                                 | ![field](examples/field/render.png) `field`: lit only by an HDRI with an importance-sampled sun                                                                                          |
+| ![normals](examples/normals/render.png) `normals`: smooth vs. per-face normals                                                                                                                                                                                         | ![melee](examples/melee/render.png) `melee`: mixed materials, one emitter                                                                                                                |
+| ![glass](examples/glass/render.png) `glass`: glass monkeys, two lights; the scene with the most fireflies                                                                                                                                                              | ![cubes](examples/cubes/render.png) `cubes`: a room of objects lit by one emitter                                                                                                        |
+| ![stairs](examples/stairs/render.png) `stairs`: glass orbs and a staircase, two lights                                                                                                                                                                                 | ![tunnel](examples/tunnel/render.png) `tunnel`: coloured walls under an HDRI                                                                                                             |
+| ![principled](examples/principled/render.png) `principled`: one row per parameter, back to front: emission, base color, roughness, metallic, IOR, alpha                                                                                                                | ![subsurface](examples/subsurface/render.png) `subsurface`: backlit spheres, one row each for weight, scale and radius                                                                   |
+| ![blob](examples/blob/render.png) `blob`: a waxy subsurface blob in a grey room, lit by one overhead emitter                                                                                                                                                           | ![textures](examples/textures/render.png) `textures`: oak floor, fabric rug, metal cube and gold ball, each with colour, roughness, metallic and normal maps, under two blackbody lights |
+| ![noise](examples/noise/render.png) `noise`: seven balls on a pool of water, each a Blender node tree written as expressions: noise and Voronoi through ramps, a Voronoi read at a noise, bumped cells, cell edges as roughness, and named masks shared between fields |                                                                                                                                                                                          |
 
 ## Development
 
-| Task | Description |
-| --- | --- |
-| `mise run` | Tests, lints, and a release build |
+| Task             | Description                                              |
+| ---------------- | -------------------------------------------------------- |
+| `mise run`       | Tests, lints, and a release build                        |
 | `mise run check` | Tests, plus `cargo fmt --check` and `clippy -D warnings` |
-| `mise run fix` | Apply formatter and clippy fixes |
-| `mise run test` | `cargo test --all-features` |
+| `mise run fix`   | Apply formatter and clippy fixes                         |
+| `mise run test`  | `cargo test --all-features`                              |
 
 Most tests run without a GPU:
+
 - WGSL struct sizes are checked against their Rust `#[repr(C)]` counterparts
   using naga.
 - A Rust port of the shader's BVH traversal is tested against brute-force
   intersection.
 
 `render/golden.rs` renders the small scenes in `tests/golden/` and diffs each
-one against its reference PNG. Regenerate them with `UPDATE_GOLDEN=1 cargo test
-golden`. On a machine with no GPU adapter, set `WGSL_RAYTRACE_SKIP_GPU_TESTS=1`.
+one against its reference PNG. Regenerate them with
+`UPDATE_GOLDEN=1 cargo test golden`. On a machine with no GPU adapter, set
+`WGSL_RAYTRACE_SKIP_GPU_TESTS=1`.
 
 ### Source layout
 
@@ -618,9 +81,11 @@ src/
   main.rs              CLI: parse, validate, load, render, write outputs
   config/mod.rs        TOML schema and CLI args (pure data, no GPU)
   config/input.rs      material input trees (patterns), as pure data
+  config/expression.rs parser for pattern expressions → input trees
   scene/               .obj loading, transforms, materials, BVH, light table, sky CDF
   scene/program.rs     input trees → the flat program the shader evaluates
   scene/noise.rs       the shader's noise, voronoi and ramp again in Rust, for the tests
+  scene/texture.rs     image loading, dedupe and resizing into texture arrays
   math/mod.rs          matrices for model transforms
   render/
     mod.rs             device setup, sample loop, readback, resolve
@@ -631,6 +96,8 @@ src/
     variance.rs        moments → noise statistics and heatmap
     tonemap.rs         ACES curve in ACEScg
     preview.rs         terminal preview (kitty.rs draws it)
+    progress.rs        console progress bar
     timing.rs          GPU timestamp queries
     golden.rs          golden-image test
+    shader_tests.rs    unit tests for shader.wgsl functions, run on the GPU
 ```
