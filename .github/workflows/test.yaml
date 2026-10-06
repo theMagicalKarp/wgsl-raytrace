@@ -52,10 +52,11 @@ jobs:
           - field
           - glass
           - melee
+          - noise
           - normals
           - principled
-          - subsurface
           - stairs
+          - subsurface
           - teapot
           - textures
           - tunnel
